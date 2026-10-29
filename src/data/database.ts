@@ -67,6 +67,23 @@ export interface FeedbackItem {
   createdAt: string;
 }
 
+export type UnlistedReportStatus = 'pending' | 'enrolled' | 'temporary';
+
+export interface UnlistedStudentReport {
+  id: string;
+  studentName: string;
+  courseId: string;
+  instructorId: string;
+  instructorName: string;
+  weekNumber: number;
+  sessionType: SessionType;
+  status: UnlistedReportStatus;
+  resolvedStudentId?: string;
+  resolvedExistingStudent?: boolean;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
 // Raw Online Courses from BGM ÇEVRİM İÇİ SINIF LİSTESİ PDF
 interface RawCourseDef {
   id: string;
@@ -1812,6 +1829,8 @@ export function syncDatabaseMutations(
       studentsMap.set(custom.id, {
         ...existing,
         ...custom,
+        addedAtWeek: existing.addedAtWeek,
+        addedAt: existing.addedAt,
         enrolledCourseIds: mergedCourses,
       });
     } else {

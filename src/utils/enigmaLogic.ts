@@ -1,6 +1,7 @@
 import {
   AttendanceRecord,
   DB,
+  getCanonicalStudentName,
   Instructor,
   Modality,
   normalizeTurkish,
@@ -194,4 +195,24 @@ export function createNewStudentRecord(params: {
 export function isUnassignedBosInstructor(instructorName: string): boolean {
   return /^bos\d+$/i.test(normalizeTurkish(instructorName));
 }
+
+/**
+ * Finds an existing student by full name (first + last name match after Turkish normalization & canonical mapping).
+ * "aynı isim soy isimse aynı öğrencidir"
+ */
+export function findMatchingStudentByFullName(
+  rawName: string,
+  students: Student[]
+): Student | undefined {
+  const canonical = getCanonicalStudentName(rawName);
+  if (!canonical) return undefined;
+  const targetSlugId = `stu-${slugifyTurkish(canonical)}`;
+  return students.find(
+    s =>
+      s.id === targetSlugId ||
+      getCanonicalStudentName(s.name) === canonical ||
+      normalizeTurkish(s.name) === canonical
+  );
+}
+
 

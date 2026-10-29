@@ -135,6 +135,62 @@
         }
       },
       "required": ["courseId", "instructorName", "updatedAt"]
+    },
+    "UnlistedStudentReport": {
+      "title": "UnlistedStudentReport",
+      "description": "Student reported by an instructor as present in class but not on the course roster.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "studentName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "courseId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "instructorId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "instructorName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "weekNumber": {
+          "type": "number"
+        },
+        "sessionType": {
+          "type": "string",
+          "enum": ["1. ders", "2. ders", "ek dersler", "ders yapmadım"],
+          "maxLength": 50
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "enrolled", "temporary"],
+          "maxLength": 30
+        },
+        "resolvedStudentId": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "resolvedExistingStudent": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "resolvedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["id", "studentName", "courseId", "instructorId", "instructorName", "weekNumber", "sessionType", "status", "createdAt"]
     }
   },
   "firestore": {
@@ -157,6 +213,10 @@
     "/instructor_assignments/{courseId}": {
       "schema": "InstructorAssignment",
       "description": "Collection of course instructor assignments."
+    },
+    "/unlisted_students/{reportId}": {
+      "schema": "UnlistedStudentReport",
+      "description": "Collection of unlisted students reported by instructors during attendance."
     }
   }
 }

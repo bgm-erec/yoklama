@@ -19,14 +19,17 @@ import {
   AttendanceRecord,
   Course,
   DATA_DISCREPANCIES,
+  getCanonicalStudentName,
   Instructor,
   Modality,
   normalizeTurkish,
   slugifyTurkish,
   Student,
+  UnlistedStudentReport,
 } from '../data/database';
 import {
   createNewStudentRecord,
+  findMatchingStudentByFullName,
   getWeekDateRangeLabel,
   isStudentResponsibleForSession,
   isUnassignedBosInstructor,
@@ -38,6 +41,7 @@ interface AdminSibeliusViewProps {
   courses: Course[];
   instructors: Instructor[];
   attendanceRecords: AttendanceRecord[];
+  unlistedReports: UnlistedStudentReport[];
   onAddStudent: (student: Student) => Promise<void>;
   onRemoveStudent: (student: Student) => Promise<void>;
   onAssignInstructor: (
@@ -45,12 +49,15 @@ interface AdminSibeliusViewProps {
     instructorName: string,
     newCourseMeta?: { modality: Modality; gradeClass: string; subject: string }
   ) => Promise<void>;
+  onEnrollUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
+  onMarkTemporaryUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
+  onDeleteUnlistedReport: (reportId: string) => Promise<void>;
   onResetAllAttendance: () => Promise<void>;
   onResetAllFeedbacks: () => Promise<void>;
   onBackToLogin: () => void;
 }
 
-type AdminCategory = 'menu' | 'ders' | 'ogrenci' | 'egitmen' | 'uyumsuzluklar';
+type AdminCategory = 'menu' | 'ders' | 'ogrenci' | 'egitmen' | 'liste_disi' | 'uyumsuzluklar';
 
 const ONLINE_GRADE_OPTIONS = [
   { label: '3. sınıf', gradeClass: '3/a' },
@@ -89,9 +96,13 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   courses,
   instructors,
   attendanceRecords,
+  unlistedReports,
   onAddStudent,
   onRemoveStudent,
   onAssignInstructor,
+  onEnrollUnlistedStudent,
+  onMarkTemporaryUnlistedStudent,
+  onDeleteUnlistedReport,
   onResetAllAttendance,
   onResetAllFeedbacks,
   onBackToLogin,
@@ -151,6 +162,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const unassignedBosCount = useMemo(
     () => instructors.filter(i => isUnassignedBosInstructor(i.name)).length,
     [instructors]
+  );
+
+  const pendingUnlistedCount = useMemo(
+    () => unlistedReports.filter(r => r.status === 'pending').length,
+    [unlistedReports]
   );
 
   // Available online courses for the currently chosen online grade (Student Add)
@@ -585,6 +601,30 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       .map(sid => students.find(s => s.id === sid))
       .filter((s): s is Student => Boolean(s));
 
+    // Temporary (geçici) students who attended a specific session of this course without being enrolled
+    const courseTempReports = unlistedReports.filter(
+      r =>
+        r.courseId === course.id &&
+        (r.status === 'temporary' || r.status === 'pending') &&
+        !courseStudents.some(
+          cs => getCanonicalStudentName(cs.name) === getCanonicalStudentName(r.studentName)
+        )
+    );
+
+    const groupedTempStudents = Array.from(
+      new Set(courseTempReports.map(r => getCanonicalStudentName(r.studentName)))
+    ).map(canonicalName => {
+      const matchingExisting = findMatchingStudentByFullName(canonicalName, students);
+      const reportsForStudent = courseTempReports.filter(
+        r => getCanonicalStudentName(r.studentName) === canonicalName
+      );
+      return {
+        canonicalName,
+        matchingExisting,
+        reports: reportsForStudent,
+      };
+    });
+
     return (
       <div key={course.id} className="rounded-2xl border border-stone-300/90 bg-white/90 p-4 sm:p-5 mb-6">
         <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-stone-200 pb-3 sm:pb-4 mb-3 sm:mb-4">
@@ -592,6 +632,9 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             <h3 className="font-serif-art text-xl sm:text-2xl text-stone-900">{course.title}</h3>
             <p className="text-xs text-stone-500 mt-0.5">
               eğitmen: {course.instructorName} · kayıtlı öğrenci: {courseStudents.length}
+              {groupedTempStudents.length > 0
+                ? ` · geçici/liste dışı öğrenci: ${groupedTempStudents.length}`
+                : ''}
             </p>
           </div>
         </div>
@@ -632,6 +675,65 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                       {renderStudentCourseWeekCell(course.id, st.id, w)}
                     </td>
                   ))}
+                </tr>
+              ))}
+
+              {/* Temporary / Unlisted students for this specific course */}
+              {groupedTempStudents.map((tempItem, idx) => (
+                <tr key={`temp-${tempItem.canonicalName}`} className="bg-amber-50/40 hover:bg-amber-50/70">
+                  <td className="py-3 sm:py-2.5 pr-3 font-medium text-stone-900 whitespace-nowrap sticky left-0 bg-[#fdfbf7] z-10">
+                    <span className="font-mono-num text-stone-400 mr-1.5">
+                      {courseStudents.length + idx + 1}.
+                    </span>
+                    {tempItem.matchingExisting ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCategory('ogrenci');
+                          setSelectedStudentId(tempItem.matchingExisting!.id);
+                        }}
+                        className="hover:underline text-left cursor-pointer"
+                      >
+                        {tempItem.canonicalName}
+                      </button>
+                    ) : (
+                      <span>{tempItem.canonicalName}</span>
+                    )}
+                    <span className="ml-1.5 inline-block rounded bg-amber-100 border border-amber-300/80 px-1.5 py-0.5 text-[10px] font-normal text-amber-900">
+                      {tempItem.reports.some(r => r.status === 'temporary')
+                        ? 'geçici öğrenci'
+                        : 'liste dışı'}
+                    </span>
+                  </td>
+                  {weeksList.map(w => {
+                    const weekReports = tempItem.reports.filter(r => r.weekNumber === w);
+                    if (weekReports.length === 0) {
+                      return (
+                        <td key={w} className="py-3 sm:py-2.5 px-3 whitespace-nowrap text-stone-300">
+                          —
+                        </td>
+                      );
+                    }
+                    return (
+                      <td key={w} className="py-3 sm:py-2.5 px-3 whitespace-nowrap">
+                        <div className="flex flex-wrap gap-y-1">
+                          {weekReports.map(r => {
+                            const shortSession =
+                              r.sessionType === '1. ders'
+                                ? '1.d'
+                                : r.sessionType === '2. ders'
+                                ? '2.d'
+                                : 'ek';
+                            return (
+                              <span key={r.id} className="inline-block mr-2 text-xs text-emerald-800 font-medium">
+                                {shortSession}: var (geçici)
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    );
+                  })}
                 </tr>
               ))}
             </tbody>
@@ -754,7 +856,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto">
-            {(['ders', 'ogrenci', 'egitmen', 'uyumsuzluklar'] as const).map(cat => {
+            {(['ders', 'ogrenci', 'egitmen', 'liste_disi', 'uyumsuzluklar'] as const).map(cat => {
               const label =
                 cat === 'ders'
                   ? 'ders arat'
@@ -762,6 +864,8 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   ? 'öğrenci arat'
                   : cat === 'egitmen'
                   ? 'eğitmen arat'
+                  : cat === 'liste_disi'
+                  ? `liste dışı öğrenciler${pendingUnlistedCount > 0 ? ` (${pendingUnlistedCount})` : ''}`
                   : 'veri doğrulama notları';
               return (
                 <button
@@ -794,17 +898,17 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         </div>
       )}
 
-      {/* Category 0: Main 3-Option Menu + Student Add/Remove + Instructor Assignment */}
+      {/* Category 0: Main Menu + Liste Dışı Öğrenciler + Student Add/Remove + Instructor Assignment */}
       {category === 'menu' && (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mb-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-2">
             <button
               type="button"
               onClick={() => {
                 setCategory('ders');
                 resetDetailSelection();
               }}
-              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
+              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-5 sm:p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
             >
               <div>
                 <BookOpen className="h-5 w-5 text-stone-700 mb-4" />
@@ -826,7 +930,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 setCategory('ogrenci');
                 resetDetailSelection();
               }}
-              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
+              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-5 sm:p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
             >
               <div>
                 <Users className="h-5 w-5 text-stone-700 mb-4" />
@@ -848,7 +952,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 setCategory('egitmen');
                 resetDetailSelection();
               }}
-              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
+              className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-5 sm:p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
             >
               <div>
                 <UserCheck className="h-5 w-5 text-stone-700 mb-4" />
@@ -862,6 +966,39 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               <span className="mt-6 text-xs font-mono-num text-stone-500">
                 {realInstructorsCount} eğitmen kayıtlı
                 {unassignedBosCount > 0 ? ` (${unassignedBosCount} boş ders)` : ''} →
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setCategory('liste_disi');
+                resetDetailSelection();
+              }}
+              className={`group flex flex-col justify-between rounded-2xl border p-5 sm:p-6 text-left transition-all cursor-pointer ${
+                pendingUnlistedCount > 0
+                  ? 'border-amber-400 bg-amber-50/70 hover:border-amber-600 hover:bg-amber-50'
+                  : 'border-stone-300/90 bg-white/85 hover:border-stone-700 hover:bg-white'
+              }`}
+            >
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-4">
+                  <UserPlus className="h-5 w-5 text-stone-700" />
+                  {pendingUnlistedCount > 0 && (
+                    <span className="rounded-full bg-amber-800 px-2 py-0.5 text-[10px] font-mono-num text-white">
+                      {pendingUnlistedCount} bekleyen
+                    </span>
+                  )}
+                </div>
+                <h2 className="font-serif-art text-2xl text-stone-900 group-hover:translate-x-0.5 transition-transform">
+                  liste dışı öğrenciler
+                </h2>
+                <p className="text-xs text-stone-600 mt-2 leading-relaxed">
+                  yoklama sırasında eğitmenlerin "listede olmayan öğrenci ekle" ile raporladığı öğrencileri derse kaydet veya geçici öğrenci olarak işle.
+                </p>
+              </div>
+              <span className="mt-6 text-xs font-mono-num text-stone-500">
+                {unlistedReports.length} raporlanan kayıt →
               </span>
             </button>
           </div>
@@ -1554,6 +1691,14 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           .map(cid => courses.find(c => c.id === cid))
           .filter((c): c is Course => Boolean(c));
 
+        const tempAttendancesForStudent = unlistedReports.filter(
+          r =>
+            r.status === 'temporary' &&
+            (r.resolvedStudentId === student.id ||
+              getCanonicalStudentName(r.studentName) === getCanonicalStudentName(student.name)) &&
+            !student.enrolledCourseIds.includes(r.courseId)
+        );
+
         return (
           <div className="rounded-2xl border border-stone-300/90 bg-white/90 p-4 sm:p-6">
             <div className="border-b border-stone-200 pb-3 sm:pb-4 mb-4 sm:mb-5">
@@ -1603,6 +1748,37 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 </tbody>
               </table>
             </div>
+
+            {tempAttendancesForStudent.length > 0 && (
+              <div className="mt-6 pt-4 border-t border-stone-200">
+                <h3 className="text-xs font-medium text-stone-800 mb-2">
+                  geçici öğrenci olarak katıldığı tekil dersler (derse kayıtlı olmadan)
+                </h3>
+                <div className="space-y-1.5">
+                  {tempAttendancesForStudent.map(rep => {
+                    const tempCourse = courses.find(c => c.id === rep.courseId);
+                    return (
+                      <div
+                        key={rep.id}
+                        className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs"
+                      >
+                        <div>
+                          <span className="font-medium text-stone-900">
+                            {tempCourse?.title || rep.courseId}
+                          </span>
+                          <span className="text-stone-500 ml-2">
+                            · eğitmen: {rep.instructorName} · {rep.weekNumber}. hafta ({rep.sessionType})
+                          </span>
+                        </div>
+                        <span className="text-emerald-800 font-medium">
+                          var (geçici öğrenci)
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         );
       })()}
@@ -1727,6 +1903,170 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         if (!course) return null;
         return renderCourseMatrix(course);
       })()}
+
+      {/* ================= CATEGORY: LİSTE DIŞI ÖĞRENCİLER ================= */}
+      {category === 'liste_disi' && (
+        <div className="rounded-2xl border border-stone-300/90 bg-white/90 p-5 sm:p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-stone-200 pb-4 mb-5">
+            <div>
+              <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900">
+                liste dışı öğrenciler
+              </h2>
+              <p className="text-xs text-stone-500 mt-1">
+                eğitmenlerin yoklama sırasında "listede olmayan öğrenci ekle" ile raporladığı öğrenciler. her öğrenciyi ilgili derse kalıcı olarak kaydedebilir veya yalnızca o dersin yoklamasında var olacak şekilde "geçici öğrenci" olarak işleyebilirsin.
+              </p>
+            </div>
+            <span className="text-xs font-mono-num text-stone-500 whitespace-nowrap">
+              {pendingUnlistedCount} bekleyen · toplam {unlistedReports.length}
+            </span>
+          </div>
+
+          {unlistedReports.length === 0 ? (
+            <div className="py-12 text-center">
+              <p className="text-sm text-stone-600">
+                henüz liste dışı olarak raporlanan bir öğrenci bulunmuyor.
+              </p>
+              <p className="text-xs text-stone-400 mt-1">
+                eğitmenler yoklama ekranındaki "listede olmayan öğrenci ekle" barından öğrenci eklediğinde burada listelenir.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3.5">
+              {[...unlistedReports]
+                .sort((a, b) => {
+                  if (a.status === 'pending' && b.status !== 'pending') return -1;
+                  if (a.status !== 'pending' && b.status === 'pending') return 1;
+                  return b.createdAt.localeCompare(a.createdAt);
+                })
+                .map(report => {
+                  const course = courses.find(c => c.id === report.courseId);
+                  const existingStudent = findMatchingStudentByFullName(
+                    report.studentName,
+                    students
+                  );
+                  const alreadyEnrolledInThisCourse = existingStudent
+                    ? existingStudent.enrolledCourseIds.includes(report.courseId)
+                    : false;
+
+                  return (
+                    <div
+                      key={report.id}
+                      className={`rounded-2xl border p-4 sm:p-5 transition-all ${
+                        report.status === 'pending'
+                          ? 'border-stone-300 bg-[#faf8f4]/90'
+                          : 'border-stone-200 bg-white/70'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="font-serif-art text-xl text-stone-900">
+                              {report.studentName}
+                            </h3>
+                            {report.status === 'pending' && (
+                              <span className="rounded-md bg-amber-100 border border-amber-300 px-2 py-0.5 text-[11px] font-medium text-amber-900">
+                                işlem bekliyor
+                              </span>
+                            )}
+                            {report.status === 'enrolled' && (
+                              <span className="rounded-md bg-emerald-100 border border-emerald-300 px-2 py-0.5 text-[11px] font-medium text-emerald-900">
+                                bu derse kaydedildi
+                              </span>
+                            )}
+                            {report.status === 'temporary' && (
+                              <span className="rounded-md bg-stone-200 border border-stone-300 px-2 py-0.5 text-[11px] font-medium text-stone-800">
+                                geçici öğrenci (sadece bu yoklamada var)
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="text-xs text-stone-600 mt-1">
+                            ders: <span className="font-medium text-stone-800">{course?.title || report.courseId}</span> · eğitmen:{' '}
+                            <span className="font-medium text-stone-800">{report.instructorName}</span> ·{' '}
+                            <span className="font-mono-num">
+                              {report.weekNumber}. hafta ({getWeekDateRangeLabel(report.weekNumber)}) · {report.sessionType}
+                            </span>
+                          </p>
+
+                          <div className="mt-2 text-xs">
+                            {existingStudent ? (
+                              <span className="text-emerald-900">
+                                sistem kontrolü: aynı isim soyisimde öğrenci mevcut (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCategory('ogrenci');
+                                    setSelectedStudentId(existingStudent.id);
+                                  }}
+                                  className="underline font-medium hover:text-stone-900 cursor-pointer"
+                                >
+                                  {existingStudent.name}
+                                </button>{' '}
+                                · {existingStudent.grade} · {existingStudent.enrolledCourseIds.length} kayıtlı ders
+                                {alreadyEnrolledInThisCourse ? ' · bu derse de kayıtlı' : ''})
+                              </span>
+                            ) : (
+                              <span className="text-stone-500">
+                                sistem kontrolü: sistemde "{report.studentName}" adında kayıtlı öğrenci yok (kaydet dendiğinde yeni öğrenci oluşturulup yalnızca bu derse eklenecek).
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onDeleteUnlistedReport(report.id);
+                            showTemporaryNotice(`"${report.studentName}" liste dışı raporu silindi.`);
+                          }}
+                          title="bu raporu sil"
+                          className="self-end sm:self-start rounded-lg border border-stone-200 bg-white p-1.5 text-stone-400 hover:border-rose-300 hover:text-rose-700 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+
+                      {/* Action Buttons Underneath Each Student */}
+                      <div className="mt-4 pt-3 border-t border-stone-200/80 flex flex-wrap items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const msg = await onEnrollUnlistedStudent(report);
+                            showTemporaryNotice(msg);
+                          }}
+                          className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                            report.status === 'enrolled'
+                              ? 'bg-emerald-800 text-white'
+                              : 'bg-stone-900 text-stone-100 hover:bg-stone-800'
+                          }`}
+                        >
+                          <UserPlus className="h-3.5 w-3.5" />
+                          <span>bu öğrenciyi bu derse kaydet</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const msg = await onMarkTemporaryUnlistedStudent(report);
+                            showTemporaryNotice(msg);
+                          }}
+                          className={`inline-flex items-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                            report.status === 'temporary'
+                              ? 'border-stone-900 bg-stone-800 text-stone-100'
+                              : 'border-stone-300 bg-white text-stone-800 hover:border-stone-600 hover:bg-stone-50'
+                          }`}
+                        >
+                          <UserCheck className="h-3.5 w-3.5" />
+                          <span>geçici öğrenci</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ================= CATEGORY: VERİ DOĞRULAMA & UYUMSUZLUK RAPORU ================= */}
       {category === 'uyumsuzluklar' && (

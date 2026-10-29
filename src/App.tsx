@@ -10,15 +10,20 @@ import {
   AttendanceRecord,
   BASE_DB,
   FeedbackItem,
+  getCanonicalStudentName,
   Instructor,
   InstructorAssignmentRecord,
   Modality,
   normalizeTurkish,
   RemovedStudentRecord,
+  slugifyTurkish,
   Student,
   syncDatabaseMutations,
+  UnlistedStudentReport,
 } from './data/database';
 import {
+  createNewStudentRecord,
+  findMatchingStudentByFullName,
   getCurrentWeekNumber,
   getWeekDateRangeLabel,
   resolveIdentityInput,
@@ -49,6 +54,7 @@ export default function App() {
   const [customStudents, setCustomStudents] = useState<Student[]>([]);
   const [removedStudentIds, setRemovedStudentIds] = useState<string[]>([]);
   const [instructorAssignments, setInstructorAssignments] = useState<InstructorAssignmentRecord[]>([]);
+  const [unlistedReports, setUnlistedReports] = useState<UnlistedStudentReport[]>([]);
 
   // Synchronize effective students, courses, and instructors whenever mutations change
   const effectiveDb = useMemo(
@@ -205,6 +211,35 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // Real-time Firestore listener for unlisted student reports
+  useEffect(() => {
+    const unlistedQuery = query(
+      collection(db, 'unlisted_students'),
+      where('createdAt', '>=', '2020-01-01')
+    );
+    const unsubscribe = onSnapshot(
+      unlistedQuery,
+      snapshot => {
+        const items: UnlistedStudentReport[] = [];
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data() as UnlistedStudentReport;
+          items.push({ ...data, id: docSnap.id });
+        });
+        items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        setUnlistedReports(items);
+      },
+      error => {
+        try {
+          handleFirestoreError(error, OperationType.GET, 'unlisted_students');
+        } catch {
+          // Handled
+        }
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
   const handleAddStudent = async (student: Student) => {
     setRemovedStudentIds(prev => prev.filter(id => id !== student.id));
     setCustomStudents(prev => {
@@ -225,8 +260,8 @@ export default function App() {
         grade: student.grade,
         modality: student.modality,
         enrolledCourseIds: student.enrolledCourseIds,
-        addedAtWeek: student.addedAtWeek || currentWeek,
-        addedAt: student.addedAt || new Date().toISOString(),
+        addedAtWeek: student.addedAtWeek || 1,
+        addedAt: student.addedAt || '2026-10-19T00:00:00.000Z',
       });
     } catch (error) {
       try {
@@ -348,6 +383,191 @@ export default function App() {
         // Already logged
       }
     }
+  };
+
+  const handleAddUnlistedStudent = async (report: UnlistedStudentReport) => {
+    setUnlistedReports(prev => {
+      const withoutOld = prev.filter(r => r.id !== report.id);
+      return [report, ...withoutOld];
+    });
+
+    try {
+      await setDoc(doc(db, 'unlisted_students', report.id), {
+        id: report.id,
+        studentName: report.studentName,
+        courseId: report.courseId,
+        instructorId: report.instructorId,
+        instructorName: report.instructorName,
+        weekNumber: report.weekNumber,
+        sessionType: report.sessionType,
+        status: report.status,
+        createdAt: report.createdAt,
+      });
+    } catch (error) {
+      try {
+        handleFirestoreError(error, OperationType.WRITE, `unlisted_students/${report.id}`);
+      } catch {
+        // Handled
+      }
+    }
+  };
+
+  const handleDeleteUnlistedReport = async (reportId: string) => {
+    setUnlistedReports(prev => prev.filter(r => r.id !== reportId));
+    try {
+      await deleteDoc(doc(db, 'unlisted_students', reportId));
+    } catch (error) {
+      try {
+        handleFirestoreError(error, OperationType.DELETE, `unlisted_students/${reportId}`);
+      } catch {
+        // Handled
+      }
+    }
+  };
+
+  const handleEnrollUnlistedStudent = async (report: UnlistedStudentReport): Promise<string> => {
+    const course = effectiveDb.courses.find(c => c.id === report.courseId);
+    const courseTitle = course ? course.title : report.courseId;
+    const canonicalName = getCanonicalStudentName(report.studentName);
+    const existingStudent = findMatchingStudentByFullName(canonicalName, effectiveDb.students);
+
+    let targetStudent: Student;
+    let noticeMessage = '';
+
+    if (existingStudent) {
+      const nextCourses = existingStudent.enrolledCourseIds.includes(report.courseId)
+        ? existingStudent.enrolledCourseIds
+        : [...existingStudent.enrolledCourseIds, report.courseId];
+
+      targetStudent = {
+        ...existingStudent,
+        enrolledCourseIds: nextCourses,
+      };
+      await handleAddStudent(targetStudent);
+      noticeMessage = `"${existingStudent.name}" sistemde aynı isim soyisimle bulundu ve ${courseTitle} dersine eklendi.`;
+    } else {
+      const gradePrefix = course?.gradeClass
+        ? course.gradeClass === 'tyt'
+          ? 'tyt'
+          : `${course.gradeClass.split('/')[0]}. sınıf${
+              course.modality === 'yuzyuze' ? ` (${course.gradeClass} yüz yüze)` : ''
+            }`
+        : '5. sınıf';
+
+      targetStudent = createNewStudentRecord({
+        rawName: canonicalName,
+        modality: course?.modality || 'online',
+        gradeLabel: gradePrefix,
+        enrolledCourseIds: [report.courseId],
+        currentWeek: report.weekNumber,
+        nowIso: '2026-10-19T00:00:00.000Z',
+      });
+      await handleAddStudent(targetStudent);
+      noticeMessage = `"${targetStudent.name}" için yeni öğrenci kaydı oluşturuldu ve şimdilik sadece ${courseTitle} dersine kaydedildi.`;
+    }
+
+    // Ensure student is marked present (not in absentStudentIds) for that specific lesson session
+    const matchingAttendance = attendanceRecords.find(
+      r =>
+        r.courseId === report.courseId &&
+        r.weekNumber === report.weekNumber &&
+        r.sessionType === report.sessionType
+    );
+    if (matchingAttendance && matchingAttendance.absentStudentIds.includes(targetStudent.id)) {
+      await handleSaveAttendance({
+        ...matchingAttendance,
+        absentStudentIds: matchingAttendance.absentStudentIds.filter(id => id !== targetStudent.id),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    const resolvedAt = new Date().toISOString();
+    const updatedReport: UnlistedStudentReport = {
+      ...report,
+      status: 'enrolled',
+      resolvedStudentId: targetStudent.id,
+      resolvedExistingStudent: Boolean(existingStudent),
+      resolvedAt,
+    };
+
+    setUnlistedReports(prev => prev.map(r => (r.id === report.id ? updatedReport : r)));
+
+    try {
+      await setDoc(doc(db, 'unlisted_students', report.id), {
+        id: updatedReport.id,
+        studentName: updatedReport.studentName,
+        courseId: updatedReport.courseId,
+        instructorId: updatedReport.instructorId,
+        instructorName: updatedReport.instructorName,
+        weekNumber: updatedReport.weekNumber,
+        sessionType: updatedReport.sessionType,
+        status: 'enrolled',
+        resolvedStudentId: targetStudent.id,
+        resolvedExistingStudent: Boolean(existingStudent),
+        createdAt: updatedReport.createdAt,
+        resolvedAt,
+      });
+    } catch (error) {
+      try {
+        handleFirestoreError(error, OperationType.WRITE, `unlisted_students/${report.id}`);
+      } catch {
+        // Handled
+      }
+    }
+
+    return noticeMessage;
+  };
+
+  const handleMarkTemporaryUnlistedStudent = async (
+    report: UnlistedStudentReport
+  ): Promise<string> => {
+    const course = effectiveDb.courses.find(c => c.id === report.courseId);
+    const courseTitle = course ? course.title : report.courseId;
+    const canonicalName = getCanonicalStudentName(report.studentName);
+    const existingStudent = findMatchingStudentByFullName(canonicalName, effectiveDb.students);
+
+    const resolvedStudentId = existingStudent
+      ? existingStudent.id
+      : `temp-${slugifyTurkish(canonicalName)}`;
+    const resolvedAt = new Date().toISOString();
+
+    const updatedReport: UnlistedStudentReport = {
+      ...report,
+      status: 'temporary',
+      resolvedStudentId,
+      resolvedExistingStudent: Boolean(existingStudent),
+      resolvedAt,
+    };
+
+    setUnlistedReports(prev => prev.map(r => (r.id === report.id ? updatedReport : r)));
+
+    try {
+      await setDoc(doc(db, 'unlisted_students', report.id), {
+        id: updatedReport.id,
+        studentName: updatedReport.studentName,
+        courseId: updatedReport.courseId,
+        instructorId: updatedReport.instructorId,
+        instructorName: updatedReport.instructorName,
+        weekNumber: updatedReport.weekNumber,
+        sessionType: updatedReport.sessionType,
+        status: 'temporary',
+        resolvedStudentId,
+        resolvedExistingStudent: Boolean(existingStudent),
+        createdAt: updatedReport.createdAt,
+        resolvedAt,
+      });
+    } catch (error) {
+      try {
+        handleFirestoreError(error, OperationType.WRITE, `unlisted_students/${report.id}`);
+      } catch {
+        // Handled
+      }
+    }
+
+    if (existingStudent) {
+      return `"${existingStudent.name}" sistemde mevcut öğrenci olarak doğrulandı; ${courseTitle} dersine kayıt yapılmadan yalnızca ${report.weekNumber}. hafta (${report.sessionType}) yoklamasında var olarak işlendi.`;
+    }
+    return `"${canonicalName}" derse kayıt yapılmadan yalnızca ${courseTitle} · ${report.weekNumber}. hafta (${report.sessionType}) yoklamasında geçici öğrenci olarak var yazıldı.`;
   };
 
   const handleDeleteCourseSession = async (courseId: string, weekNumber: number, sessionType: string) => {
@@ -540,7 +760,10 @@ export default function App() {
             selectedWeek={selectedWeek}
             onSelectWeek={setSelectedWeek}
             attendanceRecords={attendanceRecords}
+            unlistedReports={unlistedReports}
             onSaveAttendance={handleSaveAttendance}
+            onAddUnlistedStudent={handleAddUnlistedStudent}
+            onRemoveUnlistedStudent={handleDeleteUnlistedReport}
             onDeleteCourseSession={handleDeleteCourseSession}
             onBackToLogin={handleReturnHome}
           />
@@ -553,9 +776,13 @@ export default function App() {
             courses={effectiveDb.courses}
             instructors={effectiveDb.instructors}
             attendanceRecords={attendanceRecords}
+            unlistedReports={unlistedReports}
             onAddStudent={handleAddStudent}
             onRemoveStudent={handleRemoveStudent}
             onAssignInstructor={handleAssignInstructor}
+            onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
+            onMarkTemporaryUnlistedStudent={handleMarkTemporaryUnlistedStudent}
+            onDeleteUnlistedReport={handleDeleteUnlistedReport}
             onResetAllAttendance={handleResetAllAttendance}
             onResetAllFeedbacks={handleClearAllFeedbacks}
             onBackToLogin={handleReturnHome}

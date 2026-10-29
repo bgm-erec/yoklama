@@ -6,6 +6,7 @@ import {
   computeAbsentDifferenceSet,
   isStudentResponsibleForSession,
   createNewStudentRecord,
+  findMatchingStudentByFullName,
 } from './enigmaLogic';
 import { DB, syncDatabaseMutations } from '../data/database';
 
@@ -219,5 +220,31 @@ test('syncDatabaseMutations assigns new instructor to bos1 and dynamically updat
   // Reset DB back to clean state
   syncDatabaseMutations([], [], []);
 });
+
+test('findMatchingStudentByFullName matches existing students by full name and merges new course when enrolled', () => {
+  const initial = syncDatabaseMutations([], [], []);
+  // Existing student in DB: 'ece safi' (4. sınıf, online-4a-mat, online-4a-tur)
+  const found = findMatchingStudentByFullName('Ece Safi', initial.students);
+  assert.ok(found);
+  assert.equal(found.name, 'ece safi');
+  assert.ok(!found.enrolledCourseIds.includes('online-4a-fen'));
+
+  // Enroll existing student in online-4a-fen
+  const updatedEce = {
+    ...found,
+    enrolledCourseIds: [...found.enrolledCourseIds, 'online-4a-fen'],
+  };
+  const afterEnroll = syncDatabaseMutations([updatedEce], [], []);
+  const eceAfter = findMatchingStudentByFullName('ece safi', afterEnroll.students);
+  assert.ok(eceAfter?.enrolledCourseIds.includes('online-4a-fen'));
+  assert.equal(eceAfter?.addedAtWeek, undefined);
+
+  // Non-existent student returns undefined
+  const notFound = findMatchingStudentByFullName('Bilinmeyen Öğrenci', initial.students);
+  assert.equal(notFound, undefined);
+
+  syncDatabaseMutations([], [], []);
+});
+
 
 

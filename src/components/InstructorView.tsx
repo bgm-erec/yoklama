@@ -1,6 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { RotateCcw, Sparkles, ArrowLeft, BookOpen, CheckSquare } from 'lucide-react';
-import { AttendanceRecord, Course, DB, Instructor, SessionType, Student } from '../data/database';
+import { RotateCcw, Sparkles, ArrowLeft, BookOpen, CheckSquare, UserPlus, X, Check } from 'lucide-react';
+import {
+  AttendanceRecord,
+  Course,
+  DB,
+  getCanonicalStudentName,
+  Instructor,
+  normalizeTurkish,
+  SessionType,
+  slugifyTurkish,
+  Student,
+  UnlistedStudentReport,
+} from '../data/database';
 import { computeAbsentDifferenceSet, getWeekDateRangeLabel } from '../utils/enigmaLogic';
 
 interface InstructorViewProps {
@@ -9,7 +20,10 @@ interface InstructorViewProps {
   selectedWeek: number;
   onSelectWeek: (week: number) => void;
   attendanceRecords: AttendanceRecord[];
+  unlistedReports?: UnlistedStudentReport[];
   onSaveAttendance: (record: AttendanceRecord) => Promise<void>;
+  onAddUnlistedStudent?: (report: UnlistedStudentReport) => Promise<void>;
+  onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
   onDeleteCourseSession?: (courseId: string, weekNumber: number, sessionType: string) => Promise<void>;
   onBackToLogin: () => void;
 }
@@ -27,7 +41,10 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   selectedWeek,
   onSelectWeek,
   attendanceRecords,
+  unlistedReports = [],
   onSaveAttendance,
+  onAddUnlistedStudent,
+  onRemoveUnlistedStudent,
   onDeleteCourseSession,
   onBackToLogin,
 }) => {
@@ -40,6 +57,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   );
   const [selectedSession, setSelectedSession] = useState<SessionType | null>(null);
   const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'synced'>('synced');
+
+  // Compact unlisted student bar states
+  const [isUnlistedBarOpen, setIsUnlistedBarOpen] = useState(false);
+  const [unlistedNameInput, setUnlistedNameInput] = useState('');
+  const [unlistedFeedback, setUnlistedFeedback] = useState<{ type: 'error' | 'ok'; text: string } | null>(null);
 
   const activeCourse =
     instructorCourses.find(c => c.id === selectedCourseId) || instructorCourses[0];
@@ -92,6 +114,14 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
 
   const presentStudentIds = courseStudentIds.filter(id => !absentStudentIds.includes(id));
   const absentStudents = courseStudents.filter(s => absentStudentIds.includes(s.id));
+
+  // Unlisted / temporary students reported for this specific (course, week, session)
+  const sessionUnlistedReports = unlistedReports.filter(
+    r =>
+      r.courseId === activeCourse?.id &&
+      r.weekNumber === selectedWeek &&
+      r.sessionType === selectedSession
+  );
 
   const triggerSync = async (
     session: SessionType,
@@ -167,6 +197,70 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       nextPresentIds
     );
     await triggerSync(selectedSession, nextAbsentDifferenceSet, false);
+  };
+
+  const handleAddUnlistedSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım') return;
+
+    const cleanName = getCanonicalStudentName(unlistedNameInput);
+    const nameParts = cleanName.split(' ').filter(Boolean);
+    if (nameParts.length < 2) {
+      setUnlistedFeedback({
+        type: 'error',
+        text: 'lütfen öğrencinin tam adını (ad ve soyad) gir.',
+      });
+      return;
+    }
+
+    // Check if already in this course's registered student list
+    const alreadyInCourse = courseStudents.find(
+      s => getCanonicalStudentName(s.name) === cleanName || normalizeTurkish(s.name) === cleanName
+    );
+    if (alreadyInCourse) {
+      if (!presentStudentIds.includes(alreadyInCourse.id)) {
+        await handleTogglePresent(alreadyInCourse.id);
+      }
+      setUnlistedNameInput('');
+      setUnlistedFeedback({
+        type: 'ok',
+        text: `${alreadyInCourse.name} zaten bu derste kayıtlı, derste olarak işaretlendi.`,
+      });
+      setTimeout(() => setUnlistedFeedback(null), 3500);
+      return;
+    }
+
+    const sessionSlug =
+      selectedSession === '1. ders'
+        ? 's1'
+        : selectedSession === '2. ders'
+        ? 's2'
+        : 'sek';
+    const studentSlug = slugifyTurkish(cleanName);
+    const reportId = `unlisted_${activeCourse.id}_w${selectedWeek}_${sessionSlug}_${studentSlug}`;
+
+    const report: UnlistedStudentReport = {
+      id: reportId,
+      studentName: cleanName,
+      courseId: activeCourse.id,
+      instructorId: instructor.id,
+      instructorName: instructor.name,
+      weekNumber: selectedWeek,
+      sessionType: selectedSession,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+
+    if (onAddUnlistedStudent) {
+      await onAddUnlistedStudent(report);
+    }
+    setUnlistedNameInput('');
+    setIsUnlistedBarOpen(false);
+    setUnlistedFeedback({
+      type: 'ok',
+      text: `${cleanName} liste dışı öğrenci olarak eklendi.`,
+    });
+    setTimeout(() => setUnlistedFeedback(null), 3500);
   };
 
   return (
@@ -412,6 +506,113 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                     </label>
                   );
                 })}
+              </div>
+
+              {/* Compact Bar: Listede Olmayan Öğrenci Ekle (between attendance list and absent list) */}
+              <div className="mt-3 pt-2.5 border-t border-stone-200/80">
+                <div className="rounded-xl border border-stone-300/80 bg-[#faf8f4]/90 px-3 py-2">
+                  {!isUnlistedBarOpen ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsUnlistedBarOpen(true);
+                          setUnlistedFeedback(null);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-2.5 py-1 text-[11px] font-medium text-stone-100 hover:bg-stone-800 transition-colors cursor-pointer"
+                      >
+                        <UserPlus className="h-3 w-3" />
+                        <span>listede olmayan öğrenci ekle</span>
+                      </button>
+                      <span className="text-[11px] text-stone-500">
+                        lütfen öğrencinin tam adını gir
+                      </span>
+                    </div>
+                  ) : (
+                    <form
+                      onSubmit={handleAddUnlistedSubmit}
+                      className="flex flex-col sm:flex-row sm:items-center gap-2"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          value={unlistedNameInput}
+                          onChange={e => {
+                            setUnlistedNameInput(e.target.value);
+                            if (unlistedFeedback) setUnlistedFeedback(null);
+                          }}
+                          placeholder="lütfen öğrencinin tam adını gir (ad soyad)..."
+                          className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 focus:border-stone-800 focus:outline-none"
+                        />
+                      </div>
+                      <div className="flex items-center justify-between sm:justify-end gap-1.5 shrink-0">
+                        <span className="text-[10px] text-stone-500 sm:hidden">
+                          lütfen öğrencinin tam adını gir
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="submit"
+                            className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-100 hover:bg-stone-800 transition-colors cursor-pointer"
+                          >
+                            <UserPlus className="h-3 w-3" />
+                            <span>ekle</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsUnlistedBarOpen(false);
+                              setUnlistedNameInput('');
+                              setUnlistedFeedback(null);
+                            }}
+                            aria-label="kapat"
+                            className="inline-flex items-center justify-center rounded-lg border border-stone-300 bg-white p-1.5 text-stone-500 hover:text-stone-900 transition-colors cursor-pointer"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </form>
+                  )}
+
+                  {unlistedFeedback && (
+                    <p
+                      className={`mt-1.5 text-[11px] flex items-center gap-1 ${
+                        unlistedFeedback.type === 'error' ? 'text-rose-700' : 'text-emerald-800'
+                      }`}
+                    >
+                      {unlistedFeedback.type === 'ok' && <Check className="h-3 w-3 shrink-0" />}
+                      <span>{unlistedFeedback.text}</span>
+                    </p>
+                  )}
+
+                  {sessionUnlistedReports.length > 0 && (
+                    <div className="mt-2 pt-1.5 border-t border-stone-200/70 flex flex-wrap items-center gap-1.5">
+                      <span className="text-[10px] text-stone-500">bu derste eklenen liste dışı:</span>
+                      {sessionUnlistedReports.map(rep => (
+                        <span
+                          key={rep.id}
+                          className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50/90 px-2 py-0.5 text-[11px] text-emerald-900"
+                        >
+                          <span className="font-medium">{rep.studentName}</span>
+                          <span className="text-[10px] text-emerald-700">
+                            ({rep.status === 'temporary' ? 'geçici' : rep.status === 'enrolled' ? 'kaydedildi' : 'derste'})
+                          </span>
+                          {onRemoveUnlistedStudent && rep.status === 'pending' && (
+                            <button
+                              type="button"
+                              onClick={() => onRemoveUnlistedStudent(rep.id)}
+                              title="kaldır"
+                              className="ml-0.5 text-stone-400 hover:text-rose-700 cursor-pointer"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 

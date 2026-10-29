@@ -62,6 +62,23 @@ service cloud.firestore {
         && data.updatedAt is string && data.updatedAt.size() <= 64;
     }
 
+    function isValidUnlistedStudentReport(data) {
+      return data.keys().hasAll(['id', 'studentName', 'courseId', 'instructorId', 'instructorName', 'weekNumber', 'sessionType', 'status', 'createdAt'])
+        && data.keys().hasOnly(['id', 'studentName', 'courseId', 'instructorId', 'instructorName', 'weekNumber', 'sessionType', 'status', 'resolvedStudentId', 'resolvedExistingStudent', 'createdAt', 'resolvedAt'])
+        && data.id is string && data.id.size() >= 1 && data.id.size() <= 128
+        && data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120
+        && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
+        && data.instructorId is string && data.instructorId.size() >= 1 && data.instructorId.size() <= 100
+        && data.instructorName is string && data.instructorName.size() >= 1 && data.instructorName.size() <= 120
+        && data.weekNumber is number && data.weekNumber >= 1 && data.weekNumber <= 52
+        && data.sessionType is string && data.sessionType in ['1. ders', '2. ders', 'ek dersler', 'ders yapmadım']
+        && data.status is string && data.status in ['pending', 'enrolled', 'temporary']
+        && (!('resolvedStudentId' in data) || (data.resolvedStudentId is string && data.resolvedStudentId.size() >= 1 && data.resolvedStudentId.size() <= 120))
+        && (!('resolvedExistingStudent' in data) || data.resolvedExistingStudent is bool)
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && (!('resolvedAt' in data) || (data.resolvedAt is string && data.resolvedAt.size() <= 64));
+    }
+
     match /test/connection {
       allow get: if true;
     }
@@ -103,6 +120,13 @@ service cloud.firestore {
       allow list: if resource.data.updatedAt >= '2020-01-01';
       allow create, update: if isValidId(courseId) && isValidInstructorAssignment(incoming());
       allow delete: if isValidId(courseId);
+    }
+
+    match /unlisted_students/{reportId} {
+      allow get: if isValidId(reportId);
+      allow list: if resource.data.createdAt >= '2020-01-01';
+      allow create, update: if isValidId(reportId) && isValidUnlistedStudentReport(incoming());
+      allow delete: if isValidId(reportId);
     }
   }
 }
