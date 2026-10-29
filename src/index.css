@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Cormorant Garamond', Georgia, serif;
+    --font-sans: 'Bricolage Grotesque', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f7f4ee;
+    color: #1c242b;
+    text-transform: lowercase;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  input, textarea, button, select {
+    text-transform: lowercase;
+    font-family: inherit;
+  }
+}
+
+.font-serif-art {
+  font-family: var(--font-display);
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes floatSlow {
+  0%, 100% {
+    transform: translateY(0px) translateX(0px);
+  }
+  50% {
+    transform: translateY(-6px) translateX(4px);
+  }
+}
+
+@keyframes waveDrift {
+  0%, 100% {
+    transform: translateX(0px);
+  }
+  50% {
+    transform: translateX(18px);
+  }
+}
+
+@keyframes gullGlide {
+  0%, 100% {
+    transform: translate(0px, 0px) rotate(0deg);
+  }
+  50% {
+    transform: translate(-14px, -8px) rotate(-2deg);
+  }
+}
+
+.animate-float-slow {
+  animation: floatSlow 9s ease-in-out infinite;
+}
+
+.animate-wave-drift {
+  animation: waveDrift 12s ease-in-out infinite;
+}
+
+.animate-gull-glide {
+  animation: gullGlide 14s ease-in-out infinite;
+}

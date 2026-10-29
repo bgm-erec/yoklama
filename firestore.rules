@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidAttendanceRecord(data) {
+      return data.keys().hasAll(['courseId', 'instructorId', 'weekNumber', 'sessionType', 'absentStudentIds', 'didNotHoldClass', 'updatedAt'])
+        && data.keys().hasOnly(['courseId', 'instructorId', 'weekNumber', 'sessionType', 'absentStudentIds', 'didNotHoldClass', 'updatedAt'])
+        && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
+        && data.instructorId is string && data.instructorId.size() >= 1 && data.instructorId.size() <= 100
+        && data.weekNumber is number && data.weekNumber >= 1 && data.weekNumber <= 52
+        && data.sessionType is string && data.sessionType in ['1. ders', '2. ders', 'ek dersler', 'ders yapmadım']
+        && data.absentStudentIds is list && data.absentStudentIds.size() <= 100
+        && (data.absentStudentIds.size() == 0 || data.absentStudentIds[0] is string)
+        && data.didNotHoldClass is bool
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidFeedbackItem(data) {
+      return data.keys().hasAll(['message', 'createdAt'])
+        && data.keys().hasOnly(['message', 'createdAt'])
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 2000
+        && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidCustomStudent(data) {
+      return data.keys().hasAll(['id', 'name', 'grade', 'modality', 'enrolledCourseIds', 'addedAtWeek', 'addedAt'])
+        && data.keys().hasOnly(['id', 'name', 'grade', 'modality', 'enrolledCourseIds', 'addedAtWeek', 'addedAt'])
+        && data.id is string && data.id.size() >= 1 && data.id.size() <= 120
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.grade is string && data.grade.size() >= 1 && data.grade.size() <= 40
+        && data.modality in ['online', 'yuzyuze']
+        && data.enrolledCourseIds is list && data.enrolledCourseIds.size() >= 1 && data.enrolledCourseIds.size() <= 30
+        && data.enrolledCourseIds[0] is string
+        && data.addedAtWeek is number && data.addedAtWeek >= 1 && data.addedAtWeek <= 52
+        && data.addedAt is string && data.addedAt.size() <= 64;
+    }
+
+    function isValidRemovedStudent(data) {
+      return data.keys().hasAll(['studentId', 'name', 'removedAt'])
+        && data.keys().hasOnly(['studentId', 'name', 'removedAt'])
+        && data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 120
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.removedAt is string && data.removedAt.size() <= 64;
+    }
+
+    function isValidInstructorAssignment(data) {
+      return data.keys().hasAll(['courseId', 'instructorName', 'updatedAt'])
+        && data.keys().hasOnly(['courseId', 'instructorName', 'updatedAt', 'modality', 'gradeClass', 'subject'])
+        && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
+        && data.instructorName is string && data.instructorName.size() >= 1 && data.instructorName.size() <= 120
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /test/connection {
+      allow get: if true;
+    }
+
+    match /attendance/{recordId} {
+      allow get: if isValidId(recordId);
+      allow list: if resource.data.weekNumber >= 1 && resource.data.weekNumber <= 52;
+      allow create: if isValidId(recordId) && isValidAttendanceRecord(incoming());
+      allow update: if isValidId(recordId) && isValidAttendanceRecord(incoming())
+        && incoming().courseId == resource.data.courseId
+        && incoming().weekNumber == resource.data.weekNumber;
+      allow delete: if isValidId(recordId);
+    }
+
+    match /feedback/{feedbackId} {
+      allow get: if isValidId(feedbackId);
+      allow list: if resource.data.createdAt >= '2020-01-01';
+      allow create: if isValidId(feedbackId) && isValidFeedbackItem(incoming());
+      allow update: if false;
+      allow delete: if isValidId(feedbackId);
+    }
+
+    match /custom_students/{studentId} {
+      allow get: if isValidId(studentId);
+      allow list: if resource.data.addedAt >= '2020-01-01';
+      allow create, update: if isValidId(studentId) && isValidCustomStudent(incoming());
+      allow delete: if isValidId(studentId);
+    }
+
+    match /removed_students/{studentId} {
+      allow get: if isValidId(studentId);
+      allow list: if resource.data.removedAt >= '2020-01-01';
+      allow create, update: if isValidId(studentId) && isValidRemovedStudent(incoming());
+      allow delete: if isValidId(studentId);
+    }
+
+    match /instructor_assignments/{courseId} {
+      allow get: if isValidId(courseId);
+      allow list: if resource.data.updatedAt >= '2020-01-01';
+      allow create, update: if isValidId(courseId) && isValidInstructorAssignment(incoming());
+      allow delete: if isValidId(courseId);
+    }
+  }
+}

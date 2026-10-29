@@ -1,0 +1,162 @@
+{
+  "entities": {
+    "AttendanceRecord": {
+      "title": "AttendanceRecord",
+      "description": "Stores attendance taken by an instructor for a specific course, week, and session.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "description": "Unique identifier for the course",
+          "maxLength": 100
+        },
+        "instructorId": {
+          "type": "string",
+          "description": "Unique identifier for the instructor",
+          "maxLength": 100
+        },
+        "weekNumber": {
+          "type": "number",
+          "description": "Week number of the academic term"
+        },
+        "sessionType": {
+          "type": "string",
+          "enum": ["1. ders", "2. ders", "ek dersler", "ders yapmadım"],
+          "description": "Which lesson session of the week",
+          "maxLength": 50
+        },
+        "absentStudentIds": {
+          "type": "array",
+          "description": "List of canonical student IDs who were absent (difference set)",
+          "maxLength": 100
+        },
+        "didNotHoldClass": {
+          "type": "boolean",
+          "description": "True if the instructor selected ders yapmadım"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update",
+          "maxLength": 64
+        }
+      },
+      "required": ["courseId", "instructorId", "weekNumber", "sessionType", "absentStudentIds", "didNotHoldClass", "updatedAt"]
+    },
+    "FeedbackItem": {
+      "title": "FeedbackItem",
+      "description": "Anonymous feedback submitted from the bottom-left feedback button.",
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "Anonymous feedback text",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of creation",
+          "maxLength": 64
+        }
+      },
+      "required": ["message", "createdAt"]
+    },
+    "CustomStudent": {
+      "title": "CustomStudent",
+      "description": "Student dynamically added from the Sibelius admin panel.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "grade": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "modality": {
+          "type": "string",
+          "enum": ["online", "yuzyuze"]
+        },
+        "enrolledCourseIds": {
+          "type": "array",
+          "maxLength": 30
+        },
+        "addedAtWeek": {
+          "type": "number"
+        },
+        "addedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["id", "name", "grade", "modality", "enrolledCourseIds", "addedAtWeek", "addedAt"]
+    },
+    "RemovedStudent": {
+      "title": "RemovedStudent",
+      "description": "Record of a student removed via the Sibelius admin panel.",
+      "type": "object",
+      "properties": {
+        "studentId": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "removedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["studentId", "name", "removedAt"]
+    },
+    "InstructorAssignment": {
+      "title": "InstructorAssignment",
+      "description": "Dynamic assignment of an instructor to a course from the Sibelius panel.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "instructorName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["courseId", "instructorName", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/attendance/{recordId}": {
+      "schema": "AttendanceRecord",
+      "description": "Collection of attendance records per course, week, and session."
+    },
+    "/feedback/{feedbackId}": {
+      "schema": "FeedbackItem",
+      "description": "Collection of anonymous feedback messages."
+    },
+    "/custom_students/{studentId}": {
+      "schema": "CustomStudent",
+      "description": "Collection of students added after initial setup."
+    },
+    "/removed_students/{studentId}": {
+      "schema": "RemovedStudent",
+      "description": "Collection of student IDs removed from the active roster."
+    },
+    "/instructor_assignments/{courseId}": {
+      "schema": "InstructorAssignment",
+      "description": "Collection of course instructor assignments."
+    }
+  }
+}

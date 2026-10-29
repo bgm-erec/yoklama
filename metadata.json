@@ -1,0 +1,6 @@
+{
+  "name": "enigma",
+  "description": "eğitmenler ve ekip için çevrim içi ve yüz yüze ders yoklama ve takip sistemi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
