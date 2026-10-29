@@ -7,6 +7,8 @@ import {
   isStudentResponsibleForSession,
   createNewStudentRecord,
   findMatchingStudentByFullName,
+  isMelekYilmazInstructor,
+  MELEK_YILMAZ_REASSURANCE_MESSAGE,
 } from './enigmaLogic';
 import { DB, syncDatabaseMutations } from '../data/database';
 
@@ -244,6 +246,27 @@ test('findMatchingStudentByFullName matches existing students by full name and m
   assert.equal(notFound, undefined);
 
   syncDatabaseMutations([], [], []);
+});
+
+test('isMelekYilmazInstructor matches exclusively melek yılmaz and no other instructor', () => {
+  const melekRes = resolveIdentityInput('melek yılmaz');
+  assert.equal(melekRes.type, 'instructor');
+  if (melekRes.type === 'instructor') {
+    assert.equal(isMelekYilmazInstructor(melekRes.instructor), true);
+  }
+
+  for (const inst of DB.instructors) {
+    if (inst.name === 'melek yılmaz') {
+      assert.equal(isMelekYilmazInstructor(inst), true);
+    } else {
+      assert.equal(isMelekYilmazInstructor(inst), false);
+    }
+  }
+
+  assert.equal(
+    MELEK_YILMAZ_REASSURANCE_MESSAGE,
+    'aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler'
+  );
 });
 
 

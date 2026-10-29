@@ -69,3 +69,66 @@
 .animate-gull-glide {
   animation: gullGlide 14s ease-in-out infinite;
 }
+
+@keyframes melekShimmerSweep {
+  0% {
+    transform: translateX(-120%) skewX(-18deg);
+  }
+  100% {
+    transform: translateX(220%) skewX(-18deg);
+  }
+}
+
+@keyframes melekBurstRing {
+  0% {
+    transform: scale(0.75);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(1.65);
+    opacity: 0;
+  }
+}
+
+@keyframes melekSparklePop {
+  0% {
+    transform: scale(0) rotate(-25deg) translateY(6px);
+    opacity: 0;
+  }
+  45% {
+    transform: scale(1.25) rotate(12deg) translateY(-8px);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) rotate(0deg) translateY(0px);
+    opacity: 1;
+  }
+}
+
+.animate-melek-shimmer {
+  animation: melekShimmerSweep 0.75s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-melek-ring {
+  animation: melekBurstRing 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-melek-pop {
+  animation: melekSparklePop 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes melekTextReveal {
+  0% {
+    transform: translateY(6px) scale(0.98);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0px) scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-melek-text {
+  animation: melekTextReveal 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+

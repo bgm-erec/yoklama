@@ -215,4 +215,18 @@ export function findMatchingStudentByFullName(
   );
 }
 
+export const MELEK_YILMAZ_REASSURANCE_MESSAGE =
+  'aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler';
 
+/**
+ * Checks whether the given instructor is exclusively "melek yılmaz".
+ */
+export function isMelekYilmazInstructor(
+  instructor: Pick<Instructor, 'id' | 'name'> | null | undefined
+): boolean {
+  if (!instructor) return false;
+  return (
+    normalizeTurkish(instructor.name) === 'melek yılmaz' ||
+    instructor.id === 'inst-melek-yilmaz'
+  );
+}

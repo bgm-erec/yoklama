@@ -12,7 +12,12 @@ import {
   Student,
   UnlistedStudentReport,
 } from '../data/database';
-import { computeAbsentDifferenceSet, getWeekDateRangeLabel } from '../utils/enigmaLogic';
+import {
+  computeAbsentDifferenceSet,
+  getWeekDateRangeLabel,
+  isMelekYilmazInstructor,
+  MELEK_YILMAZ_REASSURANCE_MESSAGE,
+} from '../utils/enigmaLogic';
 
 interface InstructorViewProps {
   instructor: Instructor;
@@ -62,6 +67,20 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const [isUnlistedBarOpen, setIsUnlistedBarOpen] = useState(false);
   const [unlistedNameInput, setUnlistedNameInput] = useState('');
   const [unlistedFeedback, setUnlistedFeedback] = useState<{ type: 'error' | 'ok'; text: string } | null>(null);
+
+  // Exclusive placebo save button state for Melek Yılmaz only
+  const isMelekYilmaz = isMelekYilmazInstructor(instructor);
+  const [melekSavePhase, setMelekSavePhase] = useState<'idle' | 'effect' | 'reassured'>('idle');
+  const [melekBurstKey, setMelekBurstKey] = useState(0);
+
+  const handleMelekPlaceboSave = () => {
+    // Intentionally does NOT perform any save operation (saving is already automatic)
+    setMelekBurstKey(prev => prev + 1);
+    setMelekSavePhase('effect');
+    window.setTimeout(() => {
+      setMelekSavePhase('reassured');
+    }, 650);
+  };
 
   const activeCourse =
     instructorCourses.find(c => c.id === selectedCourseId) || instructorCourses[0];
@@ -392,6 +411,116 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           })}
         </div>
       </div>
+
+      {/* Exclusive Placebo Save Button & Reassurance Effect for Melek Yılmaz Only */}
+      {isMelekYilmaz && (
+        <div className="mb-6 sm:mb-8">
+          <div
+            key={melekBurstKey}
+            className={`relative overflow-hidden rounded-2xl border p-4 sm:p-5 transition-all duration-500 ${
+              melekSavePhase === 'effect'
+                ? 'border-amber-500/80 bg-gradient-to-r from-amber-50/95 via-emerald-50/95 to-amber-50/95 shadow-lg scale-[1.01]'
+                : melekSavePhase === 'reassured'
+                ? 'border-emerald-500/70 bg-gradient-to-r from-emerald-50/90 via-[#f8f5ec] to-emerald-50/90 shadow-sm'
+                : 'border-stone-300/90 bg-white/90'
+            }`}
+          >
+            {/* Shimmer sweep effect when clicked */}
+            {melekSavePhase !== 'idle' && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-y-0 left-0 w-1/2 bg-gradient-to-r from-transparent via-amber-200/60 to-transparent animate-melek-shimmer"
+              />
+            )}
+
+            <div className="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
+              <div className="flex items-center gap-3">
+                <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-stone-900 text-amber-300">
+                  {melekSavePhase !== 'idle' && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute inset-0 rounded-xl border-2 border-amber-400 animate-melek-ring"
+                    />
+                  )}
+                  <Sparkles
+                    className={`h-5 w-5 transition-transform duration-500 ${
+                      melekSavePhase === 'effect'
+                        ? 'scale-125 rotate-45 text-amber-300'
+                        : melekSavePhase === 'reassured'
+                        ? 'text-emerald-300 animate-melek-pop'
+                        : 'text-stone-200'
+                    }`}
+                  />
+                </div>
+                <div>
+                  {melekSavePhase === 'effect' ? (
+                    <p className="font-serif-art text-lg sm:text-xl font-medium text-stone-900 animate-pulse">
+                      ✨ yoklaman mühürleniyor... ✨
+                    </p>
+                  ) : melekSavePhase === 'reassured' ? (
+                    <p
+                      data-testid="melek-reassurance-text"
+                      className="font-serif-art text-lg sm:text-2xl font-medium text-emerald-950 animate-melek-text leading-snug"
+                    >
+                      aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler
+                    </p>
+                  ) : (
+                    <div>
+                      <p className="font-serif-art text-lg sm:text-xl font-medium text-stone-900">
+                        için rahat etsin diye özel kaydet butonu
+                      </p>
+                      <p className="text-xs text-stone-500">
+                        yoklaman zaten anlık kaydediliyor ama emin olmak istersen dokunabilirsin
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="relative self-start sm:self-auto shrink-0">
+                {melekSavePhase === 'effect' && (
+                  <>
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute -inset-1 rounded-xl border-2 border-emerald-500 animate-melek-ring"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute -top-2 -left-2 text-sm animate-melek-pop"
+                    >
+                      ✨
+                    </span>
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute -bottom-2 -right-2 text-sm animate-melek-pop"
+                    >
+                      🌟
+                    </span>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={handleMelekPlaceboSave}
+                  className={`relative inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-xs sm:text-sm font-medium transition-all active:scale-95 cursor-pointer ${
+                    melekSavePhase === 'effect'
+                      ? 'bg-emerald-700 text-white shadow-md scale-105'
+                      : melekSavePhase === 'reassured'
+                      ? 'bg-emerald-900 text-emerald-50 hover:bg-emerald-800 shadow-sm'
+                      : 'bg-stone-900 text-stone-100 hover:bg-stone-800 shadow-sm'
+                  }`}
+                >
+                  {melekSavePhase === 'reassured' ? (
+                    <Check className="h-4 w-4 text-emerald-300" />
+                  ) : (
+                    <Sparkles className="h-4 w-4 text-amber-300" />
+                  )}
+                  <span>kaydet</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Attendance Content Area */}
       {selectedSession === 'ders yapmadım' || (didNotHoldRecord && !selectedSession) ? (
