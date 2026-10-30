@@ -550,7 +550,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           <div className="mb-4 sm:mb-6 flex flex-col sm:flex-row sm:items-baseline justify-between gap-2">
             <div>
               <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900">
-                derse gelmeyen eşekler 🫏
+                derse gelmeyen öğrenciler
               </h2>
               <p className="text-xs text-stone-500 mt-0.5">
                 kimler derste? onların kutucuğuna dokun

@@ -100,7 +100,7 @@ export const AmadeusFeedbackView: React.FC<AmadeusFeedbackViewProps> = ({
                 className="flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/90 p-5 shadow-xs group"
               >
                 <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-wrap break-words">
-                  “{fb.message}”
+                  {fb.message}
                 </p>
                 <div className="mt-4 pt-3 border-t border-stone-200/70 flex items-center justify-between text-[11px] text-stone-400 font-mono-num">
                   <span>anonim #{feedbacks.length - index}</span>
