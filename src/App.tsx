@@ -26,6 +26,7 @@ import {
   findMatchingStudentByFullName,
   getCurrentWeekNumber,
   getWeekDateRangeLabel,
+  getZeroPresentAttendanceRecords,
   resolveIdentityInput,
 } from './utils/enigmaLogic';
 import { BogaziciIllustration } from './components/BogaziciIllustration';
@@ -44,6 +45,7 @@ export default function App() {
   const [identityInput, setIdentityInput] = useState('');
   const [promptWarning, setPromptWarning] = useState<string | null>(null);
   const [route, setRoute] = useState<AppRoute>({ view: 'login' });
+  const [instructorExitCounter, setInstructorExitCounter] = useState(0);
 
   const currentWeek = getCurrentWeekNumber();
   const [selectedWeek, setSelectedWeek] = useState<number>(currentWeek);
@@ -592,6 +594,37 @@ export default function App() {
     }
   };
 
+  const handleResetZeroPresentAttendance = async (): Promise<number> => {
+    const zeroRecords = getZeroPresentAttendanceRecords(
+      attendanceRecords,
+      effectiveDb.courses,
+      unlistedReports,
+      customStudents
+    );
+    if (zeroRecords.length === 0) {
+      return 0;
+    }
+
+    const zeroIds = new Set(zeroRecords.map(r => r.id).filter(Boolean));
+    setAttendanceRecords(prev => prev.filter(r => !r.id || !zeroIds.has(r.id)));
+
+    try {
+      await Promise.all(
+        zeroRecords
+          .filter(r => Boolean(r.id))
+          .map(r => deleteDoc(doc(db, 'attendance', r.id!)))
+      );
+    } catch (error) {
+      try {
+        handleFirestoreError(error, OperationType.DELETE, 'attendance');
+      } catch {
+        // Handled
+      }
+    }
+
+    return zeroRecords.length;
+  };
+
   const handleResetAllAttendance = async () => {
     setAttendanceRecords([]);
     try {
@@ -684,7 +717,16 @@ export default function App() {
     setRoute({ view: 'login' });
     setIdentityInput('');
     setPromptWarning(null);
+    setInstructorExitCounter(0);
     window.history.replaceState(null, 'bach', '#bach');
+  };
+
+  const handleHeaderBrandClick = () => {
+    if (route.view === 'instructor') {
+      setInstructorExitCounter(prev => prev + 1);
+      return;
+    }
+    handleReturnHome();
   };
 
   return (
@@ -696,7 +738,7 @@ export default function App() {
       <header className="relative z-20 flex items-center justify-between px-4 sm:px-6 py-3.5 sm:py-4">
         <button
           type="button"
-          onClick={handleReturnHome}
+          onClick={handleHeaderBrandClick}
           className="font-serif-art text-lg tracking-wide text-stone-800 hover:text-stone-950 py-1 pr-3 transition-colors cursor-pointer"
         >
           bach
@@ -766,6 +808,7 @@ export default function App() {
             onRemoveUnlistedStudent={handleDeleteUnlistedReport}
             onDeleteCourseSession={handleDeleteCourseSession}
             onBackToLogin={handleReturnHome}
+            exitRequestCounter={instructorExitCounter}
           />
         )}
 
@@ -783,6 +826,7 @@ export default function App() {
             onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
             onMarkTemporaryUnlistedStudent={handleMarkTemporaryUnlistedStudent}
             onDeleteUnlistedReport={handleDeleteUnlistedReport}
+            onResetZeroAttendance={handleResetZeroPresentAttendance}
             onResetAllAttendance={handleResetAllAttendance}
             onResetAllFeedbacks={handleClearAllFeedbacks}
             onBackToLogin={handleReturnHome}

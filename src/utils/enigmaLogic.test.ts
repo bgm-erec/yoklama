@@ -9,8 +9,12 @@ import {
   findMatchingStudentByFullName,
   isMelekYilmazInstructor,
   MELEK_YILMAZ_REASSURANCE_MESSAGE,
+  shouldPromptEmptyExit,
+  resolveExitPromptDecision,
+  isZeroPresentAttendanceRecord,
+  getZeroPresentAttendanceRecords,
 } from './enigmaLogic';
-import { DB, syncDatabaseMutations } from '../data/database';
+import { AttendanceRecord, DB, syncDatabaseMutations } from '../data/database';
 
 test('sibelius resolves to admin', () => {
   const res = resolveIdentityInput('Sibelius');
@@ -268,6 +272,148 @@ test('isMelekYilmazInstructor matches exclusively melek yılmaz and no other ins
     'aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler'
   );
 });
+
+test('shouldPromptEmptyExit triggers when leaving with 0 present students or without taking attendance', () => {
+  // Entered course and did not select any session yet (no attendance records for course/week)
+  assert.equal(
+    shouldPromptEmptyExit({
+      selectedSession: null,
+      presentStudentCount: 0,
+      sessionUnlistedCount: 0,
+      courseWeekRecordsCount: 0,
+    }),
+    true
+  );
+
+  // Selected 1. ders and clicked 0 students
+  assert.equal(
+    shouldPromptEmptyExit({
+      selectedSession: '1. ders',
+      presentStudentCount: 0,
+      sessionUnlistedCount: 0,
+      courseWeekRecordsCount: 0,
+    }),
+    true
+  );
+
+  // Selected 1. ders and marked at least 1 student present -> does NOT prompt
+  assert.equal(
+    shouldPromptEmptyExit({
+      selectedSession: '1. ders',
+      presentStudentCount: 1,
+      sessionUnlistedCount: 0,
+      courseWeekRecordsCount: 1,
+    }),
+    false
+  );
+
+  // Selected ders yapmadım -> does NOT prompt
+  assert.equal(
+    shouldPromptEmptyExit({
+      selectedSession: 'ders yapmadım',
+      presentStudentCount: 0,
+      sessionUnlistedCount: 0,
+      courseWeekRecordsCount: 1,
+    }),
+    false
+  );
+
+  // Explicitly confirmed kimse derse gelmedi -> does NOT prompt again
+  assert.equal(
+    shouldPromptEmptyExit({
+      selectedSession: '1. ders',
+      presentStudentCount: 0,
+      sessionUnlistedCount: 0,
+      courseWeekRecordsCount: 1,
+      hasExplicitZeroConfirmation: true,
+    }),
+    false
+  );
+});
+
+test('resolveExitPromptDecision handles herkes derste, kimse derse gelmedi, and şu anda yoklama almıyorum', () => {
+  const courseStudentIds = ['stu-1', 'stu-2', 'stu-3'];
+
+  const allPresent = resolveExitPromptDecision('herkes_derste', {
+    selectedSession: '2. ders',
+    courseStudentIds,
+  });
+  assert.deepEqual(allPresent, {
+    action: 'save',
+    sessionType: '2. ders',
+    absentStudentIds: [],
+    didNotHoldClass: false,
+  });
+
+  const nonePresent = resolveExitPromptDecision('kimse_gelmedi', {
+    selectedSession: null,
+    courseStudentIds,
+  });
+  assert.deepEqual(nonePresent, {
+    action: 'save',
+    sessionType: '1. ders',
+    absentStudentIds: ['stu-1', 'stu-2', 'stu-3'],
+    didNotHoldClass: false,
+  });
+
+  const notTakingNow = resolveExitPromptDecision('yoklama_almiyorum', {
+    selectedSession: '1. ders',
+    courseStudentIds,
+  });
+  assert.deepEqual(notTakingNow, {
+    action: 'discard',
+    sessionType: '1. ders',
+  });
+});
+
+test('getZeroPresentAttendanceRecords detects 0-present records and never touches processed records', () => {
+  const initial = syncDatabaseMutations([], [], []);
+  const course = initial.courses.find(c => c.id === 'online-4a-mat')!;
+  const allStuIds = course.studentIds;
+
+  const emptyRecord: AttendanceRecord = {
+    id: 'online-4a-mat_w2_s1',
+    courseId: 'online-4a-mat',
+    instructorId: course.instructorId,
+    weekNumber: 2,
+    sessionType: '1. ders',
+    absentStudentIds: [...allStuIds],
+    didNotHoldClass: false,
+    updatedAt: '2026-10-30T10:00:00.000Z',
+  };
+
+  const processedRecord: AttendanceRecord = {
+    id: 'online-4a-mat_w2_s2',
+    courseId: 'online-4a-mat',
+    instructorId: course.instructorId,
+    weekNumber: 2,
+    sessionType: '2. ders',
+    absentStudentIds: allStuIds.slice(1), // 1 student present
+    didNotHoldClass: false,
+    updatedAt: '2026-10-30T11:00:00.000Z',
+  };
+
+  const didNotHoldRecord: AttendanceRecord = {
+    id: 'online-4a-mat_w2_sno',
+    courseId: 'online-4a-mat',
+    instructorId: course.instructorId,
+    weekNumber: 2,
+    sessionType: 'ders yapmadım',
+    absentStudentIds: [],
+    didNotHoldClass: true,
+    updatedAt: '2026-10-30T12:00:00.000Z',
+  };
+
+  const zeroList = getZeroPresentAttendanceRecords(
+    [emptyRecord, processedRecord, didNotHoldRecord],
+    initial.courses
+  );
+  assert.equal(zeroList.length, 1);
+  assert.equal(zeroList[0].id, 'online-4a-mat_w2_s1');
+  assert.equal(isZeroPresentAttendanceRecord(processedRecord, initial.courses), false);
+  assert.equal(isZeroPresentAttendanceRecord(didNotHoldRecord, initial.courses), false);
+});
+
 
 
 

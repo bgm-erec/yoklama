@@ -14,9 +14,11 @@ import {
 } from '../data/database';
 import {
   computeAbsentDifferenceSet,
+  ExitAttendanceChoice,
   getWeekDateRangeLabel,
   isMelekYilmazInstructor,
-  MELEK_YILMAZ_REASSURANCE_MESSAGE,
+  resolveExitPromptDecision,
+  shouldPromptEmptyExit,
 } from '../utils/enigmaLogic';
 
 interface InstructorViewProps {
@@ -31,6 +33,7 @@ interface InstructorViewProps {
   onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
   onDeleteCourseSession?: (courseId: string, weekNumber: number, sessionType: string) => Promise<void>;
   onBackToLogin: () => void;
+  exitRequestCounter?: number;
 }
 
 const SESSION_OPTIONS: SessionType[] = [
@@ -52,6 +55,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   onRemoveUnlistedStudent,
   onDeleteCourseSession,
   onBackToLogin,
+  exitRequestCounter = 0,
 }) => {
   const instructorCourses: Course[] = instructor.courseIds
     .map(id => DB.courses.find(c => c.id === id))
@@ -62,6 +66,10 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   );
   const [selectedSession, setSelectedSession] = useState<SessionType | null>(null);
   const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'synced'>('synced');
+
+  // Exit prompt modal state when instructor leaves without taking attendance / clicking any student
+  const [pendingExitAction, setPendingExitAction] = useState<(() => void) | null>(null);
+  const [confirmedZeroSessions, setConfirmedZeroSessions] = useState<string[]>([]);
 
   // Compact unlisted student bar states
   const [isUnlistedBarOpen, setIsUnlistedBarOpen] = useState(false);
@@ -85,13 +93,15 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const activeCourse =
     instructorCourses.find(c => c.id === selectedCourseId) || instructorCourses[0];
 
+  const courseWeekRecords = activeCourse
+    ? attendanceRecords
+        .filter(r => r.courseId === activeCourse.id && r.weekNumber === selectedWeek)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    : [];
+
   // Auto-select the latest recorded session for this course & week when entering or switching week/course
   useEffect(() => {
     if (!activeCourse) return;
-    const courseWeekRecords = attendanceRecords
-      .filter(r => r.courseId === activeCourse.id && r.weekNumber === selectedWeek)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-
     if (courseWeekRecords.length > 0) {
       setSelectedSession(prev => {
         if (prev && courseWeekRecords.some(r => r.sessionType === prev)) {
@@ -102,7 +112,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     } else {
       setSelectedSession(null);
     }
-  }, [activeCourse?.id, selectedWeek, attendanceRecords.length]);
+  }, [activeCourse?.id, selectedWeek]);
 
   // Find current attendance record for (activeCourse, selectedWeek, selectedSession)
   const existingRecord = attendanceRecords.find(
@@ -142,6 +152,15 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       r.sessionType === selectedSession
   );
 
+  const currentSessionConfirmKey =
+    activeCourse && selectedSession
+      ? `${activeCourse.id}_w${selectedWeek}_${selectedSession}`
+      : '';
+
+  const hasExplicitZeroConfirmation = Boolean(
+    currentSessionConfirmKey && confirmedZeroSessions.includes(currentSessionConfirmKey)
+  );
+
   const triggerSync = async (
     session: SessionType,
     newAbsentIds: string[],
@@ -173,24 +192,110 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     setSyncState('synced');
   };
 
-  const handleSelectSession = async (session: SessionType) => {
-    setSelectedSession(session);
-    if (session === 'ders yapmadım') {
-      await triggerSync('ders yapmadım', [], true);
+  const attemptNavigationOrExit = (action: () => void) => {
+    const needsPrompt = shouldPromptEmptyExit({
+      selectedSession,
+      presentStudentCount: presentStudentIds.length,
+      sessionUnlistedCount: sessionUnlistedReports.length,
+      courseWeekRecordsCount: courseWeekRecords.length,
+      hasExplicitZeroConfirmation,
+    });
+
+    if (needsPrompt) {
+      setPendingExitAction(() => action);
     } else {
-      // If there's no record yet for this session, initialize with 0 present students
-      // so the initial difference set (fark kümesi) is all courseStudentIds until instructor checks who is in class.
-      const alreadyExists = attendanceRecords.some(
-        r =>
-          r.courseId === activeCourse?.id &&
-          r.weekNumber === selectedWeek &&
-          r.sessionType === session
+      action();
+    }
+  };
+
+  // Handle top-left "bach" logo click from App header
+  useEffect(() => {
+    if (exitRequestCounter > 0) {
+      attemptNavigationOrExit(onBackToLogin);
+    }
+  }, [exitRequestCounter]);
+
+  const handleExitDecision = async (choice: ExitAttendanceChoice) => {
+    const decision = resolveExitPromptDecision(choice, {
+      selectedSession,
+      courseStudentIds,
+    });
+
+    if (decision.action === 'save') {
+      if (choice === 'kimse_gelmedi' && activeCourse) {
+        const key = `${activeCourse.id}_w${selectedWeek}_${decision.sessionType}`;
+        setConfirmedZeroSessions(prev => (prev.includes(key) ? prev : [...prev, key]));
+      }
+      await triggerSync(
+        decision.sessionType,
+        decision.absentStudentIds,
+        decision.didNotHoldClass
       );
-      if (!alreadyExists) {
-        const initialDifferenceSet = computeAbsentDifferenceSet(courseStudentIds, []);
-        await triggerSync(session, initialDifferenceSet, false);
+    } else if (decision.action === 'discard') {
+      if (
+        activeCourse &&
+        decision.sessionType &&
+        onDeleteCourseSession &&
+        attendanceRecords.some(
+          r =>
+            r.courseId === activeCourse.id &&
+            r.weekNumber === selectedWeek &&
+            r.sessionType === decision.sessionType
+        )
+      ) {
+        await onDeleteCourseSession(activeCourse.id, selectedWeek, decision.sessionType);
       }
     }
+
+    const nextAction = pendingExitAction;
+    setPendingExitAction(null);
+    if (nextAction) {
+      nextAction();
+    }
+  };
+
+  const handleSelectSession = async (session: SessionType) => {
+    if (session === 'ders yapmadım') {
+      // If switching from an un-interacted empty session to "ders yapmadım", clean up any empty record
+      if (
+        activeCourse &&
+        selectedSession &&
+        selectedSession !== 'ders yapmadım' &&
+        presentStudentIds.length === 0 &&
+        sessionUnlistedReports.length === 0 &&
+        !hasExplicitZeroConfirmation &&
+        onDeleteCourseSession &&
+        existingRecord
+      ) {
+        await onDeleteCourseSession(activeCourse.id, selectedWeek, selectedSession);
+      }
+      setSelectedSession('ders yapmadım');
+      await triggerSync('ders yapmadım', [], true);
+      return;
+    }
+
+    if (selectedSession === session) {
+      return;
+    }
+
+    // If currently in another session with 0 students marked present, ask "durum nedir?" before switching
+    if (
+      selectedSession &&
+      selectedSession !== 'ders yapmadım' &&
+      shouldPromptEmptyExit({
+        selectedSession,
+        presentStudentCount: presentStudentIds.length,
+        sessionUnlistedCount: sessionUnlistedReports.length,
+        courseWeekRecordsCount: courseWeekRecords.length,
+        hasExplicitZeroConfirmation,
+      })
+    ) {
+      setPendingExitAction(() => () => setSelectedSession(session));
+      return;
+    }
+
+    // Do NOT auto-save an all-absent record merely on clicking a session tab!
+    setSelectedSession(session);
   };
 
   const handleTogglePresent = async (studentId: string) => {
@@ -289,7 +394,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         <div>
           <button
             type="button"
-            onClick={onBackToLogin}
+            onClick={() => attemptNavigationOrExit(onBackToLogin)}
             className="inline-flex items-center gap-1.5 py-1 text-xs text-stone-500 hover:text-stone-900 transition-colors mb-1 cursor-pointer"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
@@ -330,7 +435,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
             <select
               id="week-select"
               value={selectedWeek}
-              onChange={e => onSelectWeek(Number(e.target.value))}
+              onChange={e => {
+                const nextWeek = Number(e.target.value);
+                if (nextWeek === selectedWeek) return;
+                attemptNavigationOrExit(() => onSelectWeek(nextWeek));
+              }}
               className="rounded-lg border border-stone-300 bg-white/90 px-2.5 py-1.5 text-xs font-mono-num text-stone-800 focus:border-stone-600 focus:outline-none cursor-pointer"
             >
               {Array.from({ length: Math.max(currentWeek + 2, 12) }, (_, i) => i + 1).map(w => (
@@ -353,8 +462,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 key={course.id}
                 type="button"
                 onClick={() => {
-                  setSelectedCourseId(course.id);
-                  setSelectedSession(null);
+                  if (course.id === activeCourse?.id) return;
+                  attemptNavigationOrExit(() => {
+                    setSelectedCourseId(course.id);
+                    setSelectedSession(null);
+                  });
                 }}
                 className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                   course.id === activeCourse?.id
@@ -797,6 +909,96 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           </p>
         </div>
       )}
+
+      {/* Exit / Uninteracted Attendance Prompt Modal: "durum nedir?" */}
+      {pendingExitAction && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="exit-status-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/45 backdrop-blur-[2px] p-4"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-stone-300 bg-[#faf8f4] p-6 sm:p-7 shadow-xl">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <h2
+                  id="exit-status-dialog-title"
+                  className="font-serif-art text-2xl sm:text-3xl text-stone-900 leading-tight"
+                >
+                  durum nedir?
+                </h2>
+                <p className="text-xs text-stone-600 mt-1.5 leading-relaxed">
+                  {activeCourse?.title} · {selectedWeek}. hafta
+                  {selectedSession && selectedSession !== 'ders yapmadım'
+                    ? ` · ${selectedSession}`
+                    : ''}{' '}
+                  için hiçbir öğrenciye tıklanmadı. verileri siteye nasıl işleyelim?
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingExitAction(null)}
+                aria-label="pencereyi kapat ve yoklamaya dön"
+                className="rounded-lg border border-stone-300 bg-white p-1.5 text-stone-500 hover:text-stone-900 transition-colors cursor-pointer shrink-0"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2.5">
+              <button
+                type="button"
+                onClick={() => handleExitDecision('herkes_derste')}
+                className="w-full flex flex-col items-start rounded-xl border border-stone-300 bg-white px-4 py-3.5 text-left hover:border-emerald-700 hover:bg-emerald-50/60 active:scale-[0.99] transition-all cursor-pointer group"
+              >
+                <span className="font-serif-art text-xl font-medium text-stone-900 group-hover:text-emerald-950">
+                  herkes derste
+                </span>
+                <span className="text-xs text-stone-500 mt-0.5">
+                  sınıftaki tüm öğrencileri ({courseStudents.length} öğrenci) derste var olarak kaydet
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleExitDecision('kimse_gelmedi')}
+                className="w-full flex flex-col items-start rounded-xl border border-stone-300 bg-white px-4 py-3.5 text-left hover:border-rose-700 hover:bg-rose-50/50 active:scale-[0.99] transition-all cursor-pointer group"
+              >
+                <span className="font-serif-art text-xl font-medium text-stone-900 group-hover:text-rose-950">
+                  kimse derse gelmedi
+                </span>
+                <span className="text-xs text-stone-500 mt-0.5">
+                  bu derse hiçbir öğrencinin katılmadığını onayla ve kaydet
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleExitDecision('yoklama_almiyorum')}
+                className="w-full flex flex-col items-start rounded-xl border border-stone-900 bg-stone-900 px-4 py-3.5 text-left text-stone-100 hover:bg-stone-800 active:scale-[0.99] transition-all cursor-pointer"
+              >
+                <span className="font-serif-art text-xl font-medium">
+                  şu anda yoklama almıyorum
+                </span>
+                <span className="text-xs text-stone-300 mt-0.5">
+                  sadece listeyi inceledim · yoklama alınmadı olarak bırak ve çık
+                </span>
+              </button>
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-stone-200/80 text-center">
+              <button
+                type="button"
+                onClick={() => setPendingExitAction(null)}
+                className="text-xs text-stone-500 hover:text-stone-900 underline underline-offset-2 cursor-pointer"
+              >
+                vazgeç, yoklama listesine geri dön
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+

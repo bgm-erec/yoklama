@@ -52,6 +52,7 @@ interface AdminSibeliusViewProps {
   onEnrollUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
   onMarkTemporaryUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
   onDeleteUnlistedReport: (reportId: string) => Promise<void>;
+  onResetZeroAttendance?: () => Promise<number>;
   onResetAllAttendance: () => Promise<void>;
   onResetAllFeedbacks: () => Promise<void>;
   onBackToLogin: () => void;
@@ -103,6 +104,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onEnrollUnlistedStudent,
   onMarkTemporaryUnlistedStudent,
   onDeleteUnlistedReport,
+  onResetZeroAttendance,
   onResetAllAttendance,
   onResetAllFeedbacks,
   onBackToLogin,
@@ -782,6 +784,27 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         {/* Right Side: Compact Data Reset Tools (when in menu) OR Quick Category Switcher (when in sub-view) */}
         {category === 'menu' ? (
           <div className="flex flex-wrap items-center gap-1.5 sm:justify-end self-start sm:self-center">
+            {onResetZeroAttendance && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const resetCount = await onResetZeroAttendance();
+                  if (resetCount > 0) {
+                    showTemporaryNotice(
+                      `kimse derse gelmemiş görünen ${resetCount} yoklama kaydı "yoklama alınmadı" olarak sıfırlandı (işlenmiş kayıtlara dokunulmadı).`
+                    );
+                  } else {
+                    showTemporaryNotice(
+                      'kimse derse gelmemiş olarak görünen boş yoklama kaydı bulunmuyor; işlenmiş tüm yoklamalar korundu.'
+                    );
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300/90 bg-white/80 px-2.5 py-1.5 text-[11px] text-stone-700 hover:border-stone-700 hover:text-stone-950 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>boş (0 gelen) yoklamaları sıfırla</span>
+              </button>
+            )}
             {!confirmingAttendanceReset ? (
               <button
                 type="button"

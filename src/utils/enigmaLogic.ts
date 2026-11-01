@@ -1,12 +1,15 @@
 import {
   AttendanceRecord,
+  Course,
   DB,
   getCanonicalStudentName,
   Instructor,
   Modality,
   normalizeTurkish,
+  SessionType,
   slugifyTurkish,
   Student,
+  UnlistedStudentReport,
 } from '../data/database';
 
 export type LoginResolution =
@@ -230,3 +233,164 @@ export function isMelekYilmazInstructor(
     instructor.id === 'inst-melek-yilmaz'
   );
 }
+
+export type ExitAttendanceChoice =
+  | 'herkes_derste'
+  | 'kimse_gelmedi'
+  | 'yoklama_almiyorum';
+
+/**
+ * Determines whether the instructor should be prompted with:
+ * "durum nedir? herkes derste / kimse derse gelmedi / şu anda yoklama almıyorum"
+ * when leaving a lesson or course without taking attendance or without clicking any student.
+ */
+export function shouldPromptEmptyExit(params: {
+  selectedSession: SessionType | null;
+  presentStudentCount: number;
+  sessionUnlistedCount: number;
+  courseWeekRecordsCount: number;
+  hasExplicitZeroConfirmation?: boolean;
+}): boolean {
+  const {
+    selectedSession,
+    presentStudentCount,
+    sessionUnlistedCount,
+    courseWeekRecordsCount,
+    hasExplicitZeroConfirmation = false,
+  } = params;
+
+  if (selectedSession === 'ders yapmadım') {
+    return false;
+  }
+
+  // If a session (1. ders, 2. ders, ek dersler) is open and no student is marked present
+  if (selectedSession !== null) {
+    if (hasExplicitZeroConfirmation) return false;
+    return presentStudentCount === 0 && sessionUnlistedCount === 0;
+  }
+
+  // If no session is selected and no attendance record exists for this course & week at all
+  return courseWeekRecordsCount === 0;
+}
+
+/**
+ * Computes the attendance action to perform based on the instructor's answer to "durum nedir?".
+ */
+export function resolveExitPromptDecision(
+  choice: ExitAttendanceChoice,
+  params: {
+    selectedSession: SessionType | null;
+    courseStudentIds: string[];
+  }
+):
+  | {
+      action: 'save';
+      sessionType: SessionType;
+      absentStudentIds: string[];
+      didNotHoldClass: boolean;
+    }
+  | {
+      action: 'discard';
+      sessionType: SessionType | null;
+    } {
+  const targetSession: SessionType =
+    params.selectedSession && params.selectedSession !== 'ders yapmadım'
+      ? params.selectedSession
+      : '1. ders';
+
+  if (choice === 'herkes_derste') {
+    return {
+      action: 'save',
+      sessionType: targetSession,
+      absentStudentIds: [],
+      didNotHoldClass: false,
+    };
+  }
+
+  if (choice === 'kimse_gelmedi') {
+    return {
+      action: 'save',
+      sessionType: targetSession,
+      absentStudentIds: [...params.courseStudentIds],
+      didNotHoldClass: false,
+    };
+  }
+
+  return {
+    action: 'discard',
+    sessionType: params.selectedSession,
+  };
+}
+
+/**
+ * Checks whether an attendance record represents an unprocessed "nobody came to class" (0 present)
+ * session, while preserving any processed sessions (where at least 1 student was present at the
+ * time of recording, or an unlisted student was reported in that session, or "ders yapmadım" was chosen).
+ */
+export function isZeroPresentAttendanceRecord(
+  record: AttendanceRecord,
+  courses: Course[],
+  unlistedReports: UnlistedStudentReport[] = [],
+  customStudents: Student[] = []
+): boolean {
+  if (record.didNotHoldClass || record.sessionType === 'ders yapmadım') {
+    return false;
+  }
+
+  const hasUnlistedInSession = unlistedReports.some(
+    u =>
+      u.courseId === record.courseId &&
+      u.weekNumber === record.weekNumber &&
+      u.sessionType === record.sessionType
+  );
+  if (hasUnlistedInSession) {
+    return false;
+  }
+
+  const course = courses.find(c => c.id === record.courseId);
+  if (!course || course.studentIds.length === 0) {
+    return false;
+  }
+
+  // Students who were on the course roster at the time this attendance record was saved
+  const rosterAtRecordTime = course.studentIds.filter(sid => {
+    const customStu = customStudents.find(cs => cs.id === sid);
+    if (!customStu) return true;
+    const resolvedReports = unlistedReports.filter(
+      u => u.resolvedStudentId === sid && Boolean(u.resolvedAt)
+    );
+    if (resolvedReports.length > 0) {
+      const earliestResolved = resolvedReports
+        .map(u => u.resolvedAt!)
+        .sort()[0];
+      return earliestResolved <= record.updatedAt;
+    }
+    return (customStu.addedAt || '') <= record.updatedAt;
+  });
+
+  if (rosterAtRecordTime.length === 0) {
+    return false;
+  }
+
+  const presentAtRecordTime = rosterAtRecordTime.filter(
+    sid => !record.absentStudentIds.includes(sid)
+  );
+
+  return presentAtRecordTime.length === 0;
+}
+
+/**
+ * Filters and returns only the attendance records where nobody came to class (0 present),
+ * leaving all processed attendance records untouched.
+ */
+export function getZeroPresentAttendanceRecords(
+  attendanceRecords: AttendanceRecord[],
+  courses: Course[],
+  unlistedReports: UnlistedStudentReport[] = [],
+  customStudents: Student[] = []
+): AttendanceRecord[] {
+  return attendanceRecords.filter(record =>
+    isZeroPresentAttendanceRecord(record, courses, unlistedReports, customStudents)
+  );
+}
+
