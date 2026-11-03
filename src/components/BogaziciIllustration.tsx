@@ -5,7 +5,7 @@ import React from 'react';
  * Albert Long Hall clock tower, Hamlin Hall silhouettes, cypress trees on the Bebek ridge,
  * Rumeli Hisarı towers, and gentle Bosphorus waves with gliding seagulls.
  */
-export const BogaziciIllustration: React.FC = () => {
+export const BogaziciIllustration: React.FC = React.memo(() => {
   return (
     <div
       className="pointer-events-none fixed inset-0 z-0 overflow-hidden select-none opacity-40"
@@ -118,4 +118,4 @@ export const BogaziciIllustration: React.FC = () => {
       </svg>
     </div>
   );
-};
+});

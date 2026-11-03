@@ -415,7 +415,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   };
 
   // ================= STUDENT METRICS (Sorted by lowest attendance rate first) =================
-  const studentStats = useMemo(() => {
+  const baseStudentStats = useMemo(() => {
     return students
       .map(student => {
         const relevantRecords = attendanceRecords.filter(
@@ -437,12 +437,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           attendanceRate,
         };
       })
-      .filter(item =>
-        !normalizedQuery
-          ? true
-          : item.student.name.includes(normalizedQuery) ||
-            item.student.grade.includes(normalizedQuery)
-      )
       .sort((a, b) => {
         if (b.absentCount !== a.absentCount) {
           return b.absentCount - a.absentCount;
@@ -452,10 +446,19 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         }
         return a.student.name.localeCompare(b.student.name, 'tr-TR');
       });
-  }, [students, attendanceRecords, currentWeek, normalizedQuery]);
+  }, [students, attendanceRecords, currentWeek]);
+
+  const studentStats = useMemo(() => {
+    if (!normalizedQuery) return baseStudentStats;
+    return baseStudentStats.filter(
+      item =>
+        item.student.name.includes(normalizedQuery) ||
+        item.student.grade.includes(normalizedQuery)
+    );
+  }, [baseStudentStats, normalizedQuery]);
 
   // ================= INSTRUCTOR METRICS (Unrecorded / "ders yapmadım" this week on top) =================
-  const instructorStats = useMemo(() => {
+  const baseInstructorStats = useMemo(() => {
     return instructors
       .map(instructor => {
         const thisWeekRecords = attendanceRecords.filter(
@@ -480,17 +483,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           inactiveThisWeek,
         };
       })
-      .filter(item => {
-        if (!normalizedQuery) return true;
-        const courseMatch = item.courses.some(c =>
-          c.title.includes(normalizedQuery)
-        );
-        return (
-          item.instructor.name.includes(normalizedQuery) ||
-          (item.instructor.alias && item.instructor.alias.includes(normalizedQuery)) ||
-          courseMatch
-        );
-      })
       .sort((a, b) => {
         if (a.inactiveThisWeek !== b.inactiveThisWeek) {
           return a.inactiveThisWeek ? -1 : 1;
@@ -500,10 +492,24 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         }
         return a.instructor.name.localeCompare(b.instructor.name, 'tr-TR');
       });
-  }, [instructors, courses, attendanceRecords, currentWeek, normalizedQuery]);
+  }, [instructors, courses, attendanceRecords, currentWeek]);
+
+  const instructorStats = useMemo(() => {
+    if (!normalizedQuery) return baseInstructorStats;
+    return baseInstructorStats.filter(item => {
+      const courseMatch = item.courses.some(c =>
+        c.title.includes(normalizedQuery)
+      );
+      return (
+        item.instructor.name.includes(normalizedQuery) ||
+        (item.instructor.alias && item.instructor.alias.includes(normalizedQuery)) ||
+        courseMatch
+      );
+    });
+  }, [baseInstructorStats, normalizedQuery]);
 
   // ================= COURSE METRICS (Highest absence / unrecorded this week on top) =================
-  const courseStats = useMemo(() => {
+  const baseCourseStats = useMemo(() => {
     return courses
       .map(course => {
         const courseRecords = attendanceRecords.filter(
@@ -523,12 +529,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           noAttendanceThisWeek,
         };
       })
-      .filter(item =>
-        !normalizedQuery
-          ? true
-          : item.course.title.includes(normalizedQuery) ||
-            item.course.instructorName.includes(normalizedQuery)
-      )
       .sort((a, b) => {
         if (b.totalAbsences !== a.totalAbsences) {
           return b.totalAbsences - a.totalAbsences;
@@ -538,7 +538,16 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         }
         return a.course.title.localeCompare(b.course.title, 'tr-TR');
       });
-  }, [courses, attendanceRecords, currentWeek, normalizedQuery]);
+  }, [courses, attendanceRecords, currentWeek]);
+
+  const courseStats = useMemo(() => {
+    if (!normalizedQuery) return baseCourseStats;
+    return baseCourseStats.filter(
+      item =>
+        item.course.title.includes(normalizedQuery) ||
+        item.course.instructorName.includes(normalizedQuery)
+    );
+  }, [baseCourseStats, normalizedQuery]);
 
   const resetDetailSelection = () => {
     setSelectedStudentId(null);

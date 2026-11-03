@@ -797,7 +797,10 @@ export default function App() {
 
         {route.view === 'instructor' && (
           <InstructorView
-            instructor={route.instructor}
+            instructor={
+              effectiveDb.instructors.find(i => i.id === route.instructor.id) ||
+              route.instructor
+            }
             currentWeek={currentWeek}
             selectedWeek={selectedWeek}
             onSelectWeek={setSelectedWeek}

@@ -40,24 +40,34 @@ export function resolveIdentityInput(rawInput: string): LoginResolution {
     return { type: 'feedback_admin' };
   }
 
-  // 1. Check exact match on full instructor name or alias (e.g. bos1, bos2, bos3, bos4)
+  // 1. Check exact match on full instructor name, alias (e.g. bos1..bos4), or space-insensitive full name
+  const collapsedInput = input.replace(/\s+/g, '');
   const exactFullMatches = DB.instructors.filter(
-    inst => inst.name === input || inst.alias === input
+    inst =>
+      inst.name === input ||
+      inst.alias === input ||
+      inst.name.replace(/\s+/g, '') === collapsedInput
   );
   if (exactFullMatches.length === 1) {
     return { type: 'instructor', instructor: exactFullMatches[0] };
   }
 
-  // 2. Check if user entered first name + last name (ignoring middle name, e.g., "elif dede" for "elif büşra dede")
+  // 2. Check if user entered given name + last name (including middle name + last name, e.g., "elif dede" or "büşra dede" for "elif büşra dede")
   const inputTokens = input.split(' ').filter(Boolean);
   if (inputTokens.length >= 2) {
     const first = inputTokens[0];
     const last = inputTokens[inputTokens.length - 1];
     const firstLastMatches = DB.instructors.filter(inst => {
-      // Match first + last, or match prefix of multi-word name
-      const matchesFirstLast = inst.firstName === first && inst.lastName === last;
+      const instTokens = inst.name.split(' ').filter(Boolean);
+      const givenNames = instTokens.slice(0, -1);
+      const matchesGivenAndLast =
+        (inst.firstName === first ||
+          givenNames.includes(first) ||
+          inst.firstName === `${first}nur`) &&
+        inst.lastName === last;
       const matchesPrefix = inst.name.startsWith(input + ' ') || inst.name === input;
-      return matchesFirstLast || matchesPrefix;
+      const matchesSuffix = inst.name.endsWith(' ' + input);
+      return matchesGivenAndLast || matchesPrefix || matchesSuffix;
     });
 
     if (firstLastMatches.length === 1) {
@@ -79,7 +89,8 @@ export function resolveIdentityInput(rawInput: string): LoginResolution {
     return (
       inst.firstName === input ||
       givenNames.includes(input) ||
-      givenNames.join(' ') === input
+      givenNames.join(' ') === input ||
+      givenNames.join('') === collapsedInput
     );
   });
 
@@ -92,6 +103,21 @@ export function resolveIdentityInput(rawInput: string): LoginResolution {
       type: 'need_surname',
       matchingFirstName: input,
       candidates: firstNameMatches,
+    };
+  }
+
+  // 4. Fallback for compound "-nur" first names (e.g. "buse" -> "busenur uçar") or unique last/second name (e.g. "zümra" -> "ayşegül zümra")
+  const fallbackMatches = DB.instructors.filter(
+    inst => inst.firstName === `${input}nur` || inst.lastName === input
+  );
+  if (fallbackMatches.length === 1) {
+    return { type: 'instructor', instructor: fallbackMatches[0] };
+  }
+  if (fallbackMatches.length > 1) {
+    return {
+      type: 'need_surname',
+      matchingFirstName: input,
+      candidates: fallbackMatches,
     };
   }
 
@@ -221,8 +247,10 @@ export function findMatchingStudentByFullName(
 export const MELEK_YILMAZ_REASSURANCE_MESSAGE =
   'aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler';
 
+export const PLACEBO_SAVE_STORAGE_KEY = 'bach_placebo_save_prefs_v1';
+
 /**
- * Checks whether the given instructor is exclusively "melek yılmaz".
+ * Checks whether the given instructor is "melek yılmaz".
  */
 export function isMelekYilmazInstructor(
   instructor: Pick<Instructor, 'id' | 'name'> | null | undefined
@@ -232,6 +260,84 @@ export function isMelekYilmazInstructor(
     normalizeTurkish(instructor.name) === 'melek yılmaz' ||
     instructor.id === 'inst-melek-yilmaz'
   );
+}
+
+/**
+ * Extracts the given name(s) of an instructor (without surname) for personalized reassurance messages.
+ */
+export function getInstructorDisplayFirstName(
+  instructor: Pick<Instructor, 'name' | 'firstName'> | null | undefined
+): string {
+  if (!instructor) return '';
+  const normName = normalizeTurkish(instructor.name);
+  const parts = normName.split(' ').filter(Boolean);
+  if (parts.length > 1) {
+    return parts.slice(0, -1).join(' ');
+  }
+  return normalizeTurkish(instructor.firstName || instructor.name);
+}
+
+/**
+ * Builds the personalized reassurance message shown after clicking the placebo "kaydet" button:
+ * "aklın sakın orada kalmasın <isim>, yoklaman kayıt altında, iyi dersler"
+ */
+export function getInstructorReassuranceMessage(
+  instructor: Pick<Instructor, 'name' | 'firstName'> | null | undefined
+): string {
+  const displayName = getInstructorDisplayFirstName(instructor) || 'canım';
+  return `aklın sakın orada kalmasın ${displayName}, yoklaman kayıt altında, iyi dersler`;
+}
+
+/**
+ * Reads the persisted placebo save button preference for an instructor from serialized storage JSON.
+ * Defaults to false for all instructors unless explicitly enabled (or Melek Yılmaz if not yet overridden).
+ */
+export function getPlaceboSavePreference(
+  instructor: Pick<Instructor, 'id' | 'name'> | null | undefined,
+  storageRaw: string | null | undefined
+): boolean {
+  if (!instructor) return false;
+  if (storageRaw) {
+    try {
+      const parsed = JSON.parse(storageRaw) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed[instructor.id] === 'boolean') {
+          return parsed[instructor.id] as boolean;
+        }
+        const normName = normalizeTurkish(instructor.name);
+        if (typeof parsed[normName] === 'boolean') {
+          return parsed[normName] as boolean;
+        }
+      }
+    } catch {
+      // Ignore malformed storage JSON
+    }
+  }
+  return isMelekYilmazInstructor(instructor);
+}
+
+/**
+ * Updates the serialized storage JSON with the instructor's placebo save button toggle preference.
+ */
+export function setPlaceboSavePreferenceInMap(
+  instructor: Pick<Instructor, 'id' | 'name'>,
+  enabled: boolean,
+  storageRaw: string | null | undefined
+): string {
+  let map: Record<string, boolean> = {};
+  if (storageRaw) {
+    try {
+      const parsed = JSON.parse(storageRaw);
+      if (parsed && typeof parsed === 'object') {
+        map = { ...parsed };
+      }
+    } catch {
+      map = {};
+    }
+  }
+  map[instructor.id] = enabled;
+  map[normalizeTurkish(instructor.name)] = enabled;
+  return JSON.stringify(map);
 }
 
 export type ExitAttendanceChoice =

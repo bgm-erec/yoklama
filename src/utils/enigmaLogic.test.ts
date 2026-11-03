@@ -9,6 +9,10 @@ import {
   findMatchingStudentByFullName,
   isMelekYilmazInstructor,
   MELEK_YILMAZ_REASSURANCE_MESSAGE,
+  getInstructorDisplayFirstName,
+  getInstructorReassuranceMessage,
+  getPlaceboSavePreference,
+  setPlaceboSavePreferenceInMap,
   shouldPromptEmptyExit,
   resolveExitPromptDecision,
   isZeroPresentAttendanceRecord,
@@ -66,7 +70,7 @@ test('shared first names trigger surname prompt warning', () => {
   assert.equal(kaan.type, 'need_surname');
 });
 
-test('full name after surname warning resolves to exact instructor', () => {
+test('full name and middle+last name after surname warning resolve to exact instructor', () => {
   const zehraUgur = resolveIdentityInput('zehra uğur');
   assert.equal(zehraUgur.type, 'instructor');
   if (zehraUgur.type === 'instructor') {
@@ -77,6 +81,50 @@ test('full name after surname warning resolves to exact instructor', () => {
   assert.equal(elifDede.type, 'instructor');
   if (elifDede.type === 'instructor') {
     assert.equal(elifDede.instructor.name, 'elif büşra dede');
+  }
+
+  // Middle + last name resolution for 3-word instructors
+  const busraDede = resolveIdentityInput('büşra dede');
+  assert.equal(busraDede.type, 'instructor');
+  if (busraDede.type === 'instructor') {
+    assert.equal(busraDede.instructor.name, 'elif büşra dede');
+  }
+
+  const rabiaTirek = resolveIdentityInput('rabia tirek');
+  assert.equal(rabiaTirek.type, 'instructor');
+  if (rabiaTirek.type === 'instructor') {
+    assert.equal(rabiaTirek.instructor.name, 'elif rabia tirek');
+  }
+
+  const nisaAkdogan = resolveIdentityInput('nisa akdoğan');
+  assert.equal(nisaAkdogan.type, 'instructor');
+  if (nisaAkdogan.type === 'instructor') {
+    assert.equal(nisaAkdogan.instructor.name, 'fatma nisa akdoğan');
+  }
+
+  const zehraNamli = resolveIdentityInput('zehra namlı');
+  assert.equal(zehraNamli.type, 'instructor');
+  if (zehraNamli.type === 'instructor') {
+    assert.equal(zehraNamli.instructor.name, 'fatma zehra namlı');
+  }
+
+  const emreSahin = resolveIdentityInput('emre şahin');
+  assert.equal(emreSahin.type, 'instructor');
+  if (emreSahin.type === 'instructor') {
+    assert.equal(emreSahin.instructor.name, 'hüseyin emre şahin');
+  }
+
+  // Compound name busenur uçar resolves when typed as 'buse' or 'buse nur uçar'
+  const buseShort = resolveIdentityInput('buse');
+  assert.equal(buseShort.type, 'instructor');
+  if (buseShort.type === 'instructor') {
+    assert.equal(buseShort.instructor.name, 'busenur uçar');
+  }
+
+  const buseSpaced = resolveIdentityInput('buse nur uçar');
+  assert.equal(buseSpaced.type, 'instructor');
+  if (buseSpaced.type === 'instructor') {
+    assert.equal(buseSpaced.instructor.name, 'busenur uçar');
   }
 });
 
@@ -159,7 +207,7 @@ test('isStudentResponsibleForSession excludes sessions prior to student addition
   );
 });
 
-test('syncDatabaseMutations dynamically adds and removes students across courses', () => {
+test('syncDatabaseMutations dynamically adds, removes, and updates student course enrollments', () => {
   const newSt = createNewStudentRecord({
     rawName: 'Canan Ersoy',
     modality: 'yuzyuze',
@@ -173,6 +221,13 @@ test('syncDatabaseMutations dynamically adds and removes students across courses
   assert.ok(mutated.students.some(s => s.id === 'stu-canan-ersoy'));
   const yy5aMat = mutated.courses.find(c => c.id === 'yy-5a-mat');
   assert.ok(yy5aMat?.studentIds.includes('stu-canan-ersoy'));
+
+  // Verify Murat Yüksek is only in 6/a courses and not 5/a courses
+  const murat = mutated.students.find(s => s.name === 'murat yüksek');
+  assert.ok(murat);
+  assert.equal(yy5aMat?.studentIds.includes(murat.id), false);
+  const yy6aMat = mutated.courses.find(c => c.id === 'yy-6a-mat');
+  assert.equal(yy6aMat?.studentIds.includes(murat.id), true);
 
   // Now remove Canan Ersoy
   const afterRemove = syncDatabaseMutations([newSt], ['stu-canan-ersoy']);
@@ -252,25 +307,54 @@ test('findMatchingStudentByFullName matches existing students by full name and m
   syncDatabaseMutations([], [], []);
 });
 
-test('isMelekYilmazInstructor matches exclusively melek yılmaz and no other instructor', () => {
+test('placebo save button preference and personalized reassurance message work for Melek and any opted-in instructor', () => {
   const melekRes = resolveIdentityInput('melek yılmaz');
   assert.equal(melekRes.type, 'instructor');
-  if (melekRes.type === 'instructor') {
+
+  const cagdasRes = resolveIdentityInput('çağdaş');
+  assert.equal(cagdasRes.type, 'instructor');
+
+  const elifBusraRes = resolveIdentityInput('elif büşra dede');
+  assert.equal(elifBusraRes.type, 'instructor');
+
+  if (
+    melekRes.type === 'instructor' &&
+    cagdasRes.type === 'instructor' &&
+    elifBusraRes.type === 'instructor'
+  ) {
     assert.equal(isMelekYilmazInstructor(melekRes.instructor), true);
-  }
+    assert.equal(isMelekYilmazInstructor(cagdasRes.instructor), false);
 
-  for (const inst of DB.instructors) {
-    if (inst.name === 'melek yılmaz') {
-      assert.equal(isMelekYilmazInstructor(inst), true);
-    } else {
-      assert.equal(isMelekYilmazInstructor(inst), false);
-    }
-  }
+    // Personalized display name & reassurance messages
+    assert.equal(getInstructorDisplayFirstName(melekRes.instructor), 'melek');
+    assert.equal(
+      getInstructorReassuranceMessage(melekRes.instructor),
+      MELEK_YILMAZ_REASSURANCE_MESSAGE
+    );
 
-  assert.equal(
-    MELEK_YILMAZ_REASSURANCE_MESSAGE,
-    'aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler'
-  );
+    assert.equal(getInstructorDisplayFirstName(cagdasRes.instructor), 'çağdaş');
+    assert.equal(
+      getInstructorReassuranceMessage(cagdasRes.instructor),
+      'aklın sakın orada kalmasın çağdaş, yoklaman kayıt altında, iyi dersler'
+    );
+
+    assert.equal(getInstructorDisplayFirstName(elifBusraRes.instructor), 'elif büşra');
+    assert.equal(
+      getInstructorReassuranceMessage(elifBusraRes.instructor),
+      'aklın sakın orada kalmasın elif büşra, yoklaman kayıt altında, iyi dersler'
+    );
+
+    // Default preference: false for other instructors, true for Melek
+    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, null), false);
+    assert.equal(getPlaceboSavePreference(melekRes.instructor, null), true);
+
+    // Opting in persists across logins until deactivated
+    const enabledRaw = setPlaceboSavePreferenceInMap(cagdasRes.instructor, true, null);
+    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, enabledRaw), true);
+
+    const disabledRaw = setPlaceboSavePreferenceInMap(cagdasRes.instructor, false, enabledRaw);
+    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, disabledRaw), false);
+  }
 });
 
 test('shouldPromptEmptyExit triggers when leaving with 0 present students or without taking attendance', () => {
@@ -413,7 +497,3 @@ test('getZeroPresentAttendanceRecords detects 0-present records and never touche
   assert.equal(isZeroPresentAttendanceRecord(processedRecord, initial.courses), false);
   assert.equal(isZeroPresentAttendanceRecord(didNotHoldRecord, initial.courses), false);
 });
-
-
-
-

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { RotateCcw, Sparkles, ArrowLeft, BookOpen, CheckSquare, UserPlus, X, Check } from 'lucide-react';
 import {
   AttendanceRecord,
@@ -15,9 +15,12 @@ import {
 import {
   computeAbsentDifferenceSet,
   ExitAttendanceChoice,
+  getInstructorReassuranceMessage,
+  getPlaceboSavePreference,
   getWeekDateRangeLabel,
-  isMelekYilmazInstructor,
+  PLACEBO_SAVE_STORAGE_KEY,
   resolveExitPromptDecision,
+  setPlaceboSavePreferenceInMap,
   shouldPromptEmptyExit,
 } from '../utils/enigmaLogic';
 
@@ -76,17 +79,64 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const [unlistedNameInput, setUnlistedNameInput] = useState('');
   const [unlistedFeedback, setUnlistedFeedback] = useState<{ type: 'error' | 'ok'; text: string } | null>(null);
 
-  // Exclusive placebo save button state for Melek Yılmaz only
-  const isMelekYilmaz = isMelekYilmazInstructor(instructor);
+  // Placebo save button & persistent per-instructor toggle state
+  const [isPlaceboSaveEnabled, setIsPlaceboSaveEnabled] = useState<boolean>(() => {
+    try {
+      const raw = typeof window !== 'undefined' ? window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY) : null;
+      return getPlaceboSavePreference(instructor, raw);
+    } catch {
+      return getPlaceboSavePreference(instructor, null);
+    }
+  });
   const [melekSavePhase, setMelekSavePhase] = useState<'idle' | 'effect' | 'reassured'>('idle');
   const [melekBurstKey, setMelekBurstKey] = useState(0);
+  const saveTimerRef = useRef<number | null>(null);
 
-  const handleMelekPlaceboSave = () => {
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
+      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, raw));
+    } catch {
+      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, null));
+    }
+    setMelekSavePhase('idle');
+  }, [instructor.id]);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleTogglePlaceboSaveButton = () => {
+    setIsPlaceboSaveEnabled(prev => {
+      const next = !prev;
+      try {
+        const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
+        const updatedRaw = setPlaceboSavePreferenceInMap(instructor, next, raw);
+        window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
+      } catch {
+        // Ignore storage write error
+      }
+      if (!next) {
+        setMelekSavePhase('idle');
+      }
+      return next;
+    });
+  };
+
+  const handlePlaceboSaveClick = () => {
     // Intentionally does NOT perform any save operation (saving is already automatic)
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
     setMelekBurstKey(prev => prev + 1);
     setMelekSavePhase('effect');
-    window.setTimeout(() => {
+    saveTimerRef.current = window.setTimeout(() => {
       setMelekSavePhase('reassured');
+      saveTimerRef.current = null;
     }, 650);
   };
 
@@ -99,10 +149,14 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     : [];
 
+  const autoSelectedKeyRef = useRef<string>('');
+
   // Auto-select the latest recorded session for this course & week when entering or switching week/course
   useEffect(() => {
     if (!activeCourse) return;
+    const contextKey = `${activeCourse.id}_w${selectedWeek}`;
     if (courseWeekRecords.length > 0) {
+      autoSelectedKeyRef.current = contextKey;
       setSelectedSession(prev => {
         if (prev && courseWeekRecords.some(r => r.sessionType === prev)) {
           return prev;
@@ -110,9 +164,24 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         return courseWeekRecords[0].sessionType;
       });
     } else {
+      autoSelectedKeyRef.current = '';
       setSelectedSession(null);
     }
   }, [activeCourse?.id, selectedWeek]);
+
+  // If attendance records arrive asynchronously from Firestore while no session is selected yet, select latest once
+  useEffect(() => {
+    if (!activeCourse) return;
+    const contextKey = `${activeCourse.id}_w${selectedWeek}`;
+    if (
+      courseWeekRecords.length > 0 &&
+      selectedSession === null &&
+      autoSelectedKeyRef.current !== contextKey
+    ) {
+      autoSelectedKeyRef.current = contextKey;
+      setSelectedSession(courseWeekRecords[0].sessionType);
+    }
+  }, [activeCourse?.id, selectedWeek, courseWeekRecords.length, selectedSession]);
 
   // Find current attendance record for (activeCourse, selectedWeek, selectedSession)
   const existingRecord = attendanceRecords.find(
@@ -524,8 +593,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         </div>
       </div>
 
-      {/* Exclusive Placebo Save Button & Reassurance Effect for Melek Yılmaz Only */}
-      {isMelekYilmaz && (
+      {/* Placebo Save Button & Reassurance Effect (Melek Yılmaz or any opted-in instructor) */}
+      {isPlaceboSaveEnabled && (
         <div className="mb-6 sm:mb-8">
           <div
             key={melekBurstKey}
@@ -574,7 +643,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                       data-testid="melek-reassurance-text"
                       className="font-serif-art text-lg sm:text-2xl font-medium text-emerald-950 animate-melek-text leading-snug"
                     >
-                      aklın sakın orada kalmasın melek, yoklaman kayıt altında, iyi dersler
+                      {getInstructorReassuranceMessage(instructor)}
                     </p>
                   ) : (
                     <div>
@@ -612,7 +681,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 )}
                 <button
                   type="button"
-                  onClick={handleMelekPlaceboSave}
+                  data-testid="placebo-save-button"
+                  onClick={handlePlaceboSaveClick}
                   className={`relative inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-xs sm:text-sm font-medium transition-all active:scale-95 cursor-pointer ${
                     melekSavePhase === 'effect'
                       ? 'bg-emerald-700 text-white shadow-md scale-105'
@@ -909,6 +979,31 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           </p>
         </div>
       )}
+
+      {/* Small Persistent Placebo Save Button Toggle at the Very Bottom */}
+      <div className="mt-8 pt-4 border-t border-stone-200/70 flex items-center justify-end">
+        <button
+          type="button"
+          role="switch"
+          aria-checked={isPlaceboSaveEnabled}
+          data-testid="placebo-save-toggle"
+          onClick={handleTogglePlaceboSaveButton}
+          className="inline-flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[11px] text-stone-500 hover:text-stone-800 transition-colors cursor-pointer select-none"
+        >
+          <span>kaydet butonu</span>
+          <span
+            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+              isPlaceboSaveEnabled ? 'bg-stone-900' : 'bg-stone-300'
+            }`}
+          >
+            <span
+              className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                isPlaceboSaveEnabled ? 'translate-x-3.5' : 'translate-x-0.5'
+              }`}
+            />
+          </span>
+        </button>
+      </div>
 
       {/* Exit / Uninteracted Attendance Prompt Modal: "durum nedir?" */}
       {pendingExitAction && (

@@ -1472,7 +1472,6 @@ const YUZYUZE_5A_STUDENTS = [
   'İbrahim Atasoy',
   'Miray Ada Kuyucu',
   'Muhammed Ali Karaca',
-  'Murat Yüksek',
   'Yusufhan Ekren',
 ].map(name => ({ name, grade: '5/a yüz yüze' }));
 
@@ -1592,7 +1591,7 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
     instructorName: 'sümeyye nur yıldırım',
     rawStudents: YUZYUZE_5A_STUDENTS,
     initialWeek1Tracked: true,
-    initialWeek1Absents: ['Arda Deniz Bal', 'Defne Gür', 'Defne Nil Aksu', 'Dilara Tehik', 'Eymen Bozkurt', 'Murat Yüksek'],
+    initialWeek1Absents: ['Arda Deniz Bal', 'Defne Gür', 'Defne Nil Aksu', 'Dilara Tehik', 'Eymen Bozkurt'],
   },
   { id: 'yy-5a-fen', gradeClass: '5/a', subject: 'fen bilimleri', modality: 'yuzyuze', instructorName: 'rana bıyıklıoğlu', rawStudents: YUZYUZE_5A_STUDENTS },
   { id: 'yy-5a-sos', gradeClass: '5/a', subject: 'sosyal bilgiler', modality: 'yuzyuze', instructorName: 'rabia kılbaş', rawStudents: YUZYUZE_5A_STUDENTS },
@@ -1692,11 +1691,29 @@ const CANONICAL_NAME_MAP: Record<string, string> = {
   'cemre kıllı': 'fatma cemre kıllı',
   'şerife sena süzme çelik': 'şerife sena süzmeçelik',
   'damla karacabacak': 'damla karabacak',
+  'buse çubukçu': 'ecrin buse çubukcu',
+  'buse çubukcu': 'ecrin buse çubukcu',
+  'ecrin buse çubukçu': 'ecrin buse çubukcu',
+  'f mira gün': 'f. mira gün',
+  'mira gün': 'f. mira gün',
+  'bahar nas eruğ': 'bahar nas eruz',
+  'derin sofuğlu': 'derin sofuoğlu',
+  'poyraz durgut': 'poyraz durkut',
 };
 
 export function getCanonicalStudentName(rawName: string): string {
   const norm = normalizeTurkish(rawName);
-  return CANONICAL_NAME_MAP[norm] || norm;
+  if (norm === 'adını öğrenip giricem:)' || norm === 'f. mira gün') {
+    return norm;
+  }
+  if (CANONICAL_NAME_MAP[norm]) {
+    return CANONICAL_NAME_MAP[norm];
+  }
+  const cleaned = norm
+    .replace(/[.,…!?]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return CANONICAL_NAME_MAP[cleaned] || cleaned || norm;
 }
 
 // Build complete normalized database
@@ -1818,20 +1835,21 @@ export function syncDatabaseMutations(
     }
   }
 
-  // 2. Add or merge custom students (excluding removed ones)
+  // 2. Add or update custom students (excluding removed ones)
   for (const custom of customStudents) {
     if (removedSet.has(custom.id)) continue;
     const existing = studentsMap.get(custom.id);
     if (existing) {
-      const mergedCourses = Array.from(
-        new Set([...existing.enrolledCourseIds, ...custom.enrolledCourseIds])
-      );
+      const nextCourses =
+        Array.isArray(custom.enrolledCourseIds) && custom.enrolledCourseIds.length > 0
+          ? Array.from(new Set(custom.enrolledCourseIds))
+          : [...existing.enrolledCourseIds];
       studentsMap.set(custom.id, {
         ...existing,
         ...custom,
         addedAtWeek: existing.addedAtWeek,
         addedAt: existing.addedAt,
-        enrolledCourseIds: mergedCourses,
+        enrolledCourseIds: nextCourses,
       });
     } else {
       studentsMap.set(custom.id, {
@@ -1844,9 +1862,7 @@ export function syncDatabaseMutations(
   // 3. Rebuild courses with updated studentIds and instructor assignments
   const baseCourseIdSet = new Set(BASE_DB.courses.map(c => c.id));
   const updatedCourses: Course[] = BASE_DB.courses.map(baseCourse => {
-    const activeIds = new Set<string>(
-      baseCourse.studentIds.filter(sid => !removedSet.has(sid) && studentsMap.has(sid))
-    );
+    const activeIds = new Set<string>();
 
     for (const st of studentsMap.values()) {
       if (st.enrolledCourseIds.includes(baseCourse.id)) {
