@@ -191,6 +191,29 @@
         }
       },
       "required": ["id", "studentName", "courseId", "instructorId", "instructorName", "weekNumber", "sessionType", "status", "createdAt"]
+    },
+    "PlaceboSavePreference": {
+      "title": "PlaceboSavePreference",
+      "description": "Stores whether an instructor has activated the optional placebo save button.",
+      "type": "object",
+      "properties": {
+        "instructorId": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "instructorName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["instructorId", "instructorName", "enabled", "updatedAt"]
     }
   },
   "firestore": {
@@ -217,6 +240,10 @@
     "/unlisted_students/{reportId}": {
       "schema": "UnlistedStudentReport",
       "description": "Collection of unlisted students reported by instructors during attendance."
+    },
+    "/placebo_save_preferences/{instructorId}": {
+      "schema": "PlaceboSavePreference",
+      "description": "Collection of per-instructor placebo save button toggle preferences."
     }
   }
 }

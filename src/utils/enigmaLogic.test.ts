@@ -13,6 +13,7 @@ import {
   getInstructorReassuranceMessage,
   getPlaceboSavePreference,
   setPlaceboSavePreferenceInMap,
+  computeActivePlaceboSaveUsers,
   shouldPromptEmptyExit,
   resolveExitPromptDecision,
   isZeroPresentAttendanceRecord,
@@ -354,6 +355,17 @@ test('placebo save button preference and personalized reassurance message work f
 
     const disabledRaw = setPlaceboSavePreferenceInMap(cagdasRes.instructor, false, enabledRaw);
     assert.equal(getPlaceboSavePreference(cagdasRes.instructor, disabledRaw), false);
+
+    // Remote Firestore preference overrides local empty storage and computes paranoya count
+    const remotePrefs = [
+      { instructorId: cagdasRes.instructor.id, instructorName: cagdasRes.instructor.name, enabled: true },
+      { instructorId: elifBusraRes.instructor.id, instructorName: elifBusraRes.instructor.name, enabled: false },
+    ];
+    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, null, remotePrefs), true);
+    assert.equal(getPlaceboSavePreference(elifBusraRes.instructor, null, remotePrefs), false);
+    const activeStats = computeActivePlaceboSaveUsers(remotePrefs);
+    assert.equal(activeStats.count, 1);
+    assert.deepEqual(activeStats.names, ['çağdaş şahin']);
   }
 });
 

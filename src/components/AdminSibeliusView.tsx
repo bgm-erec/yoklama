@@ -23,11 +23,13 @@ import {
   Instructor,
   Modality,
   normalizeTurkish,
+  PlaceboSavePreferenceRecord,
   slugifyTurkish,
   Student,
   UnlistedStudentReport,
 } from '../data/database';
 import {
+  computeActivePlaceboSaveUsers,
   createNewStudentRecord,
   findMatchingStudentByFullName,
   getWeekDateRangeLabel,
@@ -42,6 +44,7 @@ interface AdminSibeliusViewProps {
   instructors: Instructor[];
   attendanceRecords: AttendanceRecord[];
   unlistedReports: UnlistedStudentReport[];
+  placeboSavePrefs?: PlaceboSavePreferenceRecord[];
   onAddStudent: (student: Student) => Promise<void>;
   onRemoveStudent: (student: Student) => Promise<void>;
   onAssignInstructor: (
@@ -98,6 +101,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   instructors,
   attendanceRecords,
   unlistedReports,
+  placeboSavePrefs = [],
   onAddStudent,
   onRemoveStudent,
   onAssignInstructor,
@@ -114,6 +118,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [selectedCourseId, setSelectedCourseId] = useState<string | null>(null);
   const [selectedInstructorId, setSelectedInstructorId] = useState<string | null>(null);
+  const [showParanoyaNames, setShowParanoyaNames] = useState(false);
 
   // Compact top-right reset states
   const [confirmingAttendanceReset, setConfirmingAttendanceReset] = useState(false);
@@ -169,6 +174,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const pendingUnlistedCount = useMemo(
     () => unlistedReports.filter(r => r.status === 'pending').length,
     [unlistedReports]
+  );
+
+  const paranoyaStats = useMemo(
+    () => computeActivePlaceboSaveUsers(placeboSavePrefs),
+    [placeboSavePrefs]
   );
 
   // Available online courses for the currently chosen online grade (Student Add)
@@ -1632,6 +1642,28 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   </div>
                 )}
               </form>
+            )}
+          </div>
+
+          {/* Subtle Compact Info Panel: Kaydet Butonuna İhtiyaç Duyan Paranoya Sayısı */}
+          <div className="pt-2 flex flex-col items-end">
+            <button
+              type="button"
+              data-testid="sibelius-paranoya-panel"
+              onClick={() => setShowParanoyaNames(prev => !prev)}
+              className="inline-flex items-center gap-2 rounded-xl border border-stone-300/70 bg-white/65 px-3 py-1.5 text-[11px] text-stone-500 hover:border-stone-400 hover:text-stone-700 transition-colors cursor-pointer"
+            >
+              <span>
+                kaydet butonuna ihtiyaç duyan paranoya sayısı:{' '}
+                <strong className="font-mono-num font-medium text-stone-700">
+                  {paranoyaStats.count}
+                </strong>
+              </span>
+            </button>
+            {showParanoyaNames && paranoyaStats.names.length > 0 && (
+              <p className="mt-1.5 text-[11px] text-stone-500 text-right">
+                aktif edenler: {paranoyaStats.names.join(', ')}
+              </p>
             )}
           </div>
         </div>

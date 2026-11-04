@@ -289,14 +289,27 @@ export function getInstructorReassuranceMessage(
 }
 
 /**
- * Reads the persisted placebo save button preference for an instructor from serialized storage JSON.
+ * Reads the persisted placebo save button preference for an instructor from remote Firestore records
+ * or serialized localStorage JSON.
  * Defaults to false for all instructors unless explicitly enabled (or Melek Yılmaz if not yet overridden).
  */
 export function getPlaceboSavePreference(
   instructor: Pick<Instructor, 'id' | 'name'> | null | undefined,
-  storageRaw: string | null | undefined
+  storageRaw: string | null | undefined,
+  remotePrefs?: { instructorId: string; instructorName: string; enabled: boolean }[]
 ): boolean {
   if (!instructor) return false;
+
+  if (remotePrefs && remotePrefs.length > 0) {
+    const normName = normalizeTurkish(instructor.name);
+    const matched = remotePrefs.find(
+      p => p.instructorId === instructor.id || normalizeTurkish(p.instructorName) === normName
+    );
+    if (matched) {
+      return matched.enabled;
+    }
+  }
+
   if (storageRaw) {
     try {
       const parsed = JSON.parse(storageRaw) as Record<string, unknown>;
@@ -314,6 +327,51 @@ export function getPlaceboSavePreference(
     }
   }
   return isMelekYilmazInstructor(instructor);
+}
+
+/**
+ * Checks whether localStorage has an explicit boolean preference saved for this instructor.
+ */
+export function getExplicitLocalPlaceboSavePreference(
+  instructor: Pick<Instructor, 'id' | 'name'> | null | undefined,
+  storageRaw: string | null | undefined
+): boolean | null {
+  if (!instructor || !storageRaw) return null;
+  try {
+    const parsed = JSON.parse(storageRaw) as Record<string, unknown>;
+    if (parsed && typeof parsed === 'object') {
+      if (typeof parsed[instructor.id] === 'boolean') {
+        return parsed[instructor.id] as boolean;
+      }
+      const normName = normalizeTurkish(instructor.name);
+      if (typeof parsed[normName] === 'boolean') {
+        return parsed[normName] as boolean;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Computes the list and count of instructors who have activated the placebo save button.
+ */
+export function computeActivePlaceboSaveUsers(
+  remotePrefs: { instructorId: string; instructorName: string; enabled: boolean }[]
+): { count: number; names: string[] } {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const pref of remotePrefs) {
+    if (!pref.enabled) continue;
+    const key = pref.instructorId || normalizeTurkish(pref.instructorName);
+    if (!seen.has(key)) {
+      seen.add(key);
+      names.push(normalizeTurkish(pref.instructorName));
+    }
+  }
+  names.sort((a, b) => a.localeCompare(b, 'tr-TR'));
+  return { count: names.length, names };
 }
 
 /**

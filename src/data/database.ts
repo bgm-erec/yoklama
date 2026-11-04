@@ -84,6 +84,13 @@ export interface UnlistedStudentReport {
   resolvedAt?: string;
 }
 
+export interface PlaceboSavePreferenceRecord {
+  instructorId: string;
+  instructorName: string;
+  enabled: boolean;
+  updatedAt: string;
+}
+
 // Raw Online Courses from BGM ÇEVRİM İÇİ SINIF LİSTESİ PDF
 interface RawCourseDef {
   id: string;

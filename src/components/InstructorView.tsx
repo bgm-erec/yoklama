@@ -7,6 +7,7 @@ import {
   getCanonicalStudentName,
   Instructor,
   normalizeTurkish,
+  PlaceboSavePreferenceRecord,
   SessionType,
   slugifyTurkish,
   Student,
@@ -15,6 +16,7 @@ import {
 import {
   computeAbsentDifferenceSet,
   ExitAttendanceChoice,
+  getExplicitLocalPlaceboSavePreference,
   getInstructorReassuranceMessage,
   getPlaceboSavePreference,
   getWeekDateRangeLabel,
@@ -31,10 +33,12 @@ interface InstructorViewProps {
   onSelectWeek: (week: number) => void;
   attendanceRecords: AttendanceRecord[];
   unlistedReports?: UnlistedStudentReport[];
+  placeboSavePrefs?: PlaceboSavePreferenceRecord[];
   onSaveAttendance: (record: AttendanceRecord) => Promise<void>;
   onAddUnlistedStudent?: (report: UnlistedStudentReport) => Promise<void>;
   onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
   onDeleteCourseSession?: (courseId: string, weekNumber: number, sessionType: string) => Promise<void>;
+  onSavePlaceboPreference?: (instructor: Instructor, enabled: boolean) => Promise<void>;
   onBackToLogin: () => void;
   exitRequestCounter?: number;
 }
@@ -53,10 +57,12 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   onSelectWeek,
   attendanceRecords,
   unlistedReports = [],
+  placeboSavePrefs = [],
   onSaveAttendance,
   onAddUnlistedStudent,
   onRemoveUnlistedStudent,
   onDeleteCourseSession,
+  onSavePlaceboPreference,
   onBackToLogin,
   exitRequestCounter = 0,
 }) => {
@@ -83,22 +89,43 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const [isPlaceboSaveEnabled, setIsPlaceboSaveEnabled] = useState<boolean>(() => {
     try {
       const raw = typeof window !== 'undefined' ? window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY) : null;
-      return getPlaceboSavePreference(instructor, raw);
+      return getPlaceboSavePreference(instructor, raw, placeboSavePrefs);
     } catch {
-      return getPlaceboSavePreference(instructor, null);
+      return getPlaceboSavePreference(instructor, null, placeboSavePrefs);
     }
   });
   const [melekSavePhase, setMelekSavePhase] = useState<'idle' | 'effect' | 'reassured'>('idle');
   const [melekBurstKey, setMelekBurstKey] = useState(0);
   const saveTimerRef = useRef<number | null>(null);
+  const syncedLocalPrefRef = useRef<string>('');
 
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
-      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, raw));
+      const effectivePref = getPlaceboSavePreference(instructor, raw, placeboSavePrefs);
+      setIsPlaceboSaveEnabled(effectivePref);
+
+      // If remote Firestore record exists, also mirror it into localStorage so offline/initial load stays fast
+      const hasRemote = placeboSavePrefs.some(
+        p => p.instructorId === instructor.id || normalizeTurkish(p.instructorName) === normalizeTurkish(instructor.name)
+      );
+      if (hasRemote) {
+        const updatedRaw = setPlaceboSavePreferenceInMap(instructor, effectivePref, raw);
+        window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
+      } else if (onSavePlaceboPreference && syncedLocalPrefRef.current !== instructor.id) {
+        // Backfill explicit localStorage preference to Firestore if user had toggled it earlier
+        const explicitLocal = getExplicitLocalPlaceboSavePreference(instructor, raw);
+        if (explicitLocal !== null) {
+          syncedLocalPrefRef.current = instructor.id;
+          void onSavePlaceboPreference(instructor, explicitLocal);
+        }
+      }
     } catch {
-      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, null));
+      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, null, placeboSavePrefs));
     }
+  }, [instructor.id, placeboSavePrefs]);
+
+  useEffect(() => {
     setMelekSavePhase('idle');
   }, [instructor.id]);
 
@@ -111,24 +138,25 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   }, []);
 
   const handleTogglePlaceboSaveButton = () => {
-    setIsPlaceboSaveEnabled(prev => {
-      const next = !prev;
-      try {
-        const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
-        const updatedRaw = setPlaceboSavePreferenceInMap(instructor, next, raw);
-        window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
-      } catch {
-        // Ignore storage write error
-      }
-      if (!next) {
-        setMelekSavePhase('idle');
-      }
-      return next;
-    });
+    const next = !isPlaceboSaveEnabled;
+    setIsPlaceboSaveEnabled(next);
+    try {
+      const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
+      const updatedRaw = setPlaceboSavePreferenceInMap(instructor, next, raw);
+      window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
+    } catch {
+      // Ignore storage write error
+    }
+    if (!next) {
+      setMelekSavePhase('idle');
+    }
+    if (onSavePlaceboPreference) {
+      void onSavePlaceboPreference(instructor, next);
+    }
   };
 
   const handlePlaceboSaveClick = () => {
-    // Intentionally does NOT perform any save operation (saving is already automatic)
+    // Intentionally does NOT perform any attendance save operation (saving is already automatic)
     if (saveTimerRef.current !== null) {
       window.clearTimeout(saveTimerRef.current);
     }

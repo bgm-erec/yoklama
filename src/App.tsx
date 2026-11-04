@@ -15,6 +15,7 @@ import {
   InstructorAssignmentRecord,
   Modality,
   normalizeTurkish,
+  PlaceboSavePreferenceRecord,
   RemovedStudentRecord,
   slugifyTurkish,
   Student,
@@ -57,6 +58,7 @@ export default function App() {
   const [removedStudentIds, setRemovedStudentIds] = useState<string[]>([]);
   const [instructorAssignments, setInstructorAssignments] = useState<InstructorAssignmentRecord[]>([]);
   const [unlistedReports, setUnlistedReports] = useState<UnlistedStudentReport[]>([]);
+  const [placeboSavePrefs, setPlaceboSavePrefs] = useState<PlaceboSavePreferenceRecord[]>([]);
 
   // Synchronize effective students, courses, and instructors whenever mutations change
   const effectiveDb = useMemo(
@@ -241,6 +243,61 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  // Real-time Firestore listener for placebo save button toggle preferences
+  useEffect(() => {
+    const prefsQuery = query(
+      collection(db, 'placebo_save_preferences'),
+      where('updatedAt', '>=', '2020-01-01')
+    );
+    const unsubscribe = onSnapshot(
+      prefsQuery,
+      snapshot => {
+        const items: PlaceboSavePreferenceRecord[] = [];
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data() as PlaceboSavePreferenceRecord;
+          items.push({ ...data, instructorId: data.instructorId || docSnap.id });
+        });
+        setPlaceboSavePrefs(items);
+      },
+      error => {
+        try {
+          handleFirestoreError(error, OperationType.GET, 'placebo_save_preferences');
+        } catch {
+          // Handled
+        }
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  const handleSavePlaceboPreference = async (instructor: Instructor, enabled: boolean) => {
+    const record: PlaceboSavePreferenceRecord = {
+      instructorId: instructor.id,
+      instructorName: instructor.name,
+      enabled,
+      updatedAt: new Date().toISOString(),
+    };
+    setPlaceboSavePrefs(prev => {
+      const withoutCurrent = prev.filter(p => p.instructorId !== instructor.id);
+      return [...withoutCurrent, record];
+    });
+
+    try {
+      await setDoc(doc(db, 'placebo_save_preferences', instructor.id), record);
+    } catch (error) {
+      try {
+        handleFirestoreError(
+          error,
+          OperationType.WRITE,
+          `placebo_save_preferences/${instructor.id}`
+        );
+      } catch {
+        // Handled
+      }
+    }
+  };
 
   const handleAddStudent = async (student: Student) => {
     setRemovedStudentIds(prev => prev.filter(id => id !== student.id));
@@ -806,10 +863,12 @@ export default function App() {
             onSelectWeek={setSelectedWeek}
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
+            placeboSavePrefs={placeboSavePrefs}
             onSaveAttendance={handleSaveAttendance}
             onAddUnlistedStudent={handleAddUnlistedStudent}
             onRemoveUnlistedStudent={handleDeleteUnlistedReport}
             onDeleteCourseSession={handleDeleteCourseSession}
+            onSavePlaceboPreference={handleSavePlaceboPreference}
             onBackToLogin={handleReturnHome}
             exitRequestCounter={instructorExitCounter}
           />
@@ -823,6 +882,7 @@ export default function App() {
             instructors={effectiveDb.instructors}
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
+            placeboSavePrefs={placeboSavePrefs}
             onAddStudent={handleAddStudent}
             onRemoveStudent={handleRemoveStudent}
             onAssignInstructor={handleAssignInstructor}

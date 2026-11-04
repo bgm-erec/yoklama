@@ -79,6 +79,15 @@ service cloud.firestore {
         && (!('resolvedAt' in data) || (data.resolvedAt is string && data.resolvedAt.size() <= 64));
     }
 
+    function isValidPlaceboSavePreference(data) {
+      return data.keys().hasAll(['instructorId', 'instructorName', 'enabled', 'updatedAt'])
+        && data.keys().hasOnly(['instructorId', 'instructorName', 'enabled', 'updatedAt'])
+        && data.instructorId is string && data.instructorId.size() >= 1 && data.instructorId.size() <= 120
+        && data.instructorName is string && data.instructorName.size() >= 1 && data.instructorName.size() <= 120
+        && data.enabled is bool
+        && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
     match /test/connection {
       allow get: if true;
     }
@@ -127,6 +136,13 @@ service cloud.firestore {
       allow list: if resource.data.createdAt >= '2020-01-01';
       allow create, update: if isValidId(reportId) && isValidUnlistedStudentReport(incoming());
       allow delete: if isValidId(reportId);
+    }
+
+    match /placebo_save_preferences/{instructorId} {
+      allow get: if isValidId(instructorId);
+      allow list: if resource.data.updatedAt >= '2020-01-01';
+      allow create, update: if isValidId(instructorId) && isValidPlaceboSavePreference(incoming());
+      allow delete: if isValidId(instructorId);
     }
   }
 }
