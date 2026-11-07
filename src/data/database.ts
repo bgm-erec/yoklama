@@ -11,12 +11,14 @@ export interface Student {
   notes?: string;
   addedAtWeek?: number;
   addedAt?: string;
+  deletedAt?: string | null;
 }
 
 export interface RemovedStudentRecord {
   studentId: string;
   name: string;
   removedAt: string;
+  deletedAt?: string | null;
 }
 
 export interface InstructorAssignmentRecord {
@@ -59,12 +61,16 @@ export interface AttendanceRecord {
   absentStudentIds: string[];
   didNotHoldClass: boolean;
   updatedAt: string;
+  version?: number;
+  updatedBySessionId?: string;
+  deletedAt?: string | null;
 }
 
 export interface FeedbackItem {
   id?: string;
   message: string;
   createdAt: string;
+  deletedAt?: string | null;
 }
 
 export type UnlistedReportStatus = 'pending' | 'enrolled' | 'temporary';
@@ -82,6 +88,7 @@ export interface UnlistedStudentReport {
   resolvedExistingStudent?: boolean;
   createdAt: string;
   resolvedAt?: string;
+  deletedAt?: string | null;
 }
 
 export interface PlaceboSavePreferenceRecord {
@@ -89,6 +96,15 @@ export interface PlaceboSavePreferenceRecord {
   instructorName: string;
   enabled: boolean;
   updatedAt: string;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  actor: string;
+  action: string;
+  target: string;
+  details: string;
+  createdAt: string;
 }
 
 // Raw Online Courses from BGM ÇEVRİM İÇİ SINIF LİSTESİ PDF
@@ -1670,6 +1686,8 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
 
 export function normalizeTurkish(str: string): string {
   return str
+    .replace(/İ/g, 'i')
+    .replace(/I/g, 'ı')
     .trim()
     .toLocaleLowerCase('tr-TR')
     .replace(/\s+/g, ' ');
@@ -1684,6 +1702,8 @@ export function slugifyTurkish(str: string): string {
     .replace(/ö/g, 'o')
     .replace(/ç/g, 'c')
     .replace(/â/g, 'a')
+    .replace(/î/g, 'i')
+    .replace(/û/g, 'u')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
 }
@@ -1842,9 +1862,9 @@ export function syncDatabaseMutations(
     }
   }
 
-  // 2. Add or update custom students (excluding removed ones)
+  // 2. Add or update custom students (excluding removed or soft-deleted ones)
   for (const custom of customStudents) {
-    if (removedSet.has(custom.id)) continue;
+    if (removedSet.has(custom.id) || custom.deletedAt) continue;
     const existing = studentsMap.get(custom.id);
     if (existing) {
       const nextCourses =

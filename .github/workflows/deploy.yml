@@ -29,9 +29,17 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
-      - name: Build Vite project
+      - name: Build Vite project (Production)
+        env:
+          NODE_ENV: production
         run: |
           npm run build
+          rm -f dist/_aistudio-iframe.js
+          sed -i '/_aistudio-iframe\.js/d' dist/index.html || true
+          if grep -rn "jsxDEV" dist/; then
+            echo "Error: Development jsxDEV bundle detected in production build!"
+            exit 1
+          fi
           cp dist/index.html dist/404.html
           touch dist/.nojekyll
 

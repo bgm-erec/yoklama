@@ -36,7 +36,21 @@
         },
         "updatedAt": {
           "type": "string",
-          "description": "ISO timestamp of last update",
+          "description": "Server timestamp or ISO timestamp of last update",
+          "maxLength": 64
+        },
+        "version": {
+          "type": "number",
+          "description": "Optimistic concurrency version number"
+        },
+        "updatedBySessionId": {
+          "type": "string",
+          "description": "Client session identifier for concurrent edit detection",
+          "maxLength": 100
+        },
+        "deletedAt": {
+          "type": "string",
+          "description": "Soft-delete timestamp",
           "maxLength": 64
         }
       },
@@ -55,7 +69,12 @@
         },
         "createdAt": {
           "type": "string",
-          "description": "ISO timestamp of creation",
+          "description": "Server timestamp or ISO timestamp of creation",
+          "maxLength": 64
+        },
+        "deletedAt": {
+          "type": "string",
+          "description": "Soft-delete timestamp",
           "maxLength": 64
         }
       },
@@ -92,6 +111,10 @@
         "addedAt": {
           "type": "string",
           "maxLength": 64
+        },
+        "deletedAt": {
+          "type": "string",
+          "maxLength": 64
         }
       },
       "required": ["id", "name", "grade", "modality", "enrolledCourseIds", "addedAtWeek", "addedAt"]
@@ -110,6 +133,10 @@
           "maxLength": 120
         },
         "removedAt": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "deletedAt": {
           "type": "string",
           "maxLength": 64
         }
@@ -188,6 +215,10 @@
         "resolvedAt": {
           "type": "string",
           "maxLength": 64
+        },
+        "deletedAt": {
+          "type": "string",
+          "maxLength": 64
         }
       },
       "required": ["id", "studentName", "courseId", "instructorId", "instructorName", "weekNumber", "sessionType", "status", "createdAt"]
@@ -214,6 +245,34 @@
         }
       },
       "required": ["instructorId", "instructorName", "enabled", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Audit log of attendance and administrative mutations.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "action": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "target": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "details": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["actor", "action", "target", "details", "createdAt"]
     }
   },
   "firestore": {
@@ -244,6 +303,10 @@
     "/placebo_save_preferences/{instructorId}": {
       "schema": "PlaceboSavePreference",
       "description": "Collection of per-instructor placebo save button toggle preferences."
+    },
+    "/audit_log/{logId}": {
+      "schema": "AuditLog",
+      "description": "Audit trail of mutations (who, when, what)."
     }
   }
 }

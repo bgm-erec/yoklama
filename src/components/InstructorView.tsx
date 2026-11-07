@@ -1,5 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { RotateCcw, Sparkles, ArrowLeft, BookOpen, CheckSquare, UserPlus, X, Check } from 'lucide-react';
+import {
+  RotateCcw,
+  Sparkles,
+  ArrowLeft,
+  BookOpen,
+  CheckSquare,
+  UserPlus,
+  X,
+  Check,
+  AlertTriangle,
+} from 'lucide-react';
 import {
   AttendanceRecord,
   Course,
@@ -7,39 +17,56 @@ import {
   getCanonicalStudentName,
   Instructor,
   normalizeTurkish,
-  PlaceboSavePreferenceRecord,
   SessionType,
   slugifyTurkish,
   Student,
   UnlistedStudentReport,
 } from '../data/database';
 import {
+  buildAttendanceDocId,
   computeAbsentDifferenceSet,
   ExitAttendanceChoice,
-  getExplicitLocalPlaceboSavePreference,
-  getInstructorReassuranceMessage,
-  getPlaceboSavePreference,
   getWeekDateRangeLabel,
-  PLACEBO_SAVE_STORAGE_KEY,
   resolveExitPromptDecision,
-  setPlaceboSavePreferenceInMap,
   shouldPromptEmptyExit,
 } from '../utils/enigmaLogic';
+
+export interface AttendanceConflictNotice {
+  docId: string;
+  courseId: string;
+  weekNumber: number;
+  sessionType: SessionType;
+  serverRecord: AttendanceRecord;
+  localAttemptRecord: AttendanceRecord;
+}
 
 interface InstructorViewProps {
   instructor: Instructor;
   currentWeek: number;
   selectedWeek: number;
   onSelectWeek: (week: number) => void;
+  onActiveCourseChange?: (courseId: string) => void;
   attendanceRecords: AttendanceRecord[];
   unlistedReports?: UnlistedStudentReport[];
-  placeboSavePrefs?: PlaceboSavePreferenceRecord[];
-  onSaveAttendance: (record: AttendanceRecord) => Promise<void>;
+  onSaveAttendance: (
+    record: AttendanceRecord,
+    options?: {
+      debounced?: boolean;
+      previousRecord?: AttendanceRecord | null;
+      forceOverwriteVersion?: number;
+    }
+  ) => Promise<void>;
   onAddUnlistedStudent?: (report: UnlistedStudentReport) => Promise<void>;
   onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
-  onDeleteCourseSession?: (courseId: string, weekNumber: number, sessionType: string) => Promise<void>;
-  onSavePlaceboPreference?: (instructor: Instructor, enabled: boolean) => Promise<void>;
+  onDeleteCourseSession?: (
+    courseId: string,
+    weekNumber: number,
+    sessionType: string
+  ) => Promise<void>;
   onBackToLogin: () => void;
+  onGuardedNavigate: (action: () => void) => void;
+  conflictNotice?: AttendanceConflictNotice | null;
+  onResolveConflict?: (resolution: 'accept_server' | 'force_local') => void;
   exitRequestCounter?: number;
 }
 
@@ -55,15 +82,17 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   currentWeek,
   selectedWeek,
   onSelectWeek,
+  onActiveCourseChange,
   attendanceRecords,
   unlistedReports = [],
-  placeboSavePrefs = [],
   onSaveAttendance,
   onAddUnlistedStudent,
   onRemoveUnlistedStudent,
   onDeleteCourseSession,
-  onSavePlaceboPreference,
   onBackToLogin,
+  onGuardedNavigate,
+  conflictNotice,
+  onResolveConflict,
   exitRequestCounter = 0,
 }) => {
   const instructorCourses: Course[] = instructor.courseIds
@@ -74,7 +103,6 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     instructorCourses[0]?.id || ''
   );
   const [selectedSession, setSelectedSession] = useState<SessionType | null>(null);
-  const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'synced'>('synced');
 
   // Exit prompt modal state when instructor leaves without taking attendance / clicking any student
   const [pendingExitAction, setPendingExitAction] = useState<(() => void) | null>(null);
@@ -83,96 +111,25 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   // Compact unlisted student bar states
   const [isUnlistedBarOpen, setIsUnlistedBarOpen] = useState(false);
   const [unlistedNameInput, setUnlistedNameInput] = useState('');
-  const [unlistedFeedback, setUnlistedFeedback] = useState<{ type: 'error' | 'ok'; text: string } | null>(null);
-
-  // Placebo save button & persistent per-instructor toggle state
-  const [isPlaceboSaveEnabled, setIsPlaceboSaveEnabled] = useState<boolean>(() => {
-    try {
-      const raw = typeof window !== 'undefined' ? window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY) : null;
-      return getPlaceboSavePreference(instructor, raw, placeboSavePrefs);
-    } catch {
-      return getPlaceboSavePreference(instructor, null, placeboSavePrefs);
-    }
-  });
-  const [melekSavePhase, setMelekSavePhase] = useState<'idle' | 'effect' | 'reassured'>('idle');
-  const [melekBurstKey, setMelekBurstKey] = useState(0);
-  const saveTimerRef = useRef<number | null>(null);
-  const syncedLocalPrefRef = useRef<string>('');
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
-      const effectivePref = getPlaceboSavePreference(instructor, raw, placeboSavePrefs);
-      setIsPlaceboSaveEnabled(effectivePref);
-
-      // If remote Firestore record exists, also mirror it into localStorage so offline/initial load stays fast
-      const hasRemote = placeboSavePrefs.some(
-        p => p.instructorId === instructor.id || normalizeTurkish(p.instructorName) === normalizeTurkish(instructor.name)
-      );
-      if (hasRemote) {
-        const updatedRaw = setPlaceboSavePreferenceInMap(instructor, effectivePref, raw);
-        window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
-      } else if (onSavePlaceboPreference && syncedLocalPrefRef.current !== instructor.id) {
-        // Backfill explicit localStorage preference to Firestore if user had toggled it earlier
-        const explicitLocal = getExplicitLocalPlaceboSavePreference(instructor, raw);
-        if (explicitLocal !== null) {
-          syncedLocalPrefRef.current = instructor.id;
-          void onSavePlaceboPreference(instructor, explicitLocal);
-        }
-      }
-    } catch {
-      setIsPlaceboSaveEnabled(getPlaceboSavePreference(instructor, null, placeboSavePrefs));
-    }
-  }, [instructor.id, placeboSavePrefs]);
-
-  useEffect(() => {
-    setMelekSavePhase('idle');
-  }, [instructor.id]);
-
-  useEffect(() => {
-    return () => {
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-      }
-    };
-  }, []);
-
-  const handleTogglePlaceboSaveButton = () => {
-    const next = !isPlaceboSaveEnabled;
-    setIsPlaceboSaveEnabled(next);
-    try {
-      const raw = window.localStorage.getItem(PLACEBO_SAVE_STORAGE_KEY);
-      const updatedRaw = setPlaceboSavePreferenceInMap(instructor, next, raw);
-      window.localStorage.setItem(PLACEBO_SAVE_STORAGE_KEY, updatedRaw);
-    } catch {
-      // Ignore storage write error
-    }
-    if (!next) {
-      setMelekSavePhase('idle');
-    }
-    if (onSavePlaceboPreference) {
-      void onSavePlaceboPreference(instructor, next);
-    }
-  };
-
-  const handlePlaceboSaveClick = () => {
-    // Intentionally does NOT perform any attendance save operation (saving is already automatic)
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-    }
-    setMelekBurstKey(prev => prev + 1);
-    setMelekSavePhase('effect');
-    saveTimerRef.current = window.setTimeout(() => {
-      setMelekSavePhase('reassured');
-      saveTimerRef.current = null;
-    }, 650);
-  };
+  const [unlistedFeedback, setUnlistedFeedback] = useState<{
+    type: 'error' | 'ok';
+    text: string;
+  } | null>(null);
 
   const activeCourse =
     instructorCourses.find(c => c.id === selectedCourseId) || instructorCourses[0];
 
+  useEffect(() => {
+    if (activeCourse?.id && onActiveCourseChange) {
+      onActiveCourseChange(activeCourse.id);
+    }
+  }, [activeCourse?.id, onActiveCourseChange]);
+
+  const activeAttendanceRecords = attendanceRecords.filter(r => !r.deletedAt);
+  const activeUnlistedReports = unlistedReports.filter(r => !r.deletedAt);
+
   const courseWeekRecords = activeCourse
-    ? attendanceRecords
+    ? activeAttendanceRecords
         .filter(r => r.courseId === activeCourse.id && r.weekNumber === selectedWeek)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     : [];
@@ -212,7 +169,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   }, [activeCourse?.id, selectedWeek, courseWeekRecords.length, selectedSession]);
 
   // Find current attendance record for (activeCourse, selectedWeek, selectedSession)
-  const existingRecord = attendanceRecords.find(
+  const existingRecord = activeAttendanceRecords.find(
     r =>
       r.courseId === activeCourse?.id &&
       r.weekNumber === selectedWeek &&
@@ -220,7 +177,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   );
 
   // Also check if instructor marked "ders yapmadım" for this course & week
-  const didNotHoldRecord = attendanceRecords.find(
+  const didNotHoldRecord = activeAttendanceRecords.find(
     r =>
       r.courseId === activeCourse?.id &&
       r.weekNumber === selectedWeek &&
@@ -242,7 +199,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const absentStudents = courseStudents.filter(s => absentStudentIds.includes(s.id));
 
   // Unlisted / temporary students reported for this specific (course, week, session)
-  const sessionUnlistedReports = unlistedReports.filter(
+  const sessionUnlistedReports = activeUnlistedReports.filter(
     r =>
       r.courseId === activeCourse?.id &&
       r.weekNumber === selectedWeek &&
@@ -261,20 +218,14 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const triggerSync = async (
     session: SessionType,
     newAbsentIds: string[],
-    didNotHold: boolean
+    didNotHold: boolean,
+    debounced: boolean
   ) => {
     if (!activeCourse) return;
-    setSyncState('syncing');
-    const sessionSlug =
-      session === '1. ders'
-        ? 's1'
-        : session === '2. ders'
-        ? 's2'
-        : session === 'ek dersler'
-        ? 'sek'
-        : 'sno';
+    const recordId =
+      existingRecord?.id ||
+      buildAttendanceDocId(activeCourse.id, selectedWeek, session);
 
-    const recordId = `${activeCourse.id}_w${selectedWeek}_${sessionSlug}`;
     const record: AttendanceRecord = {
       id: recordId,
       courseId: activeCourse.id,
@@ -284,9 +235,13 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       absentStudentIds: newAbsentIds,
       didNotHoldClass: didNotHold,
       updatedAt: new Date().toISOString(),
+      version: existingRecord?.version ?? 0,
     };
-    await onSaveAttendance(record);
-    setSyncState('synced');
+
+    await onSaveAttendance(record, {
+      debounced,
+      previousRecord: existingRecord || null,
+    });
   };
 
   const attemptNavigationOrExit = (action: () => void) => {
@@ -299,9 +254,9 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     });
 
     if (needsPrompt) {
-      setPendingExitAction(() => action);
+      setPendingExitAction(() => () => onGuardedNavigate(action));
     } else {
-      action();
+      onGuardedNavigate(action);
     }
   };
 
@@ -326,21 +281,26 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       await triggerSync(
         decision.sessionType,
         decision.absentStudentIds,
-        decision.didNotHoldClass
+        decision.didNotHoldClass,
+        false
       );
     } else if (decision.action === 'discard') {
       if (
         activeCourse &&
         decision.sessionType &&
         onDeleteCourseSession &&
-        attendanceRecords.some(
+        activeAttendanceRecords.some(
           r =>
             r.courseId === activeCourse.id &&
             r.weekNumber === selectedWeek &&
             r.sessionType === decision.sessionType
         )
       ) {
-        await onDeleteCourseSession(activeCourse.id, selectedWeek, decision.sessionType);
+        await onDeleteCourseSession(
+          activeCourse.id,
+          selectedWeek,
+          decision.sessionType
+        );
       }
     }
 
@@ -353,7 +313,6 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
 
   const handleSelectSession = async (session: SessionType) => {
     if (session === 'ders yapmadım') {
-      // If switching from an un-interacted empty session to "ders yapmadım", clean up any empty record
       if (
         activeCourse &&
         selectedSession &&
@@ -367,7 +326,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         await onDeleteCourseSession(activeCourse.id, selectedWeek, selectedSession);
       }
       setSelectedSession('ders yapmadım');
-      await triggerSync('ders yapmadım', [], true);
+      await triggerSync('ders yapmadım', [], true, false);
       return;
     }
 
@@ -375,7 +334,6 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       return;
     }
 
-    // If currently in another session with 0 students marked present, ask "durum nedir?" before switching
     if (
       selectedSession &&
       selectedSession !== 'ders yapmadım' &&
@@ -387,15 +345,16 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         hasExplicitZeroConfirmation,
       })
     ) {
-      setPendingExitAction(() => () => setSelectedSession(session));
+      setPendingExitAction(() => () =>
+        onGuardedNavigate(() => setSelectedSession(session))
+      );
       return;
     }
 
-    // Do NOT auto-save an all-absent record merely on clicking a session tab!
-    setSelectedSession(session);
+    onGuardedNavigate(() => setSelectedSession(session));
   };
 
-  const handleTogglePresent = async (studentId: string) => {
+  const handleTogglePresent = (studentId: string) => {
     if (!selectedSession || selectedSession === 'ders yapmadım') return;
     const isCurrentlyPresent = presentStudentIds.includes(studentId);
     const nextPresentIds = isCurrentlyPresent
@@ -406,10 +365,10 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       courseStudentIds,
       nextPresentIds
     );
-    await triggerSync(selectedSession, nextAbsentDifferenceSet, false);
+    void triggerSync(selectedSession, nextAbsentDifferenceSet, false, true);
   };
 
-  const handleMarkAllPresentOrClear = async () => {
+  const handleMarkAllPresentOrClear = () => {
     if (!selectedSession || selectedSession === 'ders yapmadım') return;
     const allPresent = presentStudentIds.length === courseStudentIds.length;
     const nextPresentIds = allPresent ? [] : [...courseStudentIds];
@@ -417,12 +376,13 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       courseStudentIds,
       nextPresentIds
     );
-    await triggerSync(selectedSession, nextAbsentDifferenceSet, false);
+    void triggerSync(selectedSession, nextAbsentDifferenceSet, false, true);
   };
 
   const handleAddUnlistedSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım') return;
+    if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım')
+      return;
 
     const cleanName = getCanonicalStudentName(unlistedNameInput);
     const nameParts = cleanName.split(' ').filter(Boolean);
@@ -436,11 +396,13 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
 
     // Check if already in this course's registered student list
     const alreadyInCourse = courseStudents.find(
-      s => getCanonicalStudentName(s.name) === cleanName || normalizeTurkish(s.name) === cleanName
+      s =>
+        getCanonicalStudentName(s.name) === cleanName ||
+        normalizeTurkish(s.name) === cleanName
     );
     if (alreadyInCourse) {
       if (!presentStudentIds.includes(alreadyInCourse.id)) {
-        await handleTogglePresent(alreadyInCourse.id);
+        handleTogglePresent(alreadyInCourse.id);
       }
       setUnlistedNameInput('');
       setUnlistedFeedback({
@@ -451,14 +413,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       return;
     }
 
-    const sessionSlug =
-      selectedSession === '1. ders'
-        ? 's1'
-        : selectedSession === '2. ders'
-        ? 's2'
-        : 'sek';
+    const sessionSlug = slugifyTurkish(selectedSession);
     const studentSlug = slugifyTurkish(cleanName);
-    const reportId = `unlisted_${activeCourse.id}_w${selectedWeek}_${sessionSlug}_${studentSlug}`;
+    const reportId = `unlisted_${slugifyTurkish(
+      activeCourse.id
+    )}_w${selectedWeek}_${sessionSlug}_${studentSlug}`;
 
     const report: UnlistedStudentReport = {
       id: reportId,
@@ -515,16 +474,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           </div>
         </div>
 
-        {/* Auto-sync status & week selector */}
-        <div className="flex flex-row sm:flex-col items-center sm:items-end justify-between sm:justify-start gap-2 pt-2 sm:pt-0 border-t sm:border-t-0 border-stone-200/70">
-          <div className="flex items-center gap-2 text-xs text-stone-600">
-            <span>
-              {syncState === 'syncing'
-                ? 'otomatik eşzamanlanıyor...'
-                : 'otomatik eşzamanlandı'}
-            </span>
-          </div>
-
+        {/* Week selector */}
+        <div className="flex items-center justify-end gap-2 pt-2 sm:pt-0 border-t sm:border-t-0 border-stone-200/70">
           <div className="flex items-center gap-1.5 text-xs text-stone-600">
             <label htmlFor="week-select" className="text-stone-500">
               hafta:
@@ -549,7 +500,46 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         </div>
       </div>
 
-      {/* If instructor teaches multiple courses (e.g. Rabia Kılbaş 5/a & 5/b sosyal), allow switching */}
+      {/* Concurrent Edit Conflict Banner */}
+      {conflictNotice && onResolveConflict && (
+        <div
+          role="alert"
+          data-testid="conflict-warning-banner"
+          className="mb-6 rounded-2xl border border-amber-400 bg-amber-50/95 p-4 sm:p-5 shadow-sm"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-800 shrink-0 mt-0.5" />
+              <div>
+                <h2 className="font-serif-art text-lg font-medium text-amber-950">
+                  eşzamanlı düzenleme çakışması tespit edildi
+                </h2>
+                <p className="text-xs text-amber-900 mt-0.5 leading-relaxed">
+                  bu dersin ({conflictNotice.sessionType}) yoklaması aynı anda başka bir cihaz veya sekmeden güncellendi (sunucu sürümü: v{conflictNotice.serverRecord.version || 1}). hangisini korumak istersin?
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => onResolveConflict('accept_server')}
+                className="rounded-xl border border-amber-400 bg-white px-3.5 py-2 text-xs font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
+              >
+                diğer cihazdaki durumu yükle
+              </button>
+              <button
+                type="button"
+                onClick={() => onResolveConflict('force_local')}
+                className="rounded-xl bg-stone-900 px-3.5 py-2 text-xs font-medium text-stone-100 hover:bg-stone-800 transition-colors cursor-pointer"
+              >
+                benim seçimlerimi yaz
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* If instructor teaches multiple courses, allow switching */}
       {instructorCourses.length > 1 && (
         <div className="mb-6">
           <p className="text-xs text-stone-500 mb-2">sınıf seçimi:</p>
@@ -587,7 +577,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3">
           {SESSION_OPTIONS.map(session => {
             const isSelected = selectedSession === session;
-            const hasSavedRecord = attendanceRecords.some(
+            const hasSavedRecord = activeAttendanceRecords.some(
               r =>
                 r.courseId === activeCourse?.id &&
                 r.weekNumber === selectedWeek &&
@@ -621,117 +611,6 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         </div>
       </div>
 
-      {/* Placebo Save Button & Reassurance Effect (Melek Yılmaz or any opted-in instructor) */}
-      {isPlaceboSaveEnabled && (
-        <div className="mb-6 sm:mb-8">
-          <div
-            key={melekBurstKey}
-            className={`relative overflow-hidden rounded-2xl border p-4 sm:p-5 transition-all duration-500 ${
-              melekSavePhase === 'effect'
-                ? 'border-amber-500/80 bg-gradient-to-r from-amber-50/95 via-emerald-50/95 to-amber-50/95 shadow-lg scale-[1.01]'
-                : melekSavePhase === 'reassured'
-                ? 'border-emerald-500/70 bg-gradient-to-r from-emerald-50/90 via-[#f8f5ec] to-emerald-50/90 shadow-sm'
-                : 'border-stone-300/90 bg-white/90'
-            }`}
-          >
-            {/* Shimmer sweep effect when clicked */}
-            {melekSavePhase !== 'idle' && (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-y-0 left-0 w-1/2 bg-gradient-to-r from-transparent via-amber-200/60 to-transparent animate-melek-shimmer"
-              />
-            )}
-
-            <div className="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
-              <div className="flex items-center gap-3">
-                <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-stone-900 text-amber-300">
-                  {melekSavePhase !== 'idle' && (
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute inset-0 rounded-xl border-2 border-amber-400 animate-melek-ring"
-                    />
-                  )}
-                  <Sparkles
-                    className={`h-5 w-5 transition-transform duration-500 ${
-                      melekSavePhase === 'effect'
-                        ? 'scale-125 rotate-45 text-amber-300'
-                        : melekSavePhase === 'reassured'
-                        ? 'text-emerald-300 animate-melek-pop'
-                        : 'text-stone-200'
-                    }`}
-                  />
-                </div>
-                <div>
-                  {melekSavePhase === 'effect' ? (
-                    <p className="font-serif-art text-lg sm:text-xl font-medium text-stone-900 animate-pulse">
-                      ✨ yoklaman mühürleniyor... ✨
-                    </p>
-                  ) : melekSavePhase === 'reassured' ? (
-                    <p
-                      data-testid="melek-reassurance-text"
-                      className="font-serif-art text-lg sm:text-2xl font-medium text-emerald-950 animate-melek-text leading-snug"
-                    >
-                      {getInstructorReassuranceMessage(instructor)}
-                    </p>
-                  ) : (
-                    <div>
-                      <p className="font-serif-art text-lg sm:text-xl font-medium text-stone-900">
-                        için rahat etsin diye özel kaydet butonu
-                      </p>
-                      <p className="text-xs text-stone-500">
-                        yoklaman zaten anlık kaydediliyor ama emin olmak istersen dokunabilirsin
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="relative self-start sm:self-auto shrink-0">
-                {melekSavePhase === 'effect' && (
-                  <>
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute -inset-1 rounded-xl border-2 border-emerald-500 animate-melek-ring"
-                    />
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute -top-2 -left-2 text-sm animate-melek-pop"
-                    >
-                      ✨
-                    </span>
-                    <span
-                      aria-hidden="true"
-                      className="pointer-events-none absolute -bottom-2 -right-2 text-sm animate-melek-pop"
-                    >
-                      🌟
-                    </span>
-                  </>
-                )}
-                <button
-                  type="button"
-                  data-testid="placebo-save-button"
-                  onClick={handlePlaceboSaveClick}
-                  className={`relative inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-xs sm:text-sm font-medium transition-all active:scale-95 cursor-pointer ${
-                    melekSavePhase === 'effect'
-                      ? 'bg-emerald-700 text-white shadow-md scale-105'
-                      : melekSavePhase === 'reassured'
-                      ? 'bg-emerald-900 text-emerald-50 hover:bg-emerald-800 shadow-sm'
-                      : 'bg-stone-900 text-stone-100 hover:bg-stone-800 shadow-sm'
-                  }`}
-                >
-                  {melekSavePhase === 'reassured' ? (
-                    <Check className="h-4 w-4 text-emerald-300" />
-                  ) : (
-                    <Sparkles className="h-4 w-4 text-amber-300" />
-                  )}
-                  <span>kaydet</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Attendance Content Area */}
       {selectedSession === 'ders yapmadım' || (didNotHoldRecord && !selectedSession) ? (
         <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-6 sm:p-8 text-center">
@@ -739,7 +618,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
             bu hafta için "ders yapmadım" olarak kaydedildi.
           </p>
           <p className="text-xs text-stone-600 mb-4">
-            değişiklik otomatik olarak sisteme işlendi. sayfayı doğrudan kapatabilir veya yukarıdan başka bir ders seçebilirsin.
+            değişiklik otomatik olarak sisteme işlendi. yukarıdan başka bir ders seçebilir veya çıkabilirsin.
           </p>
           {onDeleteCourseSession && activeCourse && (
             <button
@@ -763,7 +642,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 derse gelmeyen öğrenciler
               </h2>
               <p className="text-xs text-stone-500 mt-0.5">
-                kimler derste? onların kutucuğuna dokun
+                kimler derste? onların kutucuğuna dokun (otomatik kaydedilir)
               </p>
             </div>
             {onDeleteCourseSession && activeCourse && (
@@ -830,7 +709,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                         <span className="font-mono-num text-xs text-stone-400 w-5 shrink-0">
                           {index + 1}.
                         </span>
-                        <span className={`text-sm truncate ${isPresent ? 'font-medium text-stone-900' : 'text-stone-600'}`}>
+                        <span
+                          className={`text-sm truncate ${
+                            isPresent ? 'font-medium text-stone-900' : 'text-stone-600'
+                          }`}
+                        >
                           {student.name}
                         </span>
                       </div>
@@ -847,7 +730,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 })}
               </div>
 
-              {/* Compact Bar: Listede Olmayan Öğrenci Ekle (between attendance list and absent list) */}
+              {/* Compact Bar: Listede Olmayan Öğrenci Ekle */}
               <div className="mt-3 pt-2.5 border-t border-stone-200/80">
                 <div className="rounded-xl border border-stone-300/80 bg-[#faf8f4]/90 px-3 py-2">
                   {!isUnlistedBarOpen ? (
@@ -917,17 +800,23 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                   {unlistedFeedback && (
                     <p
                       className={`mt-1.5 text-[11px] flex items-center gap-1 ${
-                        unlistedFeedback.type === 'error' ? 'text-rose-700' : 'text-emerald-800'
+                        unlistedFeedback.type === 'error'
+                          ? 'text-rose-700'
+                          : 'text-emerald-800'
                       }`}
                     >
-                      {unlistedFeedback.type === 'ok' && <Check className="h-3 w-3 shrink-0" />}
+                      {unlistedFeedback.type === 'ok' && (
+                        <Check className="h-3 w-3 shrink-0" />
+                      )}
                       <span>{unlistedFeedback.text}</span>
                     </p>
                   )}
 
                   {sessionUnlistedReports.length > 0 && (
                     <div className="mt-2 pt-1.5 border-t border-stone-200/70 flex flex-wrap items-center gap-1.5">
-                      <span className="text-[10px] text-stone-500">bu derste eklenen liste dışı:</span>
+                      <span className="text-[10px] text-stone-500">
+                        bu derste eklenen liste dışı:
+                      </span>
                       {sessionUnlistedReports.map(rep => (
                         <span
                           key={rep.id}
@@ -935,13 +824,20 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                         >
                           <span className="font-medium">{rep.studentName}</span>
                           <span className="text-[10px] text-emerald-700">
-                            ({rep.status === 'temporary' ? 'geçici' : rep.status === 'enrolled' ? 'kaydedildi' : 'derste'})
+                            (
+                            {rep.status === 'temporary'
+                              ? 'geçici'
+                              : rep.status === 'enrolled'
+                              ? 'kaydedildi'
+                              : 'derste'}
+                            )
                           </span>
                           {onRemoveUnlistedStudent && rep.status === 'pending' && (
                             <button
                               type="button"
                               onClick={() => onRemoveUnlistedStudent(rep.id)}
                               title="kaldır"
+                              aria-label={`${rep.studentName} liste dışı kaydını kaldır`}
                               className="ml-0.5 text-stone-400 hover:text-rose-700 cursor-pointer"
                             >
                               <X className="h-3 w-3" />
@@ -1007,31 +903,6 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
           </p>
         </div>
       )}
-
-      {/* Small Persistent Placebo Save Button Toggle at the Very Bottom */}
-      <div className="mt-8 pt-4 border-t border-stone-200/70 flex items-center justify-end">
-        <button
-          type="button"
-          role="switch"
-          aria-checked={isPlaceboSaveEnabled}
-          data-testid="placebo-save-toggle"
-          onClick={handleTogglePlaceboSaveButton}
-          className="inline-flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[11px] text-stone-500 hover:text-stone-800 transition-colors cursor-pointer select-none"
-        >
-          <span>kaydet butonu</span>
-          <span
-            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
-              isPlaceboSaveEnabled ? 'bg-stone-900' : 'bg-stone-300'
-            }`}
-          >
-            <span
-              className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
-                isPlaceboSaveEnabled ? 'translate-x-3.5' : 'translate-x-0.5'
-              }`}
-            />
-          </span>
-        </button>
-      </div>
 
       {/* Exit / Uninteracted Attendance Prompt Modal: "durum nedir?" */}
       {pendingExitAction && (
@@ -1124,4 +995,3 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     </div>
   );
 };
-

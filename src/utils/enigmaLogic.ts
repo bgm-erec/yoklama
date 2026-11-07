@@ -11,6 +11,12 @@ import {
   Student,
   UnlistedStudentReport,
 } from '../data/database';
+import {
+  ACADEMIC_CONFIG,
+  getTrustedNow,
+  getZonedDateParts,
+  parseIsoDateToUtcMidnightMs,
+} from '../config/academicConfig';
 
 export type LoginResolution =
   | { type: 'admin' }
@@ -125,29 +131,37 @@ export function resolveIdentityInput(rawInput: string): LoginResolution {
 }
 
 /**
- * Calculates the current academic week number automatically, advancing every Monday.
- * Anchor Monday: October 19, 2026 (Week 1).
+ * Calculates the current academic week number automatically, advancing every Monday in Europe/Istanbul timezone.
+ * Independent of local device timezone and uses configurable term start date (ACADEMIC_CONFIG.termStartMondayIso).
  */
-export function getCurrentWeekNumber(now: Date = new Date()): number {
-  // Anchor: Monday, Oct 19, 2026 00:00:00 local time
-  const anchorMonday = new Date(2026, 9, 19, 0, 0, 0, 0);
-  const current = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+export function getCurrentWeekNumber(
+  now: Date = getTrustedNow(),
+  termStartIso: string = ACADEMIC_CONFIG.termStartMondayIso,
+  timeZone: string = ACADEMIC_CONFIG.timeZone
+): number {
+  const anchorUtcMs = parseIsoDateToUtcMidnightMs(termStartIso);
+  const { year, month, day } = getZonedDateParts(now, timeZone);
+  const currentUtcMs = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
 
-  const diffMs = current.getTime() - anchorMonday.getTime();
+  const diffMs = currentUtcMs - anchorUtcMs;
   if (diffMs < 0) {
     return 1;
   }
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
   const week = Math.floor(diffDays / 7) + 1;
-  return Math.max(1, Math.min(52, week));
+  return Math.max(1, Math.min(ACADEMIC_CONFIG.maxWeeks, week));
 }
 
 /**
- * Formats the Monday-Sunday date range for a given week number in lowercase Turkish.
+ * Formats the Monday-Sunday date range for a given week number in lowercase Turkish,
+ * using configurable term start date and timezone-independent UTC calendar math.
  */
-export function getWeekDateRangeLabel(weekNumber: number): string {
-  const anchorMonday = new Date(2026, 9, 19, 0, 0, 0, 0);
-  const start = new Date(anchorMonday.getTime() + (weekNumber - 1) * 7 * 24 * 60 * 60 * 1000);
+export function getWeekDateRangeLabel(
+  weekNumber: number,
+  termStartIso: string = ACADEMIC_CONFIG.termStartMondayIso
+): string {
+  const anchorUtcMs = parseIsoDateToUtcMidnightMs(termStartIso);
+  const start = new Date(anchorUtcMs + (weekNumber - 1) * 7 * 24 * 60 * 60 * 1000);
   const end = new Date(start.getTime() + 6 * 24 * 60 * 60 * 1000);
 
   const months = [
@@ -155,15 +169,42 @@ export function getWeekDateRangeLabel(weekNumber: number): string {
     'temmuz', 'ağustos', 'eylül', 'ekim', 'kasım', 'aralık'
   ];
 
-  const sDay = start.getDate();
-  const sMonth = months[start.getMonth()];
-  const eDay = end.getDate();
-  const eMonth = months[end.getMonth()];
+  const sDay = start.getUTCDate();
+  const sMonth = months[start.getUTCMonth()];
+  const eDay = end.getUTCDate();
+  const eMonth = months[end.getUTCMonth()];
 
   if (sMonth === eMonth) {
     return `${sDay} - ${eDay} ${eMonth}`;
   }
   return `${sDay} ${sMonth} - ${eDay} ${eMonth}`;
+}
+
+/**
+ * Generates a deterministic attendance document ID with proper Turkish character transliteration
+ * (ı→i, ş→s, ğ→g, ü→u, ö→o, ç→c).
+ */
+export function buildAttendanceDocId(
+  courseId: string,
+  weekNumber: number,
+  sessionType: SessionType | string
+): string {
+  const courseSlug = slugifyTurkish(courseId);
+  const sessionSlug = slugifyTurkish(sessionType);
+  return `${courseSlug}_w${weekNumber}_${sessionSlug}`;
+}
+
+/**
+ * Generates a random permanent student ID so that two students with the exact same name
+ * never collide or overwrite each other.
+ */
+export function generatePermanentStudentId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `stu_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  }
+  const randA = Math.random().toString(36).slice(2, 8);
+  const randB = Math.random().toString(36).slice(2, 8);
+  return `stu_${Date.now().toString(36)}_${randA}${randB}`.slice(0, 20);
 }
 
 /**
@@ -195,7 +236,8 @@ export function isStudentResponsibleForSession(
 }
 
 /**
- * Builds a clean Student record for a newly added student.
+ * Builds a clean Student record for a newly added student using a random permanent ID
+ * (never derived from the student's name, preventing collisions for same-named students).
  */
 export function createNewStudentRecord(params: {
   rawName: string;
@@ -204,18 +246,42 @@ export function createNewStudentRecord(params: {
   enrolledCourseIds: string[];
   currentWeek: number;
   nowIso?: string;
+  customId?: string;
 }): Student {
   const normName = normalizeTurkish(params.rawName);
-  const slug = slugifyTurkish(normName);
   return {
-    id: `stu-${slug}`,
+    id: params.customId || generatePermanentStudentId(),
     name: normName,
     grade: normalizeTurkish(params.gradeLabel),
     modality: params.modality,
     enrolledCourseIds: params.enrolledCourseIds,
     addedAtWeek: params.currentWeek,
-    addedAt: params.nowIso || new Date().toISOString(),
+    addedAt: params.nowIso || getTrustedNow().toISOString(),
   };
+}
+
+/**
+ * Detects whether a remote attendance document was concurrently updated by another device/session
+ * since the local client loaded or last saved its base version.
+ */
+export function detectConcurrentAttendanceConflict(params: {
+  serverVersion?: number;
+  serverUpdatedBySessionId?: string;
+  expectedBaseVersion: number;
+  currentClientSessionId: string;
+}): boolean {
+  const {
+    serverVersion,
+    serverUpdatedBySessionId,
+    expectedBaseVersion,
+    currentClientSessionId,
+  } = params;
+  if (typeof serverVersion !== 'number') return false;
+  if (serverVersion <= expectedBaseVersion) return false;
+  if (serverUpdatedBySessionId && serverUpdatedBySessionId === currentClientSessionId) {
+    return false;
+  }
+  return true;
 }
 
 /**

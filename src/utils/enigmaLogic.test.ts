@@ -18,8 +18,12 @@ import {
   resolveExitPromptDecision,
   isZeroPresentAttendanceRecord,
   getZeroPresentAttendanceRecords,
+  buildAttendanceDocId,
+  detectConcurrentAttendanceConflict,
 } from './enigmaLogic';
-import { AttendanceRecord, DB, syncDatabaseMutations } from '../data/database';
+import { AttendanceRecord, DB, slugifyTurkish, syncDatabaseMutations } from '../data/database';
+import { WriteQueueController } from './writeQueue';
+import { setServerClockOffsetMs } from '../config/academicConfig';
 
 test('sibelius resolves to admin', () => {
   const res = resolveIdentityInput('Sibelius');
@@ -208,7 +212,7 @@ test('isStudentResponsibleForSession excludes sessions prior to student addition
   );
 });
 
-test('syncDatabaseMutations dynamically adds, removes, and updates student course enrollments', () => {
+test('syncDatabaseMutations dynamically adds, removes, and updates student course enrollments with random permanent ID', () => {
   const newSt = createNewStudentRecord({
     rawName: 'Canan Ersoy',
     modality: 'yuzyuze',
@@ -218,10 +222,13 @@ test('syncDatabaseMutations dynamically adds, removes, and updates student cours
     nowIso: '2026-10-28T12:00:00.000Z',
   });
 
+  assert.ok(newSt.id.startsWith('stu_'));
+  assert.notEqual(newSt.id, 'stu-canan-ersoy');
+
   const mutated = syncDatabaseMutations([newSt], []);
-  assert.ok(mutated.students.some(s => s.id === 'stu-canan-ersoy'));
+  assert.ok(mutated.students.some(s => s.id === newSt.id));
   const yy5aMat = mutated.courses.find(c => c.id === 'yy-5a-mat');
-  assert.ok(yy5aMat?.studentIds.includes('stu-canan-ersoy'));
+  assert.ok(yy5aMat?.studentIds.includes(newSt.id));
 
   // Verify Murat Yüksek is only in 6/a courses and not 5/a courses
   const murat = mutated.students.find(s => s.name === 'murat yüksek');
@@ -231,10 +238,10 @@ test('syncDatabaseMutations dynamically adds, removes, and updates student cours
   assert.equal(yy6aMat?.studentIds.includes(murat.id), true);
 
   // Now remove Canan Ersoy
-  const afterRemove = syncDatabaseMutations([newSt], ['stu-canan-ersoy']);
-  assert.ok(!afterRemove.students.some(s => s.id === 'stu-canan-ersoy'));
+  const afterRemove = syncDatabaseMutations([newSt], [newSt.id]);
+  assert.ok(!afterRemove.students.some(s => s.id === newSt.id));
   const yy5aMatAfter = afterRemove.courses.find(c => c.id === 'yy-5a-mat');
-  assert.ok(!yy5aMatAfter?.studentIds.includes('stu-canan-ersoy'));
+  assert.ok(!yy5aMatAfter?.studentIds.includes(newSt.id));
 
   // Reset DB back to clean state
   syncDatabaseMutations([], []);
@@ -509,3 +516,127 @@ test('getZeroPresentAttendanceRecords detects 0-present records and never touche
   assert.equal(isZeroPresentAttendanceRecord(processedRecord, initial.courses), false);
   assert.equal(isZeroPresentAttendanceRecord(didNotHoldRecord, initial.courses), false);
 });
+
+test('two students with the exact same name get distinct permanent IDs and do not collide', () => {
+  const stu1 = createNewStudentRecord({
+    rawName: 'Ömer Çağrı Şahin',
+    modality: 'online',
+    gradeLabel: '5. sınıf',
+    enrolledCourseIds: ['online-5a-mat'],
+    currentWeek: 2,
+  });
+  const stu2 = createNewStudentRecord({
+    rawName: 'Ömer Çağrı Şahin',
+    modality: 'yuzyuze',
+    gradeLabel: '6. sınıf (6/a yüz yüze)',
+    enrolledCourseIds: ['yy-6a-mat'],
+    currentWeek: 2,
+  });
+
+  assert.notEqual(stu1.id, stu2.id);
+  const mutated = syncDatabaseMutations([stu1, stu2], []);
+  const matching = mutated.students.filter(s => s.name === 'ömer çağrı şahin');
+  assert.equal(matching.length, 2);
+  syncDatabaseMutations([], []);
+});
+
+test('buildAttendanceDocId and slugifyTurkish properly transliterate all Turkish characters', () => {
+  assert.equal(slugifyTurkish('Işılay Ğümüş Öztürk Çelik Şahin'), 'isilay-gumus-ozturk-celik-sahin');
+  assert.equal(buildAttendanceDocId('online-3a-mat', 3, '1. ders'), 'online-3a-mat_w3_1-ders');
+  assert.equal(buildAttendanceDocId('online-3a-mat', 3, 'ders yapmadım'), 'online-3a-mat_w3_ders-yapmadim');
+  assert.equal(buildAttendanceDocId('yy-6a-türkçe', 2, 'ek dersler'), 'yy-6a-turkce_w2_ek-dersler');
+});
+
+test('Europe/Istanbul timezone and server clock offset protect week calculation against wrong device clock', () => {
+  // Sunday Oct 25, 2026 at 22:30 UTC is already Monday Oct 26, 2026 01:30 in Europe/Istanbul (UTC+3) -> Week 2!
+  const sundayLateUtc = new Date('2026-10-25T22:30:00.000Z');
+  assert.equal(getCurrentWeekNumber(sundayLateUtc, '2026-10-19', 'Europe/Istanbul'), 2);
+
+  // Server clock offset test: suppose device clock is 7 days behind server time
+  setServerClockOffsetMs(7 * 24 * 60 * 60 * 1000);
+  const weekWithOffset = getCurrentWeekNumber();
+  setServerClockOffsetMs(0);
+  const weekWithoutOffset = getCurrentWeekNumber();
+  assert.equal(weekWithOffset, Math.min(52, weekWithoutOffset + 1));
+});
+
+test('detectConcurrentAttendanceConflict identifies edits from another session with higher version', () => {
+  assert.equal(
+    detectConcurrentAttendanceConflict({
+      serverVersion: 3,
+      serverUpdatedBySessionId: 'sess_other_device',
+      expectedBaseVersion: 2,
+      currentClientSessionId: 'sess_my_device',
+    }),
+    true
+  );
+
+  // Same session ID -> not a conflict
+  assert.equal(
+    detectConcurrentAttendanceConflict({
+      serverVersion: 3,
+      serverUpdatedBySessionId: 'sess_my_device',
+      expectedBaseVersion: 2,
+      currentClientSessionId: 'sess_my_device',
+    }),
+    false
+  );
+});
+
+test('WriteQueueController coalesces rapid clicks into a single write and waits for server confirmation', async () => {
+  let writeCalls = 0;
+  let lastWrittenPayload = '';
+  let isOnline = true;
+  let serverSyncRelease: (() => void) | null = null;
+
+  const queue = new WriteQueueController({
+    debounceMs: 30,
+    savedHideMs: 0,
+    getIsOnline: () => isOnline,
+    waitForServerSync: () =>
+      new Promise<void>(resolve => {
+        serverSyncRelease = resolve;
+      }),
+  });
+
+  // Rapid consecutive clicks (1, 2, 3) within debounce window
+  for (const state of ['click-1', 'click-2', 'click-3-final']) {
+    queue.enqueueDebounced({
+      key: 'att_1',
+      label: 'Yoklama',
+      execute: async () => {
+        writeCalls++;
+        lastWrittenPayload = state;
+      },
+    });
+  }
+
+  assert.equal(queue.getSnapshot().phase, 'saving');
+  assert.equal(queue.getSnapshot().pendingCount, 1);
+
+  // Wait for 45ms so debounce fires
+  await new Promise(r => setTimeout(r, 45));
+
+  // Write execute() ran once with final state, but serverSync hasn't resolved yet -> still 'saving', NOT 'saved'!
+  assert.equal(writeCalls, 1);
+  assert.equal(lastWrittenPayload, 'click-3-final');
+  assert.equal(queue.getSnapshot().phase, 'saving');
+
+  // Now server confirms the write
+  if (serverSyncRelease) (serverSyncRelease as () => void)();
+  await new Promise(r => setTimeout(r, 10));
+
+  assert.equal(queue.getSnapshot().phase, 'saved');
+
+  // Test offline mode -> shows 'offline' ("bağlantı yok, bağlanınca kaydedilecek")
+  isOnline = false;
+  queue.enqueueDebounced({
+    key: 'att_offline',
+    label: 'Offline Yoklama',
+    execute: async () => {
+      writeCalls++;
+    },
+  });
+  assert.equal(queue.getSnapshot().phase, 'offline');
+});
+

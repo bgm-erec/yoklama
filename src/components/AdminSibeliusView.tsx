@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import {
   AttendanceRecord,
+  AuditLogEntry,
   Course,
   DATA_DISCREPANCIES,
   getCanonicalStudentName,
@@ -45,6 +46,7 @@ interface AdminSibeliusViewProps {
   attendanceRecords: AttendanceRecord[];
   unlistedReports: UnlistedStudentReport[];
   placeboSavePrefs?: PlaceboSavePreferenceRecord[];
+  auditLogs?: AuditLogEntry[];
   onAddStudent: (student: Student) => Promise<void>;
   onRemoveStudent: (student: Student) => Promise<void>;
   onAssignInstructor: (
@@ -57,11 +59,22 @@ interface AdminSibeliusViewProps {
   onDeleteUnlistedReport: (reportId: string) => Promise<void>;
   onResetZeroAttendance?: () => Promise<number>;
   onResetAllAttendance: () => Promise<void>;
+  canUndoAttendanceReset?: boolean;
+  onUndoAttendanceReset?: () => Promise<void>;
   onResetAllFeedbacks: () => Promise<void>;
+  canUndoFeedbackReset?: boolean;
+  onUndoFeedbackReset?: () => Promise<void>;
   onBackToLogin: () => void;
 }
 
-type AdminCategory = 'menu' | 'ders' | 'ogrenci' | 'egitmen' | 'liste_disi' | 'uyumsuzluklar';
+type AdminCategory =
+  | 'menu'
+  | 'ders'
+  | 'ogrenci'
+  | 'egitmen'
+  | 'liste_disi'
+  | 'uyumsuzluklar'
+  | 'audit_log';
 
 const ONLINE_GRADE_OPTIONS = [
   { label: '3. sınıf', gradeClass: '3/a' },
@@ -99,9 +112,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   students,
   courses,
   instructors,
-  attendanceRecords,
-  unlistedReports,
+  attendanceRecords: rawAttendanceRecords,
+  unlistedReports: rawUnlistedReports,
   placeboSavePrefs = [],
+  auditLogs = [],
   onAddStudent,
   onRemoveStudent,
   onAssignInstructor,
@@ -110,9 +124,22 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onDeleteUnlistedReport,
   onResetZeroAttendance,
   onResetAllAttendance,
+  canUndoAttendanceReset,
+  onUndoAttendanceReset,
   onResetAllFeedbacks,
+  canUndoFeedbackReset,
+  onUndoFeedbackReset,
   onBackToLogin,
 }) => {
+  const attendanceRecords = useMemo(
+    () => rawAttendanceRecords.filter(r => !r.deletedAt),
+    [rawAttendanceRecords]
+  );
+  const unlistedReports = useMemo(
+    () => rawUnlistedReports.filter(r => !r.deletedAt),
+    [rawUnlistedReports]
+  );
+
   const [category, setCategory] = useState<AdminCategory>('menu');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
@@ -120,9 +147,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [selectedInstructorId, setSelectedInstructorId] = useState<string | null>(null);
   const [showParanoyaNames, setShowParanoyaNames] = useState(false);
 
-  // Compact top-right reset states
+  // Compact top-right reset states with text confirmation ("SIFIRLA")
   const [confirmingAttendanceReset, setConfirmingAttendanceReset] = useState(false);
+  const [attendanceResetConfirmText, setAttendanceResetConfirmText] = useState('');
   const [confirmingFeedbackReset, setConfirmingFeedbackReset] = useState(false);
+  const [feedbackResetConfirmText, setFeedbackResetConfirmText] = useState('');
   const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // Add / Remove Student Panel states
@@ -140,6 +169,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   // Remove Student Form states
   const [removeNameInput, setRemoveNameInput] = useState('');
   const [studentToConfirmRemove, setStudentToConfirmRemove] = useState<Student | null>(null);
+  const [sameNameCandidates, setSameNameCandidates] = useState<Student[]>([]);
   const [removeFormError, setRemoveFormError] = useState<string | null>(null);
 
   // Instructor Assignment Panel states
@@ -308,12 +338,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     if (!queryName) {
       setRemoveFormError('lütfen kaldırılacak öğrencinin adını soyadını yaz.');
       setStudentToConfirmRemove(null);
+      setSameNameCandidates([]);
       return;
     }
 
-    const exactMatch = students.find(s => s.name === queryName);
-    if (exactMatch) {
-      setStudentToConfirmRemove(exactMatch);
+    const exactMatches = students.filter(s => s.name === queryName);
+    if (exactMatches.length === 1) {
+      setStudentToConfirmRemove(exactMatches[0]);
+      setSameNameCandidates([]);
+      setRemoveFormError(null);
+      return;
+    }
+    if (exactMatches.length > 1) {
+      setStudentToConfirmRemove(null);
+      setSameNameCandidates(exactMatches);
       setRemoveFormError(null);
       return;
     }
@@ -321,22 +359,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     const partialMatches = students.filter(s => s.name.includes(queryName));
     if (partialMatches.length === 1) {
       setStudentToConfirmRemove(partialMatches[0]);
+      setSameNameCandidates([]);
       setRemoveFormError(null);
       return;
     }
 
     if (partialMatches.length > 1) {
       setStudentToConfirmRemove(null);
-      setRemoveFormError(
-        `birden fazla eşleşme bulundu (${partialMatches
-          .slice(0, 3)
-          .map(s => s.name)
-          .join(', ')}). lütfen tam adını soyadını yaz.`
-      );
+      setSameNameCandidates(partialMatches);
+      setRemoveFormError(null);
       return;
     }
 
     setStudentToConfirmRemove(null);
+    setSameNameCandidates([]);
     setRemoveFormError('bu isimde kayıtlı bir öğrenci bulunamadı.');
   };
 
@@ -803,6 +839,36 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         {/* Right Side: Compact Data Reset Tools (when in menu) OR Quick Category Switcher (when in sub-view) */}
         {category === 'menu' ? (
           <div className="flex flex-wrap items-center gap-1.5 sm:justify-end self-start sm:self-center">
+            {canUndoAttendanceReset && onUndoAttendanceReset && (
+              <button
+                type="button"
+                data-testid="undo-attendance-reset-btn"
+                onClick={async () => {
+                  await onUndoAttendanceReset();
+                  showTemporaryNotice('silinen yoklama kayıtları geri yüklendi.');
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400 bg-amber-50 px-2.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>yoklama sıfırlamayı geri al</span>
+              </button>
+            )}
+
+            {canUndoFeedbackReset && onUndoFeedbackReset && (
+              <button
+                type="button"
+                data-testid="undo-feedback-reset-btn"
+                onClick={async () => {
+                  await onUndoFeedbackReset();
+                  showTemporaryNotice('silinen feedback kayıtları geri yüklendi.');
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400 bg-amber-50 px-2.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>feedback silmeyi geri al</span>
+              </button>
+            )}
+
             {onResetZeroAttendance && (
               <button
                 type="button"
@@ -810,7 +876,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   const resetCount = await onResetZeroAttendance();
                   if (resetCount > 0) {
                     showTemporaryNotice(
-                      `kimse derse gelmemiş görünen ${resetCount} yoklama kaydı "yoklama alınmadı" olarak sıfırlandı (işlenmiş kayıtlara dokunulmadı).`
+                      `kimse derse gelmemiş görünen ${resetCount} yoklama kaydı yedeklenerek "yoklama alınmadı" olarak sıfırlandı (işlenmiş kayıtlara dokunulmadı).`
                     );
                   } else {
                     showTemporaryNotice(
@@ -824,11 +890,14 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 <span>boş (0 gelen) yoklamaları sıfırla</span>
               </button>
             )}
+
             {!confirmingAttendanceReset ? (
               <button
                 type="button"
+                data-testid="open-attendance-reset-btn"
                 onClick={() => {
                   setConfirmingAttendanceReset(true);
+                  setAttendanceResetConfirmText('');
                   setConfirmingFeedbackReset(false);
                 }}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300/90 bg-white/80 px-2.5 py-1.5 text-[11px] text-stone-600 hover:border-rose-700 hover:text-rose-800 transition-colors cursor-pointer whitespace-nowrap"
@@ -837,22 +906,43 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 <span>yoklamaları sıfırla ({attendanceRecords.length})</span>
               </button>
             ) : (
-              <div className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px]">
-                <span className="text-rose-900">emin misin?</span>
+              <div className="inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px]">
+                <label htmlFor="sibelius-att-reset-input" className="text-rose-900">
+                  onay için <strong>SIFIRLA</strong> yaz:
+                </label>
+                <input
+                  id="sibelius-att-reset-input"
+                  type="text"
+                  value={attendanceResetConfirmText}
+                  onChange={e => setAttendanceResetConfirmText(e.target.value)}
+                  placeholder="SIFIRLA"
+                  className="w-20 rounded border border-rose-300 bg-white px-1.5 py-0.5 text-[11px] text-stone-900 focus:border-rose-700 focus:outline-none"
+                />
                 <button
                   type="button"
+                  data-testid="confirm-attendance-reset-btn"
+                  disabled={
+                    normalizeTurkish(attendanceResetConfirmText) !== 'sıfırla' &&
+                    normalizeTurkish(attendanceResetConfirmText) !== 'sifirla'
+                  }
                   onClick={async () => {
                     await onResetAllAttendance();
                     setConfirmingAttendanceReset(false);
-                    showTemporaryNotice('tüm yoklama kayıtları sıfırlandı.');
+                    setAttendanceResetConfirmText('');
+                    showTemporaryNotice(
+                      'otomatik JSON yedeği indirildi ve tüm yoklama kayıtları sıfırlandı (geri alınabilir).'
+                    );
                   }}
-                  className="rounded bg-rose-700 px-2 py-0.5 text-white hover:bg-rose-800 cursor-pointer"
+                  className="rounded bg-rose-700 px-2 py-0.5 text-white hover:bg-rose-800 disabled:opacity-40 cursor-pointer"
                 >
-                  evet
+                  yedekle ve sıfırla
                 </button>
                 <button
                   type="button"
-                  onClick={() => setConfirmingAttendanceReset(false)}
+                  onClick={() => {
+                    setConfirmingAttendanceReset(false);
+                    setAttendanceResetConfirmText('');
+                  }}
                   className="px-1 text-stone-600 hover:text-stone-900 cursor-pointer"
                 >
                   vazgeç
@@ -865,6 +955,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 type="button"
                 onClick={() => {
                   setConfirmingFeedbackReset(true);
+                  setFeedbackResetConfirmText('');
                   setConfirmingAttendanceReset(false);
                 }}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300/90 bg-white/80 px-2.5 py-1.5 text-[11px] text-stone-600 hover:border-rose-700 hover:text-rose-800 transition-colors cursor-pointer whitespace-nowrap"
@@ -873,22 +964,42 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 <span>feedbackleri temizle</span>
               </button>
             ) : (
-              <div className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px]">
-                <span className="text-rose-900">silinsin mi?</span>
+              <div className="inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px]">
+                <label htmlFor="sibelius-fb-reset-input" className="text-rose-900">
+                  onay için <strong>SIFIRLA</strong> yaz:
+                </label>
+                <input
+                  id="sibelius-fb-reset-input"
+                  type="text"
+                  value={feedbackResetConfirmText}
+                  onChange={e => setFeedbackResetConfirmText(e.target.value)}
+                  placeholder="SIFIRLA"
+                  className="w-20 rounded border border-rose-300 bg-white px-1.5 py-0.5 text-[11px] text-stone-900 focus:border-rose-700 focus:outline-none"
+                />
                 <button
                   type="button"
+                  disabled={
+                    normalizeTurkish(feedbackResetConfirmText) !== 'sıfırla' &&
+                    normalizeTurkish(feedbackResetConfirmText) !== 'sifirla'
+                  }
                   onClick={async () => {
                     await onResetAllFeedbacks();
                     setConfirmingFeedbackReset(false);
-                    showTemporaryNotice('tüm anonim feedbackler temizlendi.');
+                    setFeedbackResetConfirmText('');
+                    showTemporaryNotice(
+                      'otomatik JSON yedeği indirildi ve tüm anonim feedbackler temizlendi (geri alınabilir).'
+                    );
                   }}
-                  className="rounded bg-rose-700 px-2 py-0.5 text-white hover:bg-rose-800 cursor-pointer"
+                  className="rounded bg-rose-700 px-2 py-0.5 text-white hover:bg-rose-800 disabled:opacity-40 cursor-pointer"
                 >
-                  evet
+                  yedekle ve sil
                 </button>
                 <button
                   type="button"
-                  onClick={() => setConfirmingFeedbackReset(false)}
+                  onClick={() => {
+                    setConfirmingFeedbackReset(false);
+                    setFeedbackResetConfirmText('');
+                  }}
                   className="px-1 text-stone-600 hover:text-stone-900 cursor-pointer"
                 >
                   vazgeç
@@ -898,36 +1009,42 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto">
-            {(['ders', 'ogrenci', 'egitmen', 'liste_disi', 'uyumsuzluklar'] as const).map(cat => {
-              const label =
-                cat === 'ders'
-                  ? 'ders arat'
-                  : cat === 'ogrenci'
-                  ? 'öğrenci arat'
-                  : cat === 'egitmen'
-                  ? 'eğitmen arat'
-                  : cat === 'liste_disi'
-                  ? `liste dışı öğrenciler${pendingUnlistedCount > 0 ? ` (${pendingUnlistedCount})` : ''}`
-                  : 'veri doğrulama notları';
-              return (
-                <button
-                  key={cat}
-                  type="button"
-                  onClick={() => {
-                    setCategory(cat);
-                    resetDetailSelection();
-                    setSearchQuery('');
-                  }}
-                  className={`rounded-xl px-3 py-2 text-xs font-medium text-center transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                    category === cat
-                      ? 'bg-stone-900 text-stone-100'
-                      : 'border border-stone-300 bg-white/85 text-stone-700 hover:bg-white'
-                  }`}
-                >
-                  {label}
-                </button>
-              );
-            })}
+            {(['ders', 'ogrenci', 'egitmen', 'liste_disi', 'audit_log', 'uyumsuzluklar'] as const).map(
+              cat => {
+                const label =
+                  cat === 'ders'
+                    ? 'ders arat'
+                    : cat === 'ogrenci'
+                    ? 'öğrenci arat'
+                    : cat === 'egitmen'
+                    ? 'eğitmen arat'
+                    : cat === 'liste_disi'
+                    ? `liste dışı öğrenciler${
+                        pendingUnlistedCount > 0 ? ` (${pendingUnlistedCount})` : ''
+                      }`
+                    : cat === 'audit_log'
+                    ? `işlem geçmişi (${auditLogs.length})`
+                    : 'veri doğrulama notları';
+                return (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => {
+                      setCategory(cat);
+                      resetDetailSelection();
+                      setSearchQuery('');
+                    }}
+                    className={`rounded-xl px-3 py-2 text-xs font-medium text-center transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                      category === cat
+                        ? 'bg-stone-900 text-stone-100'
+                        : 'border border-stone-300 bg-white/85 text-stone-700 hover:bg-white'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              }
+            )}
           </div>
         )}
       </div>
@@ -1349,12 +1466,40 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   </p>
                 )}
 
+                {sameNameCandidates.length > 1 && !studentToConfirmRemove && (
+                  <div className="rounded-xl border border-amber-300 bg-amber-50/90 p-4 space-y-2">
+                    <p className="text-xs font-medium text-amber-950">
+                      aynı veya benzer isimde birden fazla öğrenci bulundu ({sameNameCandidates.length}). hangisini kaldırmak istiyorsun?
+                    </p>
+                    <div className="space-y-1.5">
+                      {sameNameCandidates.map(cand => (
+                        <button
+                          key={cand.id}
+                          type="button"
+                          onClick={() => {
+                            setStudentToConfirmRemove(cand);
+                            setSameNameCandidates([]);
+                          }}
+                          className="w-full flex items-center justify-between rounded-lg border border-amber-300 bg-white px-3 py-2 text-left text-xs hover:bg-amber-100/60 transition-colors cursor-pointer"
+                        >
+                          <span>
+                            <strong>{cand.name}</strong> · {cand.grade} · {cand.enrolledCourseIds.length} ders
+                          </span>
+                          <span className="font-mono-num text-[10px] text-stone-400">
+                            id: {cand.id}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {studentToConfirmRemove && (
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-rose-300 bg-rose-50/90 p-4">
                     <div>
                       <p className="text-sm font-medium text-rose-950">
                         "{studentToConfirmRemove.name}" ({studentToConfirmRemove.grade} ·{' '}
-                        {studentToConfirmRemove.enrolledCourseIds.length} ders) bulundu.
+                        {studentToConfirmRemove.enrolledCourseIds.length} ders · id: {studentToConfirmRemove.id}) bulundu.
                       </p>
                       <p className="text-xs text-rose-800 mt-0.5">
                         bu öğrenciyi yoklama sisteminden kaldırmak istediğine emin misin?
@@ -1645,8 +1790,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             )}
           </div>
 
-          {/* Subtle Compact Info Panel: Kaydet Butonuna İhtiyaç Duyan Paranoya Sayısı */}
-          <div className="pt-2 flex flex-col items-end">
+          {/* Audit Log Quick Link at Bottom of Menu */}
+          <div className="pt-2 flex flex-wrap items-center justify-between gap-2">
+            <button
+              type="button"
+              data-testid="sibelius-audit-log-btn"
+              onClick={() => {
+                setCategory('audit_log');
+                resetDetailSelection();
+              }}
+              className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
+            >
+              <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
+            </button>
+
             <button
               type="button"
               data-testid="sibelius-paranoya-panel"
@@ -1661,7 +1818,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               </span>
             </button>
             {showParanoyaNames && paranoyaStats.names.length > 0 && (
-              <p className="mt-1.5 text-[11px] text-stone-500 text-right">
+              <p className="w-full text-[11px] text-stone-500 text-right">
                 aktif edenler: {paranoyaStats.names.join(', ')}
               </p>
             )}
@@ -2127,6 +2284,61 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                     </div>
                   );
                 })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ================= CATEGORY: İŞLEM GEÇMİŞİ (AUDIT LOG) ================= */}
+      {category === 'audit_log' && (
+        <div className="rounded-2xl border border-stone-300/90 bg-white/90 p-5 sm:p-6">
+          <div className="border-b border-stone-200 pb-4 mb-4">
+            <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900">
+              işlem geçmişi · audit log
+            </h2>
+            <p className="text-xs text-stone-500 mt-1">
+              yoklama ve yönetim işlemlerinin kim tarafından, ne zaman ve nasıl yapıldığını gösteren kayıt dökümü ({auditLogs.length})
+            </p>
+          </div>
+
+          {auditLogs.length === 0 ? (
+            <p className="py-8 text-center text-xs text-stone-500">
+              henüz kayıtlı bir işlem geçmişi bulunmuyor.
+            </p>
+          ) : (
+            <div className="divide-y divide-stone-200/70 text-xs">
+              {auditLogs.map(log => {
+                const dateObj = new Date(log.createdAt);
+                const formatted = isNaN(dateObj.getTime())
+                  ? log.createdAt
+                  : dateObj.toLocaleString('tr-TR', {
+                      timeZone: 'Europe/Istanbul',
+                      day: '2-digit',
+                      month: 'short',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    });
+                return (
+                  <div
+                    key={log.id}
+                    className="py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5"
+                  >
+                    <div>
+                      <span className="font-medium text-stone-900">{log.actor}</span>
+                      <span className="mx-1.5 text-stone-400">·</span>
+                      <span className="rounded bg-stone-100 px-1.5 py-0.5 font-mono-num text-[11px] text-stone-700">
+                        {log.action}
+                      </span>
+                      <span className="mx-1.5 text-stone-400">·</span>
+                      <span className="text-stone-600">{log.details}</span>
+                    </div>
+                    <span className="font-mono-num text-[11px] text-stone-400 whitespace-nowrap">
+                      {formatted}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

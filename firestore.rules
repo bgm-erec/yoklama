@@ -13,9 +13,17 @@ service cloud.firestore {
       return request.resource.data;
     }
 
+    function isValidTimeField(val) {
+      return val is timestamp || (val is string && val.size() <= 64);
+    }
+
+    function isValidOptionalTimeField(data, field) {
+      return !(field in data) || data[field] == null || isValidTimeField(data[field]);
+    }
+
     function isValidAttendanceRecord(data) {
       return data.keys().hasAll(['courseId', 'instructorId', 'weekNumber', 'sessionType', 'absentStudentIds', 'didNotHoldClass', 'updatedAt'])
-        && data.keys().hasOnly(['courseId', 'instructorId', 'weekNumber', 'sessionType', 'absentStudentIds', 'didNotHoldClass', 'updatedAt'])
+        && data.keys().hasOnly(['courseId', 'instructorId', 'weekNumber', 'sessionType', 'absentStudentIds', 'didNotHoldClass', 'updatedAt', 'updatedAtIso', 'version', 'updatedBySessionId', 'deletedAt', 'deletedAtIso'])
         && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
         && data.instructorId is string && data.instructorId.size() >= 1 && data.instructorId.size() <= 100
         && data.weekNumber is number && data.weekNumber >= 1 && data.weekNumber <= 52
@@ -23,19 +31,27 @@ service cloud.firestore {
         && data.absentStudentIds is list && data.absentStudentIds.size() <= 100
         && (data.absentStudentIds.size() == 0 || data.absentStudentIds[0] is string)
         && data.didNotHoldClass is bool
-        && data.updatedAt is string && data.updatedAt.size() <= 64;
+        && isValidTimeField(data.updatedAt)
+        && isValidOptionalTimeField(data, 'updatedAtIso')
+        && (!('version' in data) || (data.version is number && data.version >= 1))
+        && (!('updatedBySessionId' in data) || (data.updatedBySessionId is string && data.updatedBySessionId.size() <= 100))
+        && isValidOptionalTimeField(data, 'deletedAt')
+        && isValidOptionalTimeField(data, 'deletedAtIso');
     }
 
     function isValidFeedbackItem(data) {
       return data.keys().hasAll(['message', 'createdAt'])
-        && data.keys().hasOnly(['message', 'createdAt'])
+        && data.keys().hasOnly(['message', 'createdAt', 'createdAtIso', 'deletedAt', 'deletedAtIso'])
         && data.message is string && data.message.size() >= 1 && data.message.size() <= 2000
-        && data.createdAt is string && data.createdAt.size() <= 64;
+        && isValidTimeField(data.createdAt)
+        && isValidOptionalTimeField(data, 'createdAtIso')
+        && isValidOptionalTimeField(data, 'deletedAt')
+        && isValidOptionalTimeField(data, 'deletedAtIso');
     }
 
     function isValidCustomStudent(data) {
       return data.keys().hasAll(['id', 'name', 'grade', 'modality', 'enrolledCourseIds', 'addedAtWeek', 'addedAt'])
-        && data.keys().hasOnly(['id', 'name', 'grade', 'modality', 'enrolledCourseIds', 'addedAtWeek', 'addedAt'])
+        && data.keys().hasOnly(['id', 'name', 'grade', 'modality', 'enrolledCourseIds', 'addedAtWeek', 'addedAt', 'addedAtIso', 'deletedAt', 'deletedAtIso'])
         && data.id is string && data.id.size() >= 1 && data.id.size() <= 120
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
         && data.grade is string && data.grade.size() >= 1 && data.grade.size() <= 40
@@ -43,28 +59,34 @@ service cloud.firestore {
         && data.enrolledCourseIds is list && data.enrolledCourseIds.size() >= 1 && data.enrolledCourseIds.size() <= 30
         && data.enrolledCourseIds[0] is string
         && data.addedAtWeek is number && data.addedAtWeek >= 1 && data.addedAtWeek <= 52
-        && data.addedAt is string && data.addedAt.size() <= 64;
+        && isValidTimeField(data.addedAt)
+        && isValidOptionalTimeField(data, 'addedAtIso')
+        && isValidOptionalTimeField(data, 'deletedAt')
+        && isValidOptionalTimeField(data, 'deletedAtIso');
     }
 
     function isValidRemovedStudent(data) {
       return data.keys().hasAll(['studentId', 'name', 'removedAt'])
-        && data.keys().hasOnly(['studentId', 'name', 'removedAt'])
+        && data.keys().hasOnly(['studentId', 'name', 'removedAt', 'removedAtIso', 'deletedAt'])
         && data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 120
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
-        && data.removedAt is string && data.removedAt.size() <= 64;
+        && isValidTimeField(data.removedAt)
+        && isValidOptionalTimeField(data, 'removedAtIso')
+        && isValidOptionalTimeField(data, 'deletedAt');
     }
 
     function isValidInstructorAssignment(data) {
       return data.keys().hasAll(['courseId', 'instructorName', 'updatedAt'])
-        && data.keys().hasOnly(['courseId', 'instructorName', 'updatedAt', 'modality', 'gradeClass', 'subject'])
+        && data.keys().hasOnly(['courseId', 'instructorName', 'updatedAt', 'updatedAtIso', 'modality', 'gradeClass', 'subject'])
         && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
         && data.instructorName is string && data.instructorName.size() >= 1 && data.instructorName.size() <= 120
-        && data.updatedAt is string && data.updatedAt.size() <= 64;
+        && isValidTimeField(data.updatedAt)
+        && isValidOptionalTimeField(data, 'updatedAtIso');
     }
 
     function isValidUnlistedStudentReport(data) {
       return data.keys().hasAll(['id', 'studentName', 'courseId', 'instructorId', 'instructorName', 'weekNumber', 'sessionType', 'status', 'createdAt'])
-        && data.keys().hasOnly(['id', 'studentName', 'courseId', 'instructorId', 'instructorName', 'weekNumber', 'sessionType', 'status', 'resolvedStudentId', 'resolvedExistingStudent', 'createdAt', 'resolvedAt'])
+        && data.keys().hasOnly(['id', 'studentName', 'courseId', 'instructorId', 'instructorName', 'weekNumber', 'sessionType', 'status', 'resolvedStudentId', 'resolvedExistingStudent', 'createdAt', 'createdAtIso', 'resolvedAt', 'resolvedAtIso', 'deletedAt', 'deletedAtIso'])
         && data.id is string && data.id.size() >= 1 && data.id.size() <= 128
         && data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120
         && data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 100
@@ -75,17 +97,33 @@ service cloud.firestore {
         && data.status is string && data.status in ['pending', 'enrolled', 'temporary']
         && (!('resolvedStudentId' in data) || (data.resolvedStudentId is string && data.resolvedStudentId.size() >= 1 && data.resolvedStudentId.size() <= 120))
         && (!('resolvedExistingStudent' in data) || data.resolvedExistingStudent is bool)
-        && data.createdAt is string && data.createdAt.size() <= 64
-        && (!('resolvedAt' in data) || (data.resolvedAt is string && data.resolvedAt.size() <= 64));
+        && isValidTimeField(data.createdAt)
+        && isValidOptionalTimeField(data, 'createdAtIso')
+        && isValidOptionalTimeField(data, 'resolvedAt')
+        && isValidOptionalTimeField(data, 'resolvedAtIso')
+        && isValidOptionalTimeField(data, 'deletedAt')
+        && isValidOptionalTimeField(data, 'deletedAtIso');
     }
 
     function isValidPlaceboSavePreference(data) {
       return data.keys().hasAll(['instructorId', 'instructorName', 'enabled', 'updatedAt'])
-        && data.keys().hasOnly(['instructorId', 'instructorName', 'enabled', 'updatedAt'])
+        && data.keys().hasOnly(['instructorId', 'instructorName', 'enabled', 'updatedAt', 'updatedAtIso'])
         && data.instructorId is string && data.instructorId.size() >= 1 && data.instructorId.size() <= 120
         && data.instructorName is string && data.instructorName.size() >= 1 && data.instructorName.size() <= 120
         && data.enabled is bool
-        && data.updatedAt is string && data.updatedAt.size() <= 64;
+        && isValidTimeField(data.updatedAt)
+        && isValidOptionalTimeField(data, 'updatedAtIso');
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['actor', 'action', 'target', 'details', 'createdAt'])
+        && data.keys().hasOnly(['actor', 'action', 'target', 'details', 'createdAt', 'createdAtIso'])
+        && data.actor is string && data.actor.size() >= 1 && data.actor.size() <= 120
+        && data.action is string && data.action.size() >= 1 && data.action.size() <= 100
+        && data.target is string && data.target.size() >= 1 && data.target.size() <= 200
+        && data.details is string && data.details.size() >= 1 && data.details.size() <= 2000
+        && isValidTimeField(data.createdAt)
+        && isValidOptionalTimeField(data, 'createdAtIso');
     }
 
     match /test/connection {
@@ -104,45 +142,52 @@ service cloud.firestore {
 
     match /feedback/{feedbackId} {
       allow get: if isValidId(feedbackId);
-      allow list: if resource.data.createdAt >= '2020-01-01';
+      allow list: if resource.data.message >= '';
       allow create: if isValidId(feedbackId) && isValidFeedbackItem(incoming());
-      allow update: if false;
+      allow update: if isValidId(feedbackId) && isValidFeedbackItem(incoming());
       allow delete: if isValidId(feedbackId);
     }
 
     match /custom_students/{studentId} {
       allow get: if isValidId(studentId);
-      allow list: if resource.data.addedAt >= '2020-01-01';
+      allow list: if resource.data.addedAtWeek >= 1;
       allow create, update: if isValidId(studentId) && isValidCustomStudent(incoming());
       allow delete: if isValidId(studentId);
     }
 
     match /removed_students/{studentId} {
       allow get: if isValidId(studentId);
-      allow list: if resource.data.removedAt >= '2020-01-01';
+      allow list: if resource.data.studentId >= '';
       allow create, update: if isValidId(studentId) && isValidRemovedStudent(incoming());
       allow delete: if isValidId(studentId);
     }
 
     match /instructor_assignments/{courseId} {
       allow get: if isValidId(courseId);
-      allow list: if resource.data.updatedAt >= '2020-01-01';
+      allow list: if resource.data.courseId >= '';
       allow create, update: if isValidId(courseId) && isValidInstructorAssignment(incoming());
       allow delete: if isValidId(courseId);
     }
 
     match /unlisted_students/{reportId} {
       allow get: if isValidId(reportId);
-      allow list: if resource.data.createdAt >= '2020-01-01';
+      allow list: if resource.data.weekNumber >= 1 && resource.data.weekNumber <= 52;
       allow create, update: if isValidId(reportId) && isValidUnlistedStudentReport(incoming());
       allow delete: if isValidId(reportId);
     }
 
     match /placebo_save_preferences/{instructorId} {
       allow get: if isValidId(instructorId);
-      allow list: if resource.data.updatedAt >= '2020-01-01';
+      allow list: if resource.data.instructorId >= '';
       allow create, update: if isValidId(instructorId) && isValidPlaceboSavePreference(incoming());
       allow delete: if isValidId(instructorId);
+    }
+
+    match /audit_log/{logId} {
+      allow get: if isValidId(logId);
+      allow list: if resource.data.createdAtIso >= '2020-01-01';
+      allow create: if isValidId(logId) && isValidAuditLog(incoming());
+      allow update, delete: if false;
     }
   }
 }
