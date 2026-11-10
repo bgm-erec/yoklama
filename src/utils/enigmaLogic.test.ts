@@ -20,8 +20,24 @@ import {
   getZeroPresentAttendanceRecords,
   buildAttendanceDocId,
   detectConcurrentAttendanceConflict,
+  findSimilarStudentsByName,
 } from './enigmaLogic';
-import { AttendanceRecord, DB, slugifyTurkish, syncDatabaseMutations } from '../data/database';
+import {
+  AttendanceRecord,
+  buildStudentIdFromName,
+  canonicalizeAttendanceRecordIds,
+  DB,
+  isPlaceholderStudentName,
+  normalizeName,
+  slugifyTurkish,
+  STUDENT_ID_ALIAS_MAP,
+  syncDatabaseMutations,
+} from '../data/database';
+import {
+  applyMigrationPlanInMemory,
+  buildMigrationDryRunReport,
+  createMigrationBackupPayload,
+} from './studentMigration';
 import { WriteQueueController } from './writeQueue';
 import { setServerClockOffsetMs } from '../config/academicConfig';
 
@@ -212,7 +228,7 @@ test('isStudentResponsibleForSession excludes sessions prior to student addition
   );
 });
 
-test('syncDatabaseMutations dynamically adds, removes, and updates student course enrollments with random permanent ID', () => {
+test('syncDatabaseMutations dynamically adds, removes, and updates student course enrollments with deterministic stu-<slug> ID', () => {
   const newSt = createNewStudentRecord({
     rawName: 'Canan Ersoy',
     modality: 'yuzyuze',
@@ -222,13 +238,12 @@ test('syncDatabaseMutations dynamically adds, removes, and updates student cours
     nowIso: '2026-10-28T12:00:00.000Z',
   });
 
-  assert.ok(newSt.id.startsWith('stu_'));
-  assert.notEqual(newSt.id, 'stu-canan-ersoy');
+  assert.equal(newSt.id, 'stu-canan-ersoy');
 
   const mutated = syncDatabaseMutations([newSt], []);
-  assert.ok(mutated.students.some(s => s.id === newSt.id));
+  assert.ok(mutated.students.some(s => s.id === 'stu-canan-ersoy'));
   const yy5aMat = mutated.courses.find(c => c.id === 'yy-5a-mat');
-  assert.ok(yy5aMat?.studentIds.includes(newSt.id));
+  assert.ok(yy5aMat?.studentIds.includes('stu-canan-ersoy'));
 
   // Verify Murat Yüksek is only in 6/a courses and not 5/a courses
   const murat = mutated.students.find(s => s.name === 'murat yüksek');
@@ -517,7 +532,7 @@ test('getZeroPresentAttendanceRecords detects 0-present records and never touche
   assert.equal(isZeroPresentAttendanceRecord(didNotHoldRecord, initial.courses), false);
 });
 
-test('two students with the exact same name get distinct permanent IDs and do not collide', () => {
+test('two student records with the same normalized name resolve to the SAME person (stu-<slug>) and merge courses', () => {
   const stu1 = createNewStudentRecord({
     rawName: 'Ömer Çağrı Şahin',
     modality: 'online',
@@ -526,18 +541,225 @@ test('two students with the exact same name get distinct permanent IDs and do no
     currentWeek: 2,
   });
   const stu2 = createNewStudentRecord({
-    rawName: 'Ömer Çağrı Şahin',
-    modality: 'yuzyuze',
-    gradeLabel: '6. sınıf (6/a yüz yüze)',
-    enrolledCourseIds: ['yy-6a-mat'],
-    currentWeek: 2,
+    rawName: '  ÖMER   ÇAĞRI\u00A0ŞAHİN\u200B ',
+    modality: 'online',
+    gradeLabel: '5. sınıf',
+    enrolledCourseIds: ['online-5a-fen'],
+    currentWeek: 3,
   });
 
-  assert.notEqual(stu1.id, stu2.id);
+  assert.equal(stu1.id, 'stu-omer-cagri-sahin');
+  assert.equal(stu2.id, 'stu-omer-cagri-sahin');
   const mutated = syncDatabaseMutations([stu1, stu2], []);
   const matching = mutated.students.filter(s => s.name === 'ömer çağrı şahin');
-  assert.equal(matching.length, 2);
+  assert.equal(matching.length, 1);
+  assert.deepEqual(matching[0].enrolledCourseIds, ['online-5a-mat', 'online-5a-fen']);
+  assert.equal(matching[0].addedAtWeek, 2);
   syncDatabaseMutations([], []);
+});
+
+test('normalizeName and buildStudentIdFromName handle AHMET/Ahmet, İ/I, NBSP, zero-width chars, double spaces, and punctuation', () => {
+  // AHMET / Ahmet
+  assert.equal(normalizeName('AHMET YILMAZ'), 'ahmet yılmaz');
+  assert.equal(normalizeName('Ahmet Yılmaz'), 'ahmet yılmaz');
+  assert.equal(buildStudentIdFromName('AHMET YILMAZ'), 'stu-ahmet-yilmaz');
+  assert.equal(buildStudentIdFromName('Ahmet Yılmaz'), 'stu-ahmet-yilmaz');
+
+  // İ -> i, I -> ı
+  assert.equal(normalizeName('İSMAİL IŞIK'), 'ismail ışık');
+  assert.equal(buildStudentIdFromName('İSMAİL IŞIK'), 'stu-ismail-isik');
+
+  // Double spaces, leading/trailing spaces, NBSP (\u00A0), zero-width space (\u200B), BOM (\uFEFF)
+  assert.equal(
+    normalizeName('  \uFEFFAhmet\u00A0\u00A0Taha\u200B   Şişman...  '),
+    'ahmet taha şişman'
+  );
+  assert.equal(
+    buildStudentIdFromName('  \uFEFFAhmet\u00A0\u00A0Taha\u200B   Şişman...  '),
+    'stu-ahmet-taha-sisman'
+  );
+
+  // Placeholders (bos1, bos2, adını öğrenip giricem) are recognized and excluded from student matching
+  assert.equal(isPlaceholderStudentName('bos1'), true);
+  assert.equal(isPlaceholderStudentName('BOS2'), true);
+  assert.equal(isPlaceholderStudentName('adını öğrenip giricem:)'), true);
+  assert.equal(isPlaceholderStudentName('Ecrin Bedir'), false);
+
+  const initial = syncDatabaseMutations([], [], []);
+  assert.equal(findMatchingStudentByFullName('bos1', initial.students), undefined);
+  assert.equal(
+    findMatchingStudentByFullName('adını öğrenip giricem:)', initial.students),
+    undefined
+  );
+});
+
+test('findSimilarStudentsByName detects typos (1-2 char difference, ş/s, ı/i) without auto-merging', () => {
+  const initial = syncDatabaseMutations([], [], []);
+  // 'ecrin bedir' exists in BASE_DB
+  const exact = findMatchingStudentByFullName('ecrin bedir', initial.students);
+  assert.ok(exact);
+
+  // 1 letter typo: 'ecrin bedr' -> not exact match, but returned in findSimilarStudentsByName
+  assert.equal(findMatchingStudentByFullName('ecrin bedr', initial.students), undefined);
+  const similarTypo = findSimilarStudentsByName('ecrin bedr', initial.students);
+  assert.ok(similarTypo.some(c => c.student.id === 'stu-ecrin-bedir'));
+
+  // Turkish diacritic typo: 'alperen cosanar' vs 'alperen coşanar'
+  const customWithCosanar = syncDatabaseMutations(
+    [
+      {
+        id: 'stu-alperen-cosanar',
+        name: 'alperen coşanar',
+        grade: '4. sınıf',
+        modality: 'online',
+        enrolledCourseIds: ['online-4a-mat'],
+        addedAtWeek: 2,
+      },
+    ],
+    [],
+    []
+  );
+  const similarDiacritic = findSimilarStudentsByName(
+    'alperen cosanar',
+    customWithCosanar.students
+  );
+  assert.ok(similarDiacritic.some(c => c.student.id === 'stu-alperen-cosanar'));
+  syncDatabaseMutations([], [], []);
+});
+
+test('student migration merges duplicates, redirects attendance & unlisted references, counts absences once, and is idempotent on second run', () => {
+  const baseStudents = [
+    {
+      id: 'stu-ecrin-bedir',
+      name: 'ecrin bedir',
+      grade: '4. sınıf',
+      modality: 'online' as const,
+      enrolledCourseIds: ['online-4a-mat', 'online-4a-tur'],
+    },
+  ];
+
+  // Duplicate custom_students records (including a legacy stu_<random> ID from a second device/course)
+  const customStudents = [
+    {
+      id: 'stu-ecrin-bedir',
+      name: 'Ecrin  Bedir',
+      grade: '4. sınıf',
+      modality: 'online' as const,
+      enrolledCourseIds: ['online-4a-mat', 'online-4a-tur', 'online-4a-ing'],
+      addedAtWeek: 1,
+      addedAt: '2026-10-20T10:00:00.000Z',
+    },
+    {
+      id: 'stu_733b9b514c8f',
+      name: 'ECRİN\u00A0BEDİR',
+      grade: '4. sınıf',
+      modality: 'online' as const,
+      enrolledCourseIds: ['online-4a-fen'],
+      addedAtWeek: 4,
+      addedAt: '2026-11-09T10:00:00.000Z',
+    },
+  ];
+
+  // Unlisted student report pointing to the old random ID
+  const unlistedReports = [
+    {
+      id: 'unlisted_online-4a-fen_w4_1-ders_ecrin-bedir',
+      studentName: 'ECRİN BEDİR',
+      courseId: 'online-4a-fen',
+      instructorId: 'inst-test',
+      instructorName: 'test eğitmen',
+      weekNumber: 4,
+      sessionType: '1. ders' as const,
+      status: 'enrolled' as const,
+      resolvedStudentId: 'stu_733b9b514c8f',
+      createdAt: '2026-11-09T10:00:00.000Z',
+    },
+  ];
+
+  // Attendance record containing both old and canonical IDs in absentStudentIds
+  const attendanceRecords: AttendanceRecord[] = [
+    {
+      id: 'online-4a-fen_w4_1-ders',
+      courseId: 'online-4a-fen',
+      instructorId: 'inst-test',
+      weekNumber: 4,
+      sessionType: '1. ders',
+      absentStudentIds: ['stu_733b9b514c8f', 'stu-ecrin-bedir'],
+      didNotHoldClass: false,
+      updatedAt: '2026-11-09T12:00:00.000Z',
+    },
+  ];
+
+  // Step B backup check
+  const backup = createMigrationBackupPayload({
+    baseStudents,
+    customStudents,
+    unlistedReports,
+    attendanceRecords,
+  });
+  assert.equal(backup.counts.customStudents, 2);
+
+  // Step A dry run check
+  const dryRun1 = buildMigrationDryRunReport({
+    baseStudents,
+    customStudents,
+    unlistedReports,
+    attendanceRecords,
+  });
+  assert.equal(dryRun1.isAlreadyClean, false);
+  assert.equal(dryRun1.groupsToMigrate.length, 1);
+  assert.equal(dryRun1.groupsToMigrate[0].targetId, 'stu-ecrin-bedir');
+  assert.deepEqual(dryRun1.groupsToMigrate[0].mergedCourseIds, [
+    'online-4a-mat',
+    'online-4a-tur',
+    'online-4a-ing',
+    'online-4a-fen',
+  ]);
+  assert.deepEqual(dryRun1.groupsToMigrate[0].duplicateCustomDocIdsToSoftDelete, [
+    'stu_733b9b514c8f',
+  ]);
+
+  // Step C: First migration run
+  const firstRun = applyMigrationPlanInMemory({
+    baseStudents,
+    customStudents,
+    unlistedReports,
+    attendanceRecords,
+  });
+
+  // Verify duplicate custom_students doc was soft-deleted and primary has union of courses
+  const activeCustomAfter = firstRun.customStudents.filter(c => !c.deletedAt);
+  assert.equal(activeCustomAfter.length, 1);
+  assert.equal(activeCustomAfter[0].id, 'stu-ecrin-bedir');
+  assert.deepEqual(activeCustomAfter[0].enrolledCourseIds, [
+    'online-4a-mat',
+    'online-4a-tur',
+    'online-4a-ing',
+    'online-4a-fen',
+  ]);
+
+  // Verify attendance record redirected stu_733b9b514c8f -> stu-ecrin-bedir and deduplicated
+  assert.deepEqual(firstRun.attendanceRecords[0].absentStudentIds, ['stu-ecrin-bedir']);
+
+  // Verify unlisted report resolvedStudentId redirected to stu-ecrin-bedir
+  assert.equal(firstRun.unlistedReports[0].resolvedStudentId, 'stu-ecrin-bedir');
+
+  // Verify canonicalizeAttendanceRecordIds also deduplicates via STUDENT_ID_ALIAS_MAP
+  STUDENT_ID_ALIAS_MAP.set('stu_733b9b514c8f', 'stu-ecrin-bedir');
+  const canonicalizedAtt = canonicalizeAttendanceRecordIds(attendanceRecords[0]);
+  assert.deepEqual(canonicalizedAtt.absentStudentIds, ['stu-ecrin-bedir']);
+
+  // Step C: Second migration run (Idempotency check — running twice causes zero changes)
+  const secondRun = applyMigrationPlanInMemory({
+    baseStudents,
+    customStudents: firstRun.customStudents,
+    unlistedReports: firstRun.unlistedReports,
+    attendanceRecords: firstRun.attendanceRecords,
+  });
+  assert.equal(secondRun.report.isAlreadyClean, true);
+  assert.equal(secondRun.report.groupsToMigrate.length, 0);
+  assert.equal(secondRun.report.totalAttendanceDocsToUpdate, 0);
+  assert.equal(secondRun.report.totalUnlistedDocsToUpdate, 0);
 });
 
 test('buildAttendanceDocId and slugifyTurkish properly transliterate all Turkish characters', () => {

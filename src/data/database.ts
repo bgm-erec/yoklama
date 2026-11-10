@@ -1684,17 +1684,52 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
   { id: 'yy-8a-ing', gradeClass: '8/a', subject: 'ingilizce', modality: 'yuzyuze', instructorName: 'jana abdullah', rawStudents: YUZYUZE_8A_STUDENTS },
 ];
 
-export function normalizeTurkish(str: string): string {
-  return str
+/**
+ * Tek merkezi isim normalizasyon fonksiyonu (Requirement 1):
+ * - Unicode NFC
+ * - Görünmez karakterleri (zero-width, soft-hyphen, BOM) temizler
+ * - NBSP ve özel boşlukları standart boşluğa çevirir
+ * - tr-TR kurallarıyla küçük harf (I -> ı, İ -> i)
+ * - Noktalama işaretlerini ve çift boşlukları sadeleştirir
+ * - Baştaki ve sondaki boşlukları kırpar
+ */
+export function normalizeName(raw: string): string {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/i\u0307/g, 'i')
     .replace(/İ/g, 'i')
     .replace(/I/g, 'ı')
-    .trim()
     .toLocaleLowerCase('tr-TR')
-    .replace(/\s+/g, ' ');
+    .replace(/[.,…!?;:()[\]"'«»„“”’‘`~@#$%^&*+=<>|\\]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
+/**
+ * Genel metin normalizasyonu (sınıf/şube etiketlerinde "/" karakterini koruyarak normalizeName kurallarını uygular).
+ */
+export function normalizeTurkish(str: string): string {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/i\u0307/g, 'i')
+    .replace(/İ/g, 'i')
+    .replace(/I/g, 'ı')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Türkçe karakterleri doğru dönüştüren (ı→i, ş→s, ğ→g, ü→u, ö→o, ç→c) ve belge kimliği için güvenli slug üreten fonksiyon.
+ */
 export function slugifyTurkish(str: string): string {
-  return normalizeTurkish(str)
+  return normalizeName(str)
     .replace(/ğ/g, 'g')
     .replace(/ü/g, 'u')
     .replace(/ş/g, 's')
@@ -1708,8 +1743,35 @@ export function slugifyTurkish(str: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-// Canonicalize student names to merge duplicates where a second given name was omitted or fused
-const CANONICAL_NAME_MAP: Record<string, string> = {
+/**
+ * KURAL: Öğrenci kimliği = "stu-" + slug(normalizeName(ad))
+ */
+export function buildStudentIdFromName(rawName: string): string {
+  const slug = slugifyTurkish(normalizeName(rawName));
+  return slug ? `stu-${slug}` : '';
+}
+
+/**
+ * KURAL 2b: "bos1, bos2…" veya "adını öğrenip giricem" gibi yer tutucu kayıtlar gerçek öğrenci sayılmaz;
+ * bunlara isim eşleştirme kuralı uygulanmaz.
+ */
+export function isPlaceholderStudentName(rawName: string): boolean {
+  const norm = normalizeName(rawName);
+  if (!norm) return true;
+  if (/^bos\d+$/i.test(norm)) return true;
+  if (
+    norm.includes('adını öğrenip giricem') ||
+    norm.includes('soyadını bilmiyorum') ||
+    norm.includes('soya adı') ||
+    norm === 'isimsiz'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Yerleşik PDF listelerinde bilinen eksik ikinci ad / birleşik yazım eşleştirmeleri
+const BUILTIN_CANONICAL_NAME_MAP: Record<string, string> = {
   'aynurnisa ipek': 'aynur nisa ipek',
   'abdullah kaya': 'abdullah muhammed kaya',
   'miraç çetinkaya': 'mirac ali çetinkaya',
@@ -1728,19 +1790,13 @@ const CANONICAL_NAME_MAP: Record<string, string> = {
   'poyraz durgut': 'poyraz durkut',
 };
 
-export function getCanonicalStudentName(rawName: string): string {
-  const norm = normalizeTurkish(rawName);
-  if (norm === 'adını öğrenip giricem:)' || norm === 'f. mira gün') {
-    return norm;
+export function getCanonicalStudentName(rawName: string, useBuiltinMap = false): string {
+  const norm = normalizeName(rawName);
+  if (!norm) return '';
+  if (useBuiltinMap && BUILTIN_CANONICAL_NAME_MAP[norm]) {
+    return BUILTIN_CANONICAL_NAME_MAP[norm];
   }
-  if (CANONICAL_NAME_MAP[norm]) {
-    return CANONICAL_NAME_MAP[norm];
-  }
-  const cleaned = norm
-    .replace(/[.,…!?]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return CANONICAL_NAME_MAP[cleaned] || cleaned || norm;
+  return norm;
 }
 
 // Build complete normalized database
@@ -1753,7 +1809,7 @@ function buildDatabase() {
   const allRawCourses = [...RAW_COURSES, ...YUZYUZE_COURSES];
 
   for (const rc of allRawCourses) {
-    const instNormName = normalizeTurkish(rc.instructorName);
+    const instNormName = normalizeName(rc.instructorName);
     const instId = `inst-${slugifyTurkish(instNormName)}`;
 
     let instructor = instructorsMap.get(instId);
@@ -1779,16 +1835,17 @@ function buildDatabase() {
     const courseStudentIds: string[] = [];
 
     for (const rs of rc.rawStudents) {
-      const canonicalName = getCanonicalStudentName(rs.name);
-      // Key by canonicalName + modality if needed, or unify across same name as instructed:
-      // "tamamen aynı isim soyisime sahip olan öğrenciler, aynı öğrenciler."
-      const studentId = `stu-${slugifyTurkish(canonicalName)}`;
+      if (/^bos\d+$/i.test(normalizeName(rs.name))) continue;
+      const canonicalDisplay = getCanonicalStudentName(rs.name, true);
+      const normName = normalizeName(canonicalDisplay);
+      const studentId = buildStudentIdFromName(normName);
+      if (!studentId) continue;
 
       let student = studentsMap.get(studentId);
       if (!student) {
         student = {
           id: studentId,
-          name: canonicalName,
+          name: canonicalDisplay === 'f. mira gün' ? 'f. mira gün' : normName,
           grade: normalizeTurkish(rs.grade),
           modality: rc.modality,
           enrolledCourseIds: [],
@@ -1837,18 +1894,50 @@ function buildDatabase() {
 export const BASE_DB = buildDatabase();
 export const DB = buildDatabase();
 
+// Global runtime alias map from legacy/duplicate IDs (e.g. stu_<random>) to canonical stu-<slug>
+export const STUDENT_ID_ALIAS_MAP = new Map<string, string>();
+
+export function resolveCanonicalStudentId(studentId: string): string {
+  if (!studentId) return studentId;
+  return STUDENT_ID_ALIAS_MAP.get(studentId) || studentId;
+}
+
+export function canonicalizeAttendanceRecordIds(record: AttendanceRecord): AttendanceRecord {
+  const mappedIds = Array.from(
+    new Set((record.absentStudentIds || []).map(id => resolveCanonicalStudentId(id)))
+  );
+  return {
+    ...record,
+    absentStudentIds: mappedIds,
+  };
+}
+
 export function syncDatabaseMutations(
   customStudents: Student[],
   removedStudentIds: string[],
   instructorAssignments: InstructorAssignmentRecord[] = []
 ): { students: Student[]; courses: Course[]; instructors: Instructor[] } {
-  const removedSet = new Set(removedStudentIds);
+  for (const baseSt of BASE_DB.students) {
+    STUDENT_ID_ALIAS_MAP.set(baseSt.id, baseSt.id);
+  }
+  for (const custom of customStudents) {
+    const canonicalId = buildStudentIdFromName(custom.name);
+    if (canonicalId && custom.id) {
+      STUDENT_ID_ALIAS_MAP.set(custom.id, canonicalId);
+    }
+  }
+
+  const removedSet = new Set(removedStudentIds.map(id => resolveCanonicalStudentId(id)));
+  for (const rawId of removedStudentIds) {
+    removedSet.add(rawId);
+  }
+
   const studentsMap = new Map<string, Student>();
   const assignmentMap = new Map<string, string>();
 
   for (const assign of instructorAssignments) {
     if (assign.courseId && assign.instructorName) {
-      assignmentMap.set(assign.courseId, normalizeTurkish(assign.instructorName));
+      assignmentMap.set(assign.courseId, normalizeName(assign.instructorName));
     }
   }
 
@@ -1862,26 +1951,63 @@ export function syncDatabaseMutations(
     }
   }
 
-  // 2. Add or update custom students (excluding removed or soft-deleted ones)
+  // 2. Add or merge custom students by canonical stu-<slug> ID (Requirement 1, 2, 4)
   for (const custom of customStudents) {
-    if (removedSet.has(custom.id) || custom.deletedAt) continue;
-    const existing = studentsMap.get(custom.id);
+    if (custom.deletedAt) continue;
+    if (isPlaceholderStudentName(custom.name)) continue;
+
+    const normName = normalizeName(custom.name);
+    const canonicalId = buildStudentIdFromName(normName);
+    if (!canonicalId) continue;
+    if (removedSet.has(canonicalId) || removedSet.has(custom.id)) continue;
+
+    const existing = studentsMap.get(canonicalId);
+    const isBaseStudent = BASE_DB.students.some(b => b.id === canonicalId);
+
     if (existing) {
-      const nextCourses =
-        Array.isArray(custom.enrolledCourseIds) && custom.enrolledCourseIds.length > 0
-          ? Array.from(new Set(custom.enrolledCourseIds))
-          : [...existing.enrolledCourseIds];
-      studentsMap.set(custom.id, {
+      const mergedCourses = Array.from(
+        new Set([...existing.enrolledCourseIds, ...(custom.enrolledCourseIds || [])])
+      );
+
+      const minWeek =
+        existing.addedAtWeek !== undefined && custom.addedAtWeek !== undefined
+          ? Math.min(existing.addedAtWeek, custom.addedAtWeek)
+          : existing.addedAtWeek ?? custom.addedAtWeek;
+
+      const earliestAddedAt =
+        existing.addedAt && custom.addedAt
+          ? existing.addedAt <= custom.addedAt
+            ? existing.addedAt
+            : custom.addedAt
+          : existing.addedAt ?? custom.addedAt;
+
+      // Prefer name with rich Turkish characters if slug is identical (e.g. "ahmet emir çelikcan" over "ahmet emir celikcan")
+      const countTurkishChars = (s: string) => (s.match(/[çğıöşü]/g) || []).length;
+      const bestName =
+        existing.name === 'f. mira gün'
+          ? 'f. mira gün'
+          : countTurkishChars(normName) > countTurkishChars(existing.name)
+          ? normName
+          : existing.name;
+
+      studentsMap.set(canonicalId, {
         ...existing,
         ...custom,
-        addedAtWeek: existing.addedAtWeek,
-        addedAt: existing.addedAt,
-        enrolledCourseIds: nextCourses,
+        id: canonicalId,
+        name: bestName,
+        grade: existing.grade || normalizeTurkish(custom.grade),
+        modality: existing.modality || custom.modality,
+        addedAtWeek: isBaseStudent ? existing.addedAtWeek : minWeek,
+        addedAt: isBaseStudent ? existing.addedAt : earliestAddedAt,
+        enrolledCourseIds: mergedCourses,
       });
     } else {
-      studentsMap.set(custom.id, {
+      studentsMap.set(canonicalId, {
         ...custom,
-        enrolledCourseIds: [...custom.enrolledCourseIds],
+        id: canonicalId,
+        name: normName,
+        grade: normalizeTurkish(custom.grade),
+        enrolledCourseIds: Array.from(new Set(custom.enrolledCourseIds || [])),
       });
     }
   }

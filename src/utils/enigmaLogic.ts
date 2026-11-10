@@ -1,11 +1,14 @@
 import {
   AttendanceRecord,
+  buildStudentIdFromName,
   Course,
   DB,
-  getCanonicalStudentName,
   Instructor,
+  isPlaceholderStudentName,
   Modality,
+  normalizeName,
   normalizeTurkish,
+  resolveCanonicalStudentId,
   SessionType,
   slugifyTurkish,
   Student,
@@ -33,7 +36,7 @@ export type LoginResolution =
  * - Shared first name (e.g. "zehra", "elif", "yağmur", "kaan", "berat", "eymen", "ayşegül", "berra") -> asks for surname
  */
 export function resolveIdentityInput(rawInput: string): LoginResolution {
-  const input = normalizeTurkish(rawInput);
+  const input = normalizeName(rawInput);
   if (!input) {
     return { type: 'not_found' };
   }
@@ -195,16 +198,10 @@ export function buildAttendanceDocId(
 }
 
 /**
- * Generates a random permanent student ID so that two students with the exact same name
- * never collide or overwrite each other.
+ * KURAL: Öğrenci kimliği = "stu-" + slug(normalizeName(ad))
  */
-export function generatePermanentStudentId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return `stu_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
-  }
-  const randA = Math.random().toString(36).slice(2, 8);
-  const randB = Math.random().toString(36).slice(2, 8);
-  return `stu_${Date.now().toString(36)}_${randA}${randB}`.slice(0, 20);
+export function generatePermanentStudentId(rawName = ''): string {
+  return buildStudentIdFromName(rawName);
 }
 
 /**
@@ -215,8 +212,8 @@ export function computeAbsentDifferenceSet(
   courseStudentIds: string[],
   presentStudentIds: string[]
 ): string[] {
-  const presentSet = new Set(presentStudentIds);
-  return courseStudentIds.filter(id => !presentSet.has(id));
+  const presentSet = new Set(presentStudentIds.map(id => resolveCanonicalStudentId(id)));
+  return courseStudentIds.filter(id => !presentSet.has(resolveCanonicalStudentId(id)));
 }
 
 /**
@@ -236,8 +233,8 @@ export function isStudentResponsibleForSession(
 }
 
 /**
- * Builds a clean Student record for a newly added student using a random permanent ID
- * (never derived from the student's name, preventing collisions for same-named students).
+ * Builds a clean Student record for a student using the deterministic name-based ID:
+ * "stu-" + slugifyTurkish(normalizeName(ad))
  */
 export function createNewStudentRecord(params: {
   rawName: string;
@@ -248,13 +245,14 @@ export function createNewStudentRecord(params: {
   nowIso?: string;
   customId?: string;
 }): Student {
-  const normName = normalizeTurkish(params.rawName);
+  const normName = normalizeName(params.rawName);
+  const canonicalId = params.customId || buildStudentIdFromName(normName);
   return {
-    id: params.customId || generatePermanentStudentId(),
+    id: canonicalId,
     name: normName,
     grade: normalizeTurkish(params.gradeLabel),
     modality: params.modality,
-    enrolledCourseIds: params.enrolledCourseIds,
+    enrolledCourseIds: Array.from(new Set(params.enrolledCourseIds)),
     addedAtWeek: params.currentWeek,
     addedAt: params.nowIso || getTrustedNow().toISOString(),
   };
@@ -288,26 +286,147 @@ export function detectConcurrentAttendanceConflict(params: {
  * Checks whether a course's current instructor is one of the unassigned placeholders (bos1, bos2, etc.).
  */
 export function isUnassignedBosInstructor(instructorName: string): boolean {
-  return /^bos\d+$/i.test(normalizeTurkish(instructorName));
+  return /^bos\d+$/i.test(normalizeName(instructorName));
 }
 
 /**
- * Finds an existing student by full name (first + last name match after Turkish normalization & canonical mapping).
- * "aynı isim soy isimse aynı öğrencidir"
+ * Finds an existing real student by exact normalized full name (Requirement 1, 2, 2b).
+ * Placeholders (bos1, bos2, adını öğrenip giricem, etc.) are excluded.
  */
 export function findMatchingStudentByFullName(
   rawName: string,
   students: Student[]
 ): Student | undefined {
-  const canonical = getCanonicalStudentName(rawName);
-  if (!canonical) return undefined;
-  const targetSlugId = `stu-${slugifyTurkish(canonical)}`;
+  if (isPlaceholderStudentName(rawName)) return undefined;
+  const norm = normalizeName(rawName);
+  if (!norm) return undefined;
   return students.find(
-    s =>
-      s.id === targetSlugId ||
-      getCanonicalStudentName(s.name) === canonical ||
-      normalizeTurkish(s.name) === canonical
+    s => !isPlaceholderStudentName(s.name) && normalizeName(s.name) === norm
   );
+}
+
+export function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix: number[][] = [];
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const cost = b.charAt(i - 1) === a.charAt(j - 1) ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+export interface SimilarStudentCandidate {
+  student: Student;
+  reason: string;
+  distance: number;
+}
+
+/**
+ * Yazım hatası uyarısı (Requirement 2):
+ * Çok benzer ama normalizeName ile birebir aynı olmayan isimleri (ş/s, ı/i, ö/o, ğ/g, ü/u, ç/c farkı,
+ * 1-2 harf yazım hatası veya eksik/fazla göbek adı) bulur. Otomatik birleştirme yapmaz,
+ * kullanıcıya "Şunu mu demek istedin: <ad>?" sorusu için aday listesi döner.
+ */
+export function findSimilarStudentsByName(
+  rawName: string,
+  students: Student[]
+): SimilarStudentCandidate[] {
+  if (isPlaceholderStudentName(rawName)) return [];
+  const norm = normalizeName(rawName);
+  if (!norm || norm.length < 3) return [];
+  const slug = slugifyTurkish(norm);
+  const inputTokens = norm.split(' ').filter(Boolean);
+
+  const candidates: SimilarStudentCandidate[] = [];
+  const seenIds = new Set<string>();
+
+  for (const st of students) {
+    if (isPlaceholderStudentName(st.name)) continue;
+    const stNorm = normalizeName(st.name);
+    if (!stNorm || stNorm === norm) continue; // exact matches are handled by findMatchingStudentByFullName
+    if (seenIds.has(st.id)) continue;
+
+    const stSlug = slugifyTurkish(stNorm);
+
+    // 1. Same Turkish-transliterated slug (e.g. ş/s, ı/i, ö/o, ü/u, ç/c, ğ/g difference)
+    if (slug && stSlug === slug) {
+      seenIds.add(st.id);
+      candidates.push({
+        student: st,
+        reason: 'Türkçe karakter farkı (ş/s, ı/i, ö/o, ü/u, ç/c, ğ/g)',
+        distance: 0.5,
+      });
+      continue;
+    }
+
+    // 2. Small Levenshtein edit distance (1 or 2 chars) on normalized name or slug
+    const normDist = levenshteinDistance(norm, stNorm);
+    const slugDist = levenshteinDistance(slug, stSlug);
+    const minDist = Math.min(normDist, slugDist);
+    if (minDist <= 2 && Math.max(norm.length, stNorm.length) >= 5) {
+      seenIds.add(st.id);
+      candidates.push({
+        student: st,
+        reason: normDist <= 1 ? '1 harf farkı' : 'yazım benzerliği (1-2 harf farkı)',
+        distance: minDist,
+      });
+      continue;
+    }
+
+    // 3. Token subset / missing middle name or fused given name (e.g. "cemre kıllı" vs "fatma cemre kıllı", "aynurnisa ipek" vs "aynur nisa ipek")
+    const stTokens = stNorm.split(' ').filter(Boolean);
+    if (norm.replace(/\s+/g, '') === stNorm.replace(/\s+/g, '')) {
+      seenIds.add(st.id);
+      candidates.push({
+        student: st,
+        reason: 'bitişik/ayrı yazım farkı',
+        distance: 0.8,
+      });
+      continue;
+    }
+
+    if (inputTokens.length >= 2 && stTokens.length >= 2) {
+      const sameLast = inputTokens[inputTokens.length - 1] === stTokens[stTokens.length - 1];
+      const sameFirst = inputTokens[0] === stTokens[0];
+      if (sameLast && sameFirst && inputTokens.length !== stTokens.length) {
+        seenIds.add(st.id);
+        candidates.push({
+          student: st,
+          reason: 'ikinci ad farkı (aynı ad ve soyad)',
+          distance: 1.5,
+        });
+        continue;
+      }
+      const smaller = inputTokens.length < stTokens.length ? inputTokens : stTokens;
+      const larger = inputTokens.length < stTokens.length ? stTokens : inputTokens;
+      if (smaller.length >= 2 && smaller.every(t => larger.includes(t))) {
+        seenIds.add(st.id);
+        candidates.push({
+          student: st,
+          reason: 'eksik/fazla ad eşleşmesi',
+          distance: 1.8,
+        });
+      }
+    }
+  }
+
+  return candidates.sort((a, b) => a.distance - b.distance);
 }
 
 export const MELEK_YILMAZ_REASSURANCE_MESSAGE =

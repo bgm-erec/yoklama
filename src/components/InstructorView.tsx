@@ -16,6 +16,8 @@ import {
   DB,
   getCanonicalStudentName,
   Instructor,
+  isPlaceholderStudentName,
+  normalizeName,
   normalizeTurkish,
   SessionType,
   slugifyTurkish,
@@ -26,9 +28,12 @@ import {
   buildAttendanceDocId,
   computeAbsentDifferenceSet,
   ExitAttendanceChoice,
+  findMatchingStudentByFullName,
+  findSimilarStudentsByName,
   getWeekDateRangeLabel,
   resolveExitPromptDecision,
   shouldPromptEmptyExit,
+  SimilarStudentCandidate,
 } from '../utils/enigmaLogic';
 
 export interface AttendanceConflictNotice {
@@ -46,6 +51,8 @@ interface InstructorViewProps {
   selectedWeek: number;
   onSelectWeek: (week: number) => void;
   onActiveCourseChange?: (courseId: string) => void;
+  allStudents?: Student[];
+  allCourses?: Course[];
   attendanceRecords: AttendanceRecord[];
   unlistedReports?: UnlistedStudentReport[];
   onSaveAttendance: (
@@ -56,6 +63,7 @@ interface InstructorViewProps {
       forceOverwriteVersion?: number;
     }
   ) => Promise<void>;
+  onAddStudent?: (student: Student) => Promise<void>;
   onAddUnlistedStudent?: (report: UnlistedStudentReport) => Promise<void>;
   onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
   onDeleteCourseSession?: (
@@ -83,9 +91,12 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   selectedWeek,
   onSelectWeek,
   onActiveCourseChange,
+  allStudents = DB.students,
+  allCourses = DB.courses,
   attendanceRecords,
   unlistedReports = [],
   onSaveAttendance,
+  onAddStudent,
   onAddUnlistedStudent,
   onRemoveUnlistedStudent,
   onDeleteCourseSession,
@@ -96,7 +107,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   exitRequestCounter = 0,
 }) => {
   const instructorCourses: Course[] = instructor.courseIds
-    .map(id => DB.courses.find(c => c.id === id))
+    .map(id => allCourses.find(c => c.id === id))
     .filter((c): c is Course => Boolean(c));
 
   const [selectedCourseId, setSelectedCourseId] = useState<string>(
@@ -114,6 +125,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const [unlistedFeedback, setUnlistedFeedback] = useState<{
     type: 'error' | 'ok';
     text: string;
+  } | null>(null);
+  const [pendingExistingMatch, setPendingExistingMatch] = useState<Student | null>(null);
+  const [pendingTypoCandidates, setPendingTypoCandidates] = useState<{
+    typedName: string;
+    candidates: SimilarStudentCandidate[];
   } | null>(null);
 
   const activeCourse =
@@ -185,7 +201,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   );
 
   const courseStudents: Student[] = (activeCourse?.studentIds || [])
-    .map(sid => DB.students.find(s => s.id === sid))
+    .map(sid => allStudents.find(s => s.id === sid))
     .filter((s): s is Student => Boolean(s));
 
   const courseStudentIds = courseStudents.map(s => s.id);
@@ -379,40 +395,13 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     void triggerSync(selectedSession, nextAbsentDifferenceSet, false, true);
   };
 
-  const handleAddUnlistedSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const finalizeUnlistedReportSubmission = async (
+    rawName: string,
+    linkedExistingStudent?: Student
+  ) => {
     if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım')
       return;
-
-    const cleanName = getCanonicalStudentName(unlistedNameInput);
-    const nameParts = cleanName.split(' ').filter(Boolean);
-    if (nameParts.length < 2) {
-      setUnlistedFeedback({
-        type: 'error',
-        text: 'lütfen öğrencinin tam adını (ad ve soyad) gir.',
-      });
-      return;
-    }
-
-    // Check if already in this course's registered student list
-    const alreadyInCourse = courseStudents.find(
-      s =>
-        getCanonicalStudentName(s.name) === cleanName ||
-        normalizeTurkish(s.name) === cleanName
-    );
-    if (alreadyInCourse) {
-      if (!presentStudentIds.includes(alreadyInCourse.id)) {
-        handleTogglePresent(alreadyInCourse.id);
-      }
-      setUnlistedNameInput('');
-      setUnlistedFeedback({
-        type: 'ok',
-        text: `${alreadyInCourse.name} zaten bu derste kayıtlı, derste olarak işaretlendi.`,
-      });
-      setTimeout(() => setUnlistedFeedback(null), 3500);
-      return;
-    }
-
+    const cleanName = getCanonicalStudentName(rawName);
     const sessionSlug = slugifyTurkish(selectedSession);
     const studentSlug = slugifyTurkish(cleanName);
     const reportId = `unlisted_${slugifyTurkish(
@@ -428,12 +417,16 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       weekNumber: selectedWeek,
       sessionType: selectedSession,
       status: 'pending',
+      resolvedStudentId: linkedExistingStudent?.id,
+      resolvedExistingStudent: Boolean(linkedExistingStudent),
       createdAt: new Date().toISOString(),
     };
 
     if (onAddUnlistedStudent) {
       await onAddUnlistedStudent(report);
     }
+    setPendingExistingMatch(null);
+    setPendingTypoCandidates(null);
     setUnlistedNameInput('');
     setIsUnlistedBarOpen(false);
     setUnlistedFeedback({
@@ -441,6 +434,119 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
       text: `${cleanName} liste dışı öğrenci olarak eklendi.`,
     });
     setTimeout(() => setUnlistedFeedback(null), 3500);
+  };
+
+  const handleConfirmEnrollExistingToCourse = async (existingStu: Student) => {
+    if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım')
+      return;
+
+    const nextCourseIds = existingStu.enrolledCourseIds.includes(activeCourse.id)
+      ? existingStu.enrolledCourseIds
+      : [...existingStu.enrolledCourseIds, activeCourse.id];
+
+    const updatedStudent: Student = {
+      ...existingStu,
+      enrolledCourseIds: nextCourseIds,
+    };
+
+    if (onAddStudent) {
+      await onAddStudent(updatedStudent);
+      const nextAllCourseStuIds = courseStudentIds.includes(existingStu.id)
+        ? courseStudentIds
+        : [...courseStudentIds, existingStu.id];
+      const nextPresentIds = presentStudentIds.includes(existingStu.id)
+        ? presentStudentIds
+        : [...presentStudentIds, existingStu.id];
+      const nextAbsentDifferenceSet = computeAbsentDifferenceSet(
+        nextAllCourseStuIds,
+        nextPresentIds
+      );
+      await triggerSync(selectedSession, nextAbsentDifferenceSet, false, false);
+      setPendingExistingMatch(null);
+      setPendingTypoCandidates(null);
+      setUnlistedNameInput('');
+      setIsUnlistedBarOpen(false);
+      setUnlistedFeedback({
+        type: 'ok',
+        text: `${existingStu.name} mevcut kaydına ${activeCourse.shortTitle} dersi eklendi ve derste olarak işaretlendi.`,
+      });
+      setTimeout(() => setUnlistedFeedback(null), 4000);
+    } else {
+      await finalizeUnlistedReportSubmission(existingStu.name, existingStu);
+    }
+  };
+
+  const processCandidateNameForUnlisted = async (
+    rawInputName: string,
+    skipTypoWarning = false
+  ) => {
+    if (!activeCourse || !selectedSession || selectedSession === 'ders yapmadım')
+      return;
+
+    const cleanName = getCanonicalStudentName(rawInputName);
+    if (isPlaceholderStudentName(cleanName)) {
+      setUnlistedFeedback({
+        type: 'error',
+        text: `"${cleanName}" yer tutucu bir kayıttır; gerçek öğrenci olarak eklenemez.`,
+      });
+      return;
+    }
+
+    const nameParts = cleanName.split(' ').filter(Boolean);
+    if (nameParts.length < 2) {
+      setUnlistedFeedback({
+        type: 'error',
+        text: 'lütfen öğrencinin tam adını (ad ve soyad) gir.',
+      });
+      return;
+    }
+
+    // 1. Check if already in this course's registered student list
+    const alreadyInCourse = courseStudents.find(
+      s => normalizeName(s.name) === cleanName
+    );
+    if (alreadyInCourse) {
+      if (!presentStudentIds.includes(alreadyInCourse.id)) {
+        handleTogglePresent(alreadyInCourse.id);
+      }
+      setPendingExistingMatch(null);
+      setPendingTypoCandidates(null);
+      setUnlistedNameInput('');
+      setUnlistedFeedback({
+        type: 'ok',
+        text: `${alreadyInCourse.name} zaten bu derste kayıtlı, derste olarak işaretlendi.`,
+      });
+      setTimeout(() => setUnlistedFeedback(null), 3500);
+      return;
+    }
+
+    // 2. Check if already registered in another course (exact normalized name match)
+    const existingGlobal = findMatchingStudentByFullName(cleanName, allStudents);
+    if (existingGlobal) {
+      setPendingTypoCandidates(null);
+      setPendingExistingMatch(existingGlobal);
+      return;
+    }
+
+    // 3. Check for typo / near-duplicate candidates ("şunu mu demek istedin: <ad>?")
+    if (!skipTypoWarning) {
+      const similar = findSimilarStudentsByName(cleanName, allStudents);
+      if (similar.length > 0) {
+        setPendingExistingMatch(null);
+        setPendingTypoCandidates({
+          typedName: cleanName,
+          candidates: similar,
+        });
+        return;
+      }
+    }
+
+    await finalizeUnlistedReportSubmission(cleanName);
+  };
+
+  const handleAddUnlistedSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await processCandidateNameForUnlisted(unlistedNameInput, false);
   };
 
   return (
@@ -763,6 +869,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                           onChange={e => {
                             setUnlistedNameInput(e.target.value);
                             if (unlistedFeedback) setUnlistedFeedback(null);
+                            if (pendingExistingMatch) setPendingExistingMatch(null);
+                            if (pendingTypoCandidates) setPendingTypoCandidates(null);
                           }}
                           placeholder="lütfen öğrencinin tam adını gir (ad soyad)..."
                           className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 focus:border-stone-800 focus:outline-none"
@@ -786,6 +894,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                               setIsUnlistedBarOpen(false);
                               setUnlistedNameInput('');
                               setUnlistedFeedback(null);
+                              setPendingExistingMatch(null);
+                              setPendingTypoCandidates(null);
                             }}
                             aria-label="kapat"
                             className="inline-flex items-center justify-center rounded-lg border border-stone-300 bg-white p-1.5 text-stone-500 hover:text-stone-900 transition-colors cursor-pointer"
@@ -795,6 +905,107 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                         </div>
                       </div>
                     </form>
+                  )}
+
+                  {/* Exact-match confirmation: "Bu öğrenci zaten kayıtlı: <ad> (<sınıf>, <dersler>). Bu dersi mevcut öğrenciye ekleyeyim mi?" */}
+                  {pendingExistingMatch && activeCourse && (
+                    <div
+                      data-testid="instructor-duplicate-student-prompt"
+                      className="mt-2 rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2"
+                    >
+                      <p className="font-medium text-amber-950 leading-relaxed">
+                        Bu öğrenci zaten kayıtlı: <strong>{pendingExistingMatch.name}</strong> (
+                        {pendingExistingMatch.grade},{' '}
+                        {pendingExistingMatch.enrolledCourseIds
+                          .map(cid => allCourses.find(c => c.id === cid)?.shortTitle || cid)
+                          .join(', ')}
+                        ). Bu dersi ({activeCourse.shortTitle}) mevcut öğrenciye ekleyeyim mi?
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleConfirmEnrollExistingToCourse(pendingExistingMatch)}
+                          className="rounded-lg bg-stone-900 px-3 py-1.5 text-[11px] font-medium text-stone-100 hover:bg-stone-800 cursor-pointer"
+                        >
+                          evet, bu dersi mevcut öğrenciye ekle
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void finalizeUnlistedReportSubmission(
+                              pendingExistingMatch.name,
+                              pendingExistingMatch
+                            )
+                          }
+                          className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-[11px] font-medium text-stone-800 hover:bg-stone-100 cursor-pointer"
+                        >
+                          sadece bu yoklama için geçici/liste dışı bildir
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingExistingMatch(null)}
+                          className="text-[11px] text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                        >
+                          vazgeç
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Typo warning: "Şunu mu demek istedin: <ad>?" */}
+                  {pendingTypoCandidates && (
+                    <div
+                      data-testid="instructor-typo-student-prompt"
+                      className="mt-2 rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2"
+                    >
+                      <p className="font-medium text-amber-950">
+                        şunu mu demek istedin? (benzer isimli kayıtlı öğrenci bulundu):
+                      </p>
+                      <div className="space-y-1.5">
+                        {pendingTypoCandidates.candidates.map(cand => (
+                          <button
+                            key={cand.student.id}
+                            type="button"
+                            onClick={() => {
+                              setUnlistedNameInput(cand.student.name);
+                              setPendingTypoCandidates(null);
+                              void processCandidateNameForUnlisted(cand.student.name, true);
+                            }}
+                            className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 text-left text-[11px] text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                          >
+                            <span>
+                              şunu mu demek istedin: <strong>{cand.student.name}</strong> (
+                              {cand.student.grade} ·{' '}
+                              {cand.student.enrolledCourseIds
+                                .map(cid => allCourses.find(c => c.id === cid)?.shortTitle || cid)
+                                .join(', ')}
+                              )?
+                            </span>
+                            <span className="text-[10px] text-amber-800 shrink-0">
+                              bu öğrenciyi seç →
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="pt-1 flex items-center justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void finalizeUnlistedReportSubmission(pendingTypoCandidates.typedName)
+                          }
+                          className="rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-[11px] text-stone-700 hover:bg-stone-100 cursor-pointer"
+                        >
+                          hayır, "{pendingTypoCandidates.typedName}" farklı bir öğrenci (yeni ekle)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingTypoCandidates(null)}
+                          className="text-[11px] text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                        >
+                          vazgeç
+                        </button>
+                      </div>
+                    </div>
                   )}
 
                   {unlistedFeedback && (

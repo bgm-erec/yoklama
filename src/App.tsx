@@ -16,6 +16,7 @@ import {
   setDoc,
   waitForPendingWrites,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 import {
   CLIENT_SESSION_ID,
@@ -29,16 +30,20 @@ import {
   AttendanceRecord,
   AuditLogEntry,
   BASE_DB,
+  buildStudentIdFromName,
+  canonicalizeAttendanceRecordIds,
   FeedbackItem,
   getCanonicalStudentName,
   Instructor,
   InstructorAssignmentRecord,
   Modality,
+  normalizeName,
   normalizeTurkish,
   PlaceboSavePreferenceRecord,
   RemovedStudentRecord,
   slugifyTurkish,
   Student,
+  STUDENT_ID_ALIAS_MAP,
   syncDatabaseMutations,
   UnlistedStudentReport,
 } from './data/database';
@@ -52,6 +57,12 @@ import {
   getZeroPresentAttendanceRecords,
   resolveIdentityInput,
 } from './utils/enigmaLogic';
+import {
+  buildMigrationDryRunReport,
+  createMigrationBackupPayload,
+  MigrationBackupPayload,
+  MigrationUserResolutions,
+} from './utils/studentMigration';
 import {
   isClockSkewSignificant,
   getClockSkewMinutes,
@@ -147,12 +158,14 @@ export default function App() {
     useState<AttendanceConflictNotice | null>(null);
   const knownVersionsRef = useRef<Map<string, number>>(new Map());
 
-  // Undo buffers for soft-deleted bulk operations
+  // Undo buffers for soft-deleted bulk operations & migration backup
   const [lastSoftDeletedAttendanceIds, setLastSoftDeletedAttendanceIds] =
     useState<string[]>([]);
   const [lastSoftDeletedFeedbackIds, setLastSoftDeletedFeedbackIds] = useState<
     string[]
   >([]);
+  const [lastMigrationBackup, setLastMigrationBackup] =
+    useState<MigrationBackupPayload | null>(null);
 
   // Real-time synced lists from Firestore
   const [attendanceRecords, setAttendanceRecords] = useState<
@@ -338,10 +351,17 @@ export default function App() {
         const items: Student[] = [];
         snapshot.forEach(docSnap => {
           const data = docSnap.data();
+          const rawId = data.id || docSnap.id;
+          if (typeof data.name === 'string') {
+            const canonicalId = buildStudentIdFromName(data.name);
+            if (rawId && canonicalId && rawId !== canonicalId) {
+              STUDENT_ID_ALIAS_MAP.set(rawId, canonicalId);
+            }
+          }
           if (data.deletedAt) return;
           items.push({
             ...(data as Student),
-            id: data.id || docSnap.id,
+            id: rawId,
             addedAt: formatFirestoreTimestamp(data.addedAt, data.addedAtIso),
             deletedAt: data.deletedAt
               ? formatFirestoreTimestamp(data.deletedAt, data.deletedAtIso)
@@ -463,7 +483,7 @@ export default function App() {
           const incomingRecords: AttendanceRecord[] = [];
           snapshot.forEach(docSnap => {
             const raw = docSnap.data();
-            const record: AttendanceRecord = {
+            const record: AttendanceRecord = canonicalizeAttendanceRecordIds({
               id: docSnap.id,
               courseId: raw.courseId,
               instructorId: raw.instructorId,
@@ -482,7 +502,7 @@ export default function App() {
               deletedAt: raw.deletedAt
                 ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
                 : null,
-            };
+            });
 
             if (!docSnap.metadata.hasPendingWrites && record.version) {
               const prevKnown = knownVersionsRef.current.get(docSnap.id) ?? 0;
@@ -597,26 +617,28 @@ export default function App() {
           const remoteRecords: AttendanceRecord[] = [];
           snapshot.forEach(docSnap => {
             const raw = docSnap.data();
-            remoteRecords.push({
-              id: docSnap.id,
-              courseId: raw.courseId,
-              instructorId: raw.instructorId,
-              weekNumber: raw.weekNumber,
-              sessionType: raw.sessionType,
-              absentStudentIds: Array.isArray(raw.absentStudentIds)
-                ? raw.absentStudentIds
-                : [],
-              didNotHoldClass: Boolean(raw.didNotHoldClass),
-              updatedAt: formatFirestoreTimestamp(
-                raw.updatedAt,
-                raw.updatedAtIso
-              ),
-              version: typeof raw.version === 'number' ? raw.version : 1,
-              updatedBySessionId: raw.updatedBySessionId,
-              deletedAt: raw.deletedAt
-                ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-                : null,
-            });
+            remoteRecords.push(
+              canonicalizeAttendanceRecordIds({
+                id: docSnap.id,
+                courseId: raw.courseId,
+                instructorId: raw.instructorId,
+                weekNumber: raw.weekNumber,
+                sessionType: raw.sessionType,
+                absentStudentIds: Array.isArray(raw.absentStudentIds)
+                  ? raw.absentStudentIds
+                  : [],
+                didNotHoldClass: Boolean(raw.didNotHoldClass),
+                updatedAt: formatFirestoreTimestamp(
+                  raw.updatedAt,
+                  raw.updatedAtIso
+                ),
+                version: typeof raw.version === 'number' ? raw.version : 1,
+                updatedBySessionId: raw.updatedBySessionId,
+                deletedAt: raw.deletedAt
+                  ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
+                  : null,
+              })
+            );
           });
           setAttendanceRecords(remoteRecords);
         },
@@ -765,14 +787,53 @@ export default function App() {
     const prevCustom = [...customStudents];
     const prevRemoved = [...removedStudentIds];
 
-    setRemovedStudentIds(prev => prev.filter(id => id !== student.id));
+    const canonicalName = normalizeName(student.name);
+    const canonicalId = buildStudentIdFromName(canonicalName);
+    const baseMatch = BASE_DB.students.find(s => s.id === canonicalId);
+    const existingCustomMatch = customStudents.find(
+      s => buildStudentIdFromName(s.name) === canonicalId || s.id === canonicalId
+    );
+
+    const mergedCourses = Array.from(
+      new Set([
+        ...(baseMatch?.enrolledCourseIds || []),
+        ...(existingCustomMatch?.enrolledCourseIds || []),
+        ...(student.enrolledCourseIds || []),
+      ])
+    );
+
+    const canonicalStudent: Student = {
+      ...student,
+      id: canonicalId,
+      name: canonicalName,
+      grade: normalizeTurkish(
+        student.grade || existingCustomMatch?.grade || baseMatch?.grade || '5. sınıf'
+      ),
+      modality:
+        student.modality || existingCustomMatch?.modality || baseMatch?.modality || 'online',
+      enrolledCourseIds: mergedCourses,
+      addedAtWeek: Math.min(
+        student.addedAtWeek || currentWeek,
+        existingCustomMatch?.addedAtWeek || currentWeek,
+        baseMatch ? 1 : currentWeek
+      ),
+      addedAt:
+        existingCustomMatch?.addedAt ||
+        student.addedAt ||
+        new Date().toISOString(),
+      deletedAt: null,
+    };
+
+    setRemovedStudentIds(prev => prev.filter(id => id !== canonicalId));
     setCustomStudents(prev => {
-      const withoutOld = prev.filter(s => s.id !== student.id);
-      return [...withoutOld, student];
+      const withoutOld = prev.filter(
+        s => s.id !== canonicalId && buildStudentIdFromName(s.name) !== canonicalId
+      );
+      return [...withoutOld, canonicalStudent];
     });
 
     await writeQueueRef.current!.enqueueImmediate({
-      key: `student_add_${student.id}`,
+      key: `student_add_${canonicalId}`,
       label: 'Öğrenci Ekle',
       rollback: () => {
         setCustomStudents(prevCustom);
@@ -780,29 +841,86 @@ export default function App() {
       },
       execute: async () => {
         const nowIso = new Date().toISOString();
+        const docRef = doc(db, 'custom_students', canonicalId);
+        const isOnline =
+          typeof navigator !== 'undefined' ? navigator.onLine : true;
+
         try {
-          await setDoc(doc(db, 'custom_students', student.id), {
-            id: student.id,
-            name: student.name,
-            grade: student.grade,
-            modality: student.modality,
-            enrolledCourseIds: student.enrolledCourseIds,
-            addedAtWeek: student.addedAtWeek || currentWeek,
-            addedAt: serverTimestamp(),
-            addedAtIso: student.addedAt || nowIso,
-            deletedAt: null,
-          });
+          if (isOnline) {
+            // Requirement 2: Firestore transaction on stu-<slug> so even if two devices add the same student concurrently, a single merged document is written
+            await runTransaction(db, async tx => {
+              const serverSnap = await tx.get(docRef);
+              let finalCourses = [...mergedCourses];
+              let finalAddedAtWeek = canonicalStudent.addedAtWeek || currentWeek;
+              let finalAddedAtIso = canonicalStudent.addedAt || nowIso;
+              let finalGrade = canonicalStudent.grade;
+              let finalModality = canonicalStudent.modality;
+
+              if (serverSnap.exists()) {
+                const srv = serverSnap.data();
+                if (!srv.deletedAt) {
+                  const srvCourses = Array.isArray(srv.enrolledCourseIds)
+                    ? (srv.enrolledCourseIds as string[])
+                    : [];
+                  finalCourses = Array.from(
+                    new Set([...srvCourses, ...finalCourses])
+                  );
+                  if (typeof srv.addedAtWeek === 'number') {
+                    finalAddedAtWeek = Math.min(finalAddedAtWeek, srv.addedAtWeek);
+                  }
+                  const srvIso = formatFirestoreTimestamp(
+                    srv.addedAt,
+                    srv.addedAtIso
+                  );
+                  if (srvIso && srvIso < finalAddedAtIso) {
+                    finalAddedAtIso = srvIso;
+                  }
+                  if (srv.grade && !student.grade) {
+                    finalGrade = normalizeTurkish(srv.grade);
+                  }
+                  if (srv.modality && !student.modality) {
+                    finalModality = srv.modality as Modality;
+                  }
+                }
+              }
+
+              tx.set(docRef, {
+                id: canonicalId,
+                name: canonicalName,
+                grade: finalGrade,
+                modality: finalModality,
+                enrolledCourseIds: finalCourses,
+                addedAtWeek: finalAddedAtWeek,
+                addedAt: serverTimestamp(),
+                addedAtIso: finalAddedAtIso,
+                deletedAt: null,
+              });
+            });
+          } else {
+            await setDoc(docRef, {
+              id: canonicalId,
+              name: canonicalName,
+              grade: canonicalStudent.grade,
+              modality: canonicalStudent.modality,
+              enrolledCourseIds: canonicalStudent.enrolledCourseIds,
+              addedAtWeek: canonicalStudent.addedAtWeek || currentWeek,
+              addedAt: serverTimestamp(),
+              addedAtIso: canonicalStudent.addedAt || nowIso,
+              deletedAt: null,
+            });
+          }
+
           void writeAuditLog({
             actor: 'sibelius (ekip)',
             action: 'ogrenci_ekle',
-            target: student.id,
-            details: `${student.name} (${student.grade}) sisteme eklendi.`,
+            target: canonicalId,
+            details: `${canonicalName} (${canonicalStudent.grade}) [${canonicalId}] sisteme eklendi/güncellendi.`,
           });
         } catch (error) {
           handleFirestoreError(
             error,
             OperationType.WRITE,
-            `custom_students/${student.id}`
+            `custom_students/${canonicalId}`
           );
         }
       },
@@ -1238,11 +1356,14 @@ export default function App() {
   };
 
   const handleEnrollUnlistedStudent = async (
-    report: UnlistedStudentReport
+    report: UnlistedStudentReport,
+    overrideStudentName?: string
   ): Promise<string> => {
     const course = effectiveDb.courses.find(c => c.id === report.courseId);
     const courseTitle = course ? course.title : report.courseId;
-    const canonicalName = getCanonicalStudentName(report.studentName);
+    const canonicalName = getCanonicalStudentName(
+      overrideStudentName || report.studentName
+    );
     const existingStudent = findMatchingStudentByFullName(
       canonicalName,
       effectiveDb.students
@@ -1260,6 +1381,7 @@ export default function App() {
 
       targetStudent = {
         ...existingStudent,
+        id: buildStudentIdFromName(existingStudent.name),
         enrolledCourseIds: nextCourses,
       };
       await handleAddStudent(targetStudent);
@@ -1283,7 +1405,7 @@ export default function App() {
         currentWeek: report.weekNumber,
       });
       await handleAddStudent(targetStudent);
-      noticeMessage = `"${targetStudent.name}" için yeni öğrenci kaydı oluşturuldu ve şimdilik sadece ${courseTitle} dersine kaydedildi.`;
+      noticeMessage = `"${targetStudent.name}" için yeni öğrenci kaydı (${targetStudent.id}) oluşturuldu ve şimdilik sadece ${courseTitle} dersine kaydedildi.`;
     }
 
     const matchingAttendance = attendanceRecords.find(
@@ -1312,6 +1434,7 @@ export default function App() {
     const resolvedAtIso = new Date().toISOString();
     const updatedReport: UnlistedStudentReport = {
       ...report,
+      studentName: targetStudent.name,
       status: 'enrolled',
       resolvedStudentId: targetStudent.id,
       resolvedExistingStudent: Boolean(existingStudent),
@@ -1801,6 +1924,236 @@ export default function App() {
     });
   };
 
+  const handleDownloadMigrationBackup = () => {
+    const backup = createMigrationBackupPayload({
+      baseStudents: BASE_DB.students,
+      customStudents,
+      removedStudents: removedStudentIds.map(id => ({
+        studentId: id,
+        name: id,
+        removedAt: new Date().toISOString(),
+      })),
+      unlistedReports,
+      attendanceRecords,
+      instructorAssignments,
+    });
+    setLastMigrationBackup(backup);
+    triggerJsonBackupDownload('ogrenci-birlestirme-tam-yedek', backup);
+  };
+
+  const handleExecuteStudentMigration = async (
+    resolutions: MigrationUserResolutions
+  ): Promise<string> => {
+    const nowIso = new Date().toISOString();
+    const backup = createMigrationBackupPayload(
+      {
+        baseStudents: BASE_DB.students,
+        customStudents,
+        removedStudents: removedStudentIds.map(id => ({
+          studentId: id,
+          name: id,
+          removedAt: nowIso,
+        })),
+        unlistedReports,
+        attendanceRecords,
+        instructorAssignments,
+      },
+      nowIso
+    );
+    setLastMigrationBackup(backup);
+    triggerJsonBackupDownload('ogrenci-birlestirme-oncesi', backup);
+
+    const report = buildMigrationDryRunReport(
+      {
+        baseStudents: BASE_DB.students,
+        customStudents,
+        unlistedReports,
+        attendanceRecords,
+        courses: effectiveDb.courses,
+      },
+      resolutions,
+      nowIso
+    );
+
+    if (report.isAlreadyClean) {
+      return 'Tüm öğrenci kimlikleri zaten birleştirilmiş durumda (idempotent kontrol: yapılacak değişiklik yok).';
+    }
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: 'student_identity_migration_batch',
+      label: 'Öğrenci Kimliklerini Birleştir',
+      execute: async () => {
+        try {
+          const batch = writeBatch(db);
+
+          for (const group of report.groupsToMigrate) {
+            const resolvedName =
+              resolutions.nameByTargetId?.[group.targetId] ||
+              group.normalizedName;
+            const resolvedGrade =
+              resolutions.gradeByTargetId?.[group.targetId] ||
+              group.defaultGrade;
+            const resolvedModality =
+              resolutions.modalityByTargetId?.[group.targetId] ||
+              group.defaultModality;
+
+            if (group.needsCustomUpsert) {
+              batch.set(doc(db, 'custom_students', group.targetId), {
+                id: group.targetId,
+                name: resolvedName,
+                grade: resolvedGrade,
+                modality: resolvedModality,
+                enrolledCourseIds: group.mergedCourseIds,
+                addedAtWeek: group.minAddedAtWeek,
+                addedAt: serverTimestamp(),
+                addedAtIso: group.earliestAddedAt,
+                deletedAt: null,
+              });
+            }
+
+            for (const dupId of group.duplicateCustomDocIdsToSoftDelete) {
+              const oldRec = customStudents.find(c => c.id === dupId);
+              if (oldRec) {
+                batch.set(doc(db, 'custom_students', dupId), {
+                  id: oldRec.id,
+                  name: oldRec.name,
+                  grade: oldRec.grade,
+                  modality: oldRec.modality,
+                  enrolledCourseIds: oldRec.enrolledCourseIds,
+                  addedAtWeek: oldRec.addedAtWeek || 1,
+                  addedAt: oldRec.addedAt || nowIso,
+                  addedAtIso: oldRec.addedAt || nowIso,
+                  deletedAt: serverTimestamp(),
+                  deletedAtIso: nowIso,
+                });
+              }
+            }
+          }
+
+          for (const uRedir of report.unlistedRedirects) {
+            const orig = unlistedReports.find(u => u.id === uRedir.docId);
+            if (orig) {
+              batch.set(doc(db, 'unlisted_students', orig.id), {
+                id: orig.id,
+                studentName: uRedir.normalizedName,
+                courseId: orig.courseId,
+                instructorId: orig.instructorId,
+                instructorName: orig.instructorName,
+                weekNumber: orig.weekNumber,
+                sessionType: orig.sessionType,
+                status: orig.status,
+                resolvedStudentId: uRedir.afterResolvedId,
+                resolvedExistingStudent: Boolean(orig.resolvedExistingStudent),
+                createdAt: orig.createdAt,
+                createdAtIso: orig.createdAt,
+                resolvedAt: orig.resolvedAt || nowIso,
+                resolvedAtIso: orig.resolvedAt || nowIso,
+                deletedAt: null,
+              });
+            }
+          }
+
+          for (const aRedir of report.attendanceRedirects) {
+            const orig = attendanceRecords.find(a => a.id === aRedir.docId);
+            if (orig) {
+              batch.set(doc(db, 'attendance', aRedir.docId), {
+                courseId: orig.courseId,
+                instructorId: orig.instructorId,
+                weekNumber: orig.weekNumber,
+                sessionType: orig.sessionType,
+                absentStudentIds: aRedir.afterAbsentIds,
+                didNotHoldClass: orig.didNotHoldClass,
+                updatedAt: serverTimestamp(),
+                updatedAtIso: nowIso,
+                version: (orig.version || 1) + 1,
+                updatedBySessionId: CLIENT_SESSION_ID,
+                deletedAt: null,
+              });
+            }
+          }
+
+          await batch.commit();
+
+          void writeAuditLog({
+            actor: 'sibelius (ekip)',
+            action: 'ogrenci_kimlik_migrasyonu',
+            target: 'custom_students,unlisted_students,attendance',
+            details: `${report.groupsToMigrate.length} öğrenci grubu stu-<slug> kimliğinde birleştirildi (${report.totalCustomDocsToSoftDelete} tekrar belge soft-delete, ${report.totalUnlistedDocsToUpdate} liste dışı ve ${report.totalAttendanceDocsToUpdate} yoklama referansı güncellendi).`,
+          });
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.WRITE,
+            'student_identity_migration'
+          );
+        }
+      },
+    });
+
+    return `Birleştirme tamamlandı: ${report.groupsToMigrate.length} öğrenci grubu stu-<slug> kimliğinde birleştirildi, ${report.totalCustomDocsToSoftDelete} tekrar belge soft-delete edildi, ${report.totalUnlistedDocsToUpdate} liste dışı ve ${report.totalAttendanceDocsToUpdate} yoklama kaydı güncellendi.`;
+  };
+
+  const handleUndoStudentMigration = async () => {
+    if (!lastMigrationBackup) return;
+    const backup = lastMigrationBackup;
+    setLastMigrationBackup(null);
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: 'undo_student_identity_migration',
+      label: 'Kimlik Birleştirmeyi Geri Al',
+      execute: async () => {
+        try {
+          const batch = writeBatch(db);
+          for (const c of backup.data.customStudents) {
+            batch.set(doc(db, 'custom_students', c.id), {
+              id: c.id,
+              name: c.name,
+              grade: c.grade,
+              modality: c.modality,
+              enrolledCourseIds: c.enrolledCourseIds,
+              addedAtWeek: c.addedAtWeek || 1,
+              addedAt: c.addedAt,
+              addedAtIso: c.addedAt,
+              deletedAt: c.deletedAt || null,
+            });
+          }
+          for (const u of backup.data.unlistedReports) {
+            batch.set(doc(db, 'unlisted_students', u.id), {
+              id: u.id,
+              studentName: u.studentName,
+              courseId: u.courseId,
+              instructorId: u.instructorId,
+              instructorName: u.instructorName,
+              weekNumber: u.weekNumber,
+              sessionType: u.sessionType,
+              status: u.status,
+              resolvedStudentId: u.resolvedStudentId || null,
+              resolvedExistingStudent: Boolean(u.resolvedExistingStudent),
+              createdAt: u.createdAt,
+              createdAtIso: u.createdAt,
+              resolvedAt: u.resolvedAt || null,
+              resolvedAtIso: u.resolvedAt || null,
+              deletedAt: u.deletedAt || null,
+            });
+          }
+          await batch.commit();
+          void writeAuditLog({
+            actor: 'sibelius (ekip)',
+            action: 'ogrenci_migrasyon_geri_al',
+            target: 'custom_students,unlisted_students',
+            details: 'Öğrenci kimlik birleştirme işlemi yedekten geri yüklendi.',
+          });
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.WRITE,
+            'undo_student_identity_migration'
+          );
+        }
+      },
+    });
+  };
+
   const handleDownloadHtml = () => {
     const link = document.createElement('a');
     link.href = './bach.html';
@@ -2002,9 +2355,12 @@ export default function App() {
             selectedWeek={selectedWeek}
             onSelectWeek={setSelectedWeek}
             onActiveCourseChange={setActiveInstructorCourseId}
+            allStudents={effectiveDb.students}
+            allCourses={effectiveDb.courses}
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
             onSaveAttendance={handleSaveAttendance}
+            onAddStudent={handleAddStudent}
             onAddUnlistedStudent={handleAddUnlistedStudent}
             onRemoveUnlistedStudent={handleDeleteUnlistedReport}
             onDeleteCourseSession={handleDeleteCourseSession}
@@ -2020,6 +2376,7 @@ export default function App() {
           <AdminSibeliusView
             currentWeek={currentWeek}
             students={effectiveDb.students}
+            rawCustomStudents={customStudents}
             courses={effectiveDb.courses}
             instructors={effectiveDb.instructors}
             attendanceRecords={attendanceRecords}
@@ -2032,6 +2389,10 @@ export default function App() {
             onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
             onMarkTemporaryUnlistedStudent={handleMarkTemporaryUnlistedStudent}
             onDeleteUnlistedReport={handleDeleteUnlistedReport}
+            onDownloadMigrationBackup={handleDownloadMigrationBackup}
+            onExecuteStudentMigration={handleExecuteStudentMigration}
+            canUndoMigration={Boolean(lastMigrationBackup)}
+            onUndoMigration={handleUndoStudentMigration}
             onResetZeroAttendance={handleResetZeroPresentAttendance}
             onResetAllAttendance={handleResetAllAttendance}
             canUndoAttendanceReset={lastSoftDeletedAttendanceIds.length > 0}

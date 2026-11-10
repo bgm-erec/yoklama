@@ -14,15 +14,20 @@ import {
   ChevronDown,
   ChevronUp,
   Plus,
+  RefreshCw,
+  Download,
 } from 'lucide-react';
 import {
   AttendanceRecord,
   AuditLogEntry,
+  BASE_DB,
   Course,
   DATA_DISCREPANCIES,
   getCanonicalStudentName,
   Instructor,
+  isPlaceholderStudentName,
   Modality,
+  normalizeName,
   normalizeTurkish,
   PlaceboSavePreferenceRecord,
   slugifyTurkish,
@@ -33,14 +38,21 @@ import {
   computeActivePlaceboSaveUsers,
   createNewStudentRecord,
   findMatchingStudentByFullName,
+  findSimilarStudentsByName,
   getWeekDateRangeLabel,
   isStudentResponsibleForSession,
   isUnassignedBosInstructor,
+  SimilarStudentCandidate,
 } from '../utils/enigmaLogic';
+import {
+  buildMigrationDryRunReport,
+  MigrationUserResolutions,
+} from '../utils/studentMigration';
 
 interface AdminSibeliusViewProps {
   currentWeek: number;
   students: Student[];
+  rawCustomStudents?: Student[];
   courses: Course[];
   instructors: Instructor[];
   attendanceRecords: AttendanceRecord[];
@@ -54,9 +66,16 @@ interface AdminSibeliusViewProps {
     instructorName: string,
     newCourseMeta?: { modality: Modality; gradeClass: string; subject: string }
   ) => Promise<void>;
-  onEnrollUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
+  onEnrollUnlistedStudent: (
+    report: UnlistedStudentReport,
+    overrideStudentName?: string
+  ) => Promise<string>;
   onMarkTemporaryUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
   onDeleteUnlistedReport: (reportId: string) => Promise<void>;
+  onDownloadMigrationBackup?: () => void;
+  onExecuteStudentMigration?: (resolutions: MigrationUserResolutions) => Promise<string>;
+  canUndoMigration?: boolean;
+  onUndoMigration?: () => Promise<void>;
   onResetZeroAttendance?: () => Promise<number>;
   onResetAllAttendance: () => Promise<void>;
   canUndoAttendanceReset?: boolean;
@@ -110,6 +129,7 @@ const YUZYUZE_CLASS_LEVELS = [
 export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   currentWeek,
   students,
+  rawCustomStudents = [],
   courses,
   instructors,
   attendanceRecords: rawAttendanceRecords,
@@ -122,6 +142,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onEnrollUnlistedStudent,
   onMarkTemporaryUnlistedStudent,
   onDeleteUnlistedReport,
+  onDownloadMigrationBackup,
+  onExecuteStudentMigration,
+  canUndoMigration,
+  onUndoMigration,
   onResetZeroAttendance,
   onResetAllAttendance,
   canUndoAttendanceReset,
@@ -165,6 +189,33 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [newYuzyuzeBranch, setNewYuzyuzeBranch] = useState('a');
   const [selectedOnlineCourseIds, setSelectedOnlineCourseIds] = useState<string[]>([]);
   const [addFormError, setAddFormError] = useState<string | null>(null);
+  const [pendingDuplicateAddConfirm, setPendingDuplicateAddConfirm] = useState<{
+    existingStudent: Student;
+    newCourseIds: string[];
+  } | null>(null);
+  const [pendingTypoAddCandidates, setPendingTypoAddCandidates] = useState<{
+    typedName: string;
+    newCourseIds: string[];
+    gradeLabel: string;
+    modality: Modality;
+    candidates: SimilarStudentCandidate[];
+  } | null>(null);
+
+  // Unlisted student enrollment duplicate / typo prompt state
+  const [pendingUnlistedConfirm, setPendingUnlistedConfirm] = useState<{
+    reportId: string;
+    existingStudent: Student;
+  } | null>(null);
+  const [pendingUnlistedTypo, setPendingUnlistedTypo] = useState<{
+    reportId: string;
+    candidates: SimilarStudentCandidate[];
+  } | null>(null);
+
+  // Migration / Olası Tekrarlar state
+  const [rescanCounter, setRescanCounter] = useState(0);
+  const [migrationResolutions, setMigrationResolutions] =
+    useState<MigrationUserResolutions>({});
+  const [isApplyingMigration, setIsApplyingMigration] = useState(false);
 
   // Remove Student Form states
   const [removeNameInput, setRemoveNameInput] = useState('');
@@ -283,11 +334,88 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     setTimeout(() => setActionNotice(null), 4000);
   };
 
+  const migrationDryRunReport = useMemo(
+    () =>
+      buildMigrationDryRunReport(
+        {
+          baseStudents: BASE_DB.students,
+          customStudents: rawCustomStudents,
+          unlistedReports: rawUnlistedReports,
+          attendanceRecords: rawAttendanceRecords,
+          courses,
+        },
+        migrationResolutions
+      ),
+    [
+      rawCustomStudents,
+      rawUnlistedReports,
+      rawAttendanceRecords,
+      courses,
+      migrationResolutions,
+      rescanCounter,
+    ]
+  );
+
+  const executeCreateNewStudentRecord = async (
+    cleanName: string,
+    modality: Modality,
+    gradeLabel: string,
+    enrolledCourseIds: string[]
+  ) => {
+    const newStudent = createNewStudentRecord({
+      rawName: cleanName,
+      modality,
+      gradeLabel,
+      enrolledCourseIds,
+      currentWeek,
+    });
+
+    await onAddStudent(newStudent);
+    setNewStudentName('');
+    setAddFormError(null);
+    setPendingDuplicateAddConfirm(null);
+    setPendingTypoAddCandidates(null);
+    setActiveStudentPanel('none');
+    showTemporaryNotice(
+      `${newStudent.name} sisteme eklendi (${currentWeek}. haftadan itibaren değerlendirmeye alındı).`
+    );
+  };
+
+  const handleConfirmMergeExistingOnAdd = async (
+    existingStudent: Student,
+    courseIdsToAdd: string[]
+  ) => {
+    const mergedCourses = Array.from(
+      new Set([...existingStudent.enrolledCourseIds, ...courseIdsToAdd])
+    );
+    const updatedStudent: Student = {
+      ...existingStudent,
+      enrolledCourseIds: mergedCourses,
+    };
+    await onAddStudent(updatedStudent);
+    const addedTitles = courseIdsToAdd
+      .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+      .join(', ');
+    setNewStudentName('');
+    setAddFormError(null);
+    setPendingDuplicateAddConfirm(null);
+    setPendingTypoAddCandidates(null);
+    setActiveStudentPanel('none');
+    showTemporaryNotice(
+      `Mevcut öğrenci "${existingStudent.name}" kaydına yeni dersler (${addedTitles}) eklendi.`
+    );
+  };
+
   const handleAddStudentSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanName = normalizeTurkish(newStudentName);
-    if (!cleanName || cleanName.length < 2) {
+    const cleanName = normalizeName(newStudentName);
+    if (!cleanName || cleanName.length < 2 || cleanName.split(' ').length < 2) {
       setAddFormError('lütfen öğrencinin adını ve soyadını gir.');
+      return;
+    }
+
+    if (isPlaceholderStudentName(cleanName)) {
+      setAddFormError(`"${cleanName}" yer tutucu bir kayıttır; gerçek öğrenci olarak eklenemez.`);
       return;
     }
 
@@ -315,20 +443,38 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       return;
     }
 
-    const newStudent = createNewStudentRecord({
-      rawName: cleanName,
-      modality: newStudentModality,
-      gradeLabel,
-      enrolledCourseIds,
-      currentWeek,
-    });
-
-    await onAddStudent(newStudent);
-    setNewStudentName('');
     setAddFormError(null);
-    setActiveStudentPanel('none');
-    showTemporaryNotice(
-      `${newStudent.name} sisteme eklendi (${currentWeek}. haftadan itibaren değerlendirmeye alındı).`
+
+    // 1. Check exact normalized name match across existing students (Requirement 2)
+    const existingMatch = findMatchingStudentByFullName(cleanName, students);
+    if (existingMatch) {
+      setPendingTypoAddCandidates(null);
+      setPendingDuplicateAddConfirm({
+        existingStudent: existingMatch,
+        newCourseIds: enrolledCourseIds,
+      });
+      return;
+    }
+
+    // 2. Check similar names / typos ("Şunu mu demek istedin: <ad>?")
+    const similar = findSimilarStudentsByName(cleanName, students);
+    if (similar.length > 0) {
+      setPendingDuplicateAddConfirm(null);
+      setPendingTypoAddCandidates({
+        typedName: cleanName,
+        newCourseIds: enrolledCourseIds,
+        gradeLabel,
+        modality: newStudentModality,
+        candidates: similar,
+      });
+      return;
+    }
+
+    await executeCreateNewStudentRecord(
+      cleanName,
+      newStudentModality,
+      gradeLabel,
+      enrolledCourseIds
     );
   };
 
@@ -1024,7 +1170,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                       }`
                     : cat === 'audit_log'
                     ? `işlem geçmişi (${auditLogs.length})`
-                    : 'veri doğrulama notları';
+                    : `olası tekrarlar & migrasyon (${migrationDryRunReport.groupsToMigrate.length})`;
                 return (
                   <button
                     key={cat}
@@ -1409,6 +1555,113 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   </p>
                 )}
 
+                {/* Exact-Match Duplicate Prevention Prompt (Requirement 2) */}
+                {pendingDuplicateAddConfirm && (
+                  <div
+                    data-testid="admin-duplicate-student-prompt"
+                    className="rounded-xl border border-amber-300 bg-amber-50/95 p-4 space-y-2.5 text-xs"
+                  >
+                    <p className="font-medium text-amber-950 leading-relaxed">
+                      Bu öğrenci zaten kayıtlı:{' '}
+                      <strong>{pendingDuplicateAddConfirm.existingStudent.name}</strong> (
+                      {pendingDuplicateAddConfirm.existingStudent.grade},{' '}
+                      {pendingDuplicateAddConfirm.existingStudent.enrolledCourseIds
+                        .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+                        .join(', ')}
+                      ). Bu dersi (
+                      {pendingDuplicateAddConfirm.newCourseIds
+                        .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+                        .join(', ')}
+                      ) mevcut öğrenciye ekleyeyim mi?
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        data-testid="admin-confirm-merge-existing-btn"
+                        onClick={() =>
+                          void handleConfirmMergeExistingOnAdd(
+                            pendingDuplicateAddConfirm.existingStudent,
+                            pendingDuplicateAddConfirm.newCourseIds
+                          )
+                        }
+                        className="rounded-xl bg-stone-900 px-4 py-2 text-xs font-medium text-stone-100 hover:bg-stone-800 cursor-pointer"
+                      >
+                        evet, bu dersi mevcut öğrenciye ekle
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingDuplicateAddConfirm(null)}
+                        className="rounded-xl border border-stone-300 bg-white px-3 py-2 text-xs text-stone-700 hover:bg-stone-100 cursor-pointer"
+                      >
+                        vazgeç
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Typo / Similar Student Prompt: "Şunu mu demek istedin: <ad>?" (Requirement 2) */}
+                {pendingTypoAddCandidates && (
+                  <div
+                    data-testid="admin-typo-student-prompt"
+                    className="rounded-xl border border-amber-300 bg-amber-50/95 p-4 space-y-2.5 text-xs"
+                  >
+                    <p className="font-medium text-amber-950">
+                      yazım benzerliği uyarısı — şunu mu demek istedin?
+                    </p>
+                    <div className="space-y-1.5">
+                      {pendingTypoAddCandidates.candidates.map(cand => (
+                        <button
+                          key={cand.student.id}
+                          type="button"
+                          onClick={() => {
+                            setPendingTypoAddCandidates(null);
+                            setPendingDuplicateAddConfirm({
+                              existingStudent: cand.student,
+                              newCourseIds: pendingTypoAddCandidates.newCourseIds,
+                            });
+                          }}
+                          className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-left text-xs text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                        >
+                          <span>
+                            şunu mu demek istedin: <strong>{cand.student.name}</strong> (
+                            {cand.student.grade} ·{' '}
+                            {cand.student.enrolledCourseIds
+                              .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+                              .join(', ')}
+                            )?
+                          </span>
+                          <span className="text-[11px] font-medium text-amber-900 shrink-0">
+                            bu öğrenciyi seç →
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void executeCreateNewStudentRecord(
+                            pendingTypoAddCandidates.typedName,
+                            pendingTypoAddCandidates.modality,
+                            pendingTypoAddCandidates.gradeLabel,
+                            pendingTypoAddCandidates.newCourseIds
+                          )
+                        }
+                        className="rounded-xl border border-stone-300 bg-white px-3.5 py-2 text-xs text-stone-700 hover:bg-stone-100 cursor-pointer"
+                      >
+                        hayır, "{pendingTypoAddCandidates.typedName}" farklı bir öğrenci (yeni kayıt aç)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingTypoAddCandidates(null)}
+                        className="text-xs text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                      >
+                        vazgeç
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
                   <p className="text-[11px] text-stone-500">
                     not: öğrenci {currentWeek}. haftadan ({getWeekDateRangeLabel(currentWeek)}) itibaren yoklama sistemine dahil edilir; önceki derslerden sorumlu tutulmaz.
@@ -1790,19 +2043,36 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             )}
           </div>
 
-          {/* Audit Log Quick Link at Bottom of Menu */}
+          {/* Audit Log & Olası Tekrarlar / Kimlik Birleştirme Quick Links at Bottom of Menu */}
           <div className="pt-2 flex flex-wrap items-center justify-between gap-2">
-            <button
-              type="button"
-              data-testid="sibelius-audit-log-btn"
-              onClick={() => {
-                setCategory('audit_log');
-                resetDetailSelection();
-              }}
-              className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
-            >
-              <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                data-testid="sibelius-audit-log-btn"
+                onClick={() => {
+                  setCategory('audit_log');
+                  resetDetailSelection();
+                }}
+                className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
+              >
+                <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="sibelius-duplicates-btn"
+                onClick={() => {
+                  setCategory('uyumsuzluklar');
+                  resetDetailSelection();
+                }}
+                className="inline-flex items-center gap-2 rounded-xl border border-amber-400/90 bg-amber-50/90 px-3.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
+              >
+                <AlertCircle className="h-3.5 w-3.5 text-amber-800" />
+                <span>
+                  olası tekrarlar & kimlik birleştirme ({migrationDryRunReport.groupsToMigrate.length} grup · {migrationDryRunReport.nearDuplicatePairs.length} benzer) →
+                </span>
+              </button>
+            </div>
 
             <button
               type="button"
@@ -2248,38 +2518,159 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                       </div>
 
                       {/* Action Buttons Underneath Each Student */}
-                      <div className="mt-4 pt-3 border-t border-stone-200/80 flex flex-wrap items-center gap-2.5">
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const msg = await onEnrollUnlistedStudent(report);
-                            showTemporaryNotice(msg);
-                          }}
-                          className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
-                            report.status === 'enrolled'
-                              ? 'bg-emerald-800 text-white'
-                              : 'bg-stone-900 text-stone-100 hover:bg-stone-800'
-                          }`}
-                        >
-                          <UserPlus className="h-3.5 w-3.5" />
-                          <span>bu öğrenciyi bu derse kaydet</span>
-                        </button>
+                      <div className="mt-4 pt-3 border-t border-stone-200/80 space-y-3">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (existingStudent && !alreadyEnrolledInThisCourse) {
+                                setPendingUnlistedTypo(null);
+                                setPendingUnlistedConfirm({
+                                  reportId: report.id,
+                                  existingStudent,
+                                });
+                                return;
+                              }
+                              if (!existingStudent) {
+                                const similar = findSimilarStudentsByName(
+                                  report.studentName,
+                                  students
+                                );
+                                if (similar.length > 0) {
+                                  setPendingUnlistedConfirm(null);
+                                  setPendingUnlistedTypo({
+                                    reportId: report.id,
+                                    candidates: similar,
+                                  });
+                                  return;
+                                }
+                              }
+                              const msg = await onEnrollUnlistedStudent(report);
+                              showTemporaryNotice(msg);
+                            }}
+                            className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                              report.status === 'enrolled'
+                                ? 'bg-emerald-800 text-white'
+                                : 'bg-stone-900 text-stone-100 hover:bg-stone-800'
+                            }`}
+                          >
+                            <UserPlus className="h-3.5 w-3.5" />
+                            <span>
+                              {report.status === 'temporary'
+                                ? 'geçici → kayıtlıya çevir (bu derse kaydet)'
+                                : 'bu öğrenciyi bu derse kaydet'}
+                            </span>
+                          </button>
 
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const msg = await onMarkTemporaryUnlistedStudent(report);
-                            showTemporaryNotice(msg);
-                          }}
-                          className={`inline-flex items-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
-                            report.status === 'temporary'
-                              ? 'border-stone-900 bg-stone-800 text-stone-100'
-                              : 'border-stone-300 bg-white text-stone-800 hover:border-stone-600 hover:bg-stone-50'
-                          }`}
-                        >
-                          <UserCheck className="h-3.5 w-3.5" />
-                          <span>geçici öğrenci</span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const msg = await onMarkTemporaryUnlistedStudent(report);
+                              showTemporaryNotice(msg);
+                            }}
+                            className={`inline-flex items-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                              report.status === 'temporary'
+                                ? 'border-stone-900 bg-stone-800 text-stone-100'
+                                : 'border-stone-300 bg-white text-stone-800 hover:border-stone-600 hover:bg-stone-50'
+                            }`}
+                          >
+                            <UserCheck className="h-3.5 w-3.5" />
+                            <span>geçici öğrenci</span>
+                          </button>
+                        </div>
+
+                        {/* Exact-match confirmation for unlisted student enrollment */}
+                        {pendingUnlistedConfirm?.reportId === report.id && (
+                          <div className="rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2">
+                            <p className="font-medium text-amber-950">
+                              Bu öğrenci zaten kayıtlı:{' '}
+                              <strong>{pendingUnlistedConfirm.existingStudent.name}</strong> (
+                              {pendingUnlistedConfirm.existingStudent.grade},{' '}
+                              {pendingUnlistedConfirm.existingStudent.enrolledCourseIds
+                                .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+                                .join(', ')}
+                              ). Bu dersi ({course?.shortTitle || report.courseId}) mevcut öğrenciye ekleyeyim mi?
+                            </p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  const targetName = pendingUnlistedConfirm.existingStudent.name;
+                                  setPendingUnlistedConfirm(null);
+                                  const msg = await onEnrollUnlistedStudent(report, targetName);
+                                  showTemporaryNotice(msg);
+                                }}
+                                className="rounded-lg bg-stone-900 px-3 py-1.5 text-[11px] font-medium text-stone-100 hover:bg-stone-800 cursor-pointer"
+                              >
+                                evet, bu dersi mevcut öğrenciye ekle
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setPendingUnlistedConfirm(null)}
+                                className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-[11px] text-stone-700 hover:bg-stone-100 cursor-pointer"
+                              >
+                                vazgeç
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Typo warning for unlisted student enrollment */}
+                        {pendingUnlistedTypo?.reportId === report.id && (
+                          <div className="rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2">
+                            <p className="font-medium text-amber-950">
+                              şunu mu demek istedin? (benzer isimli kayıtlı öğrenci bulundu):
+                            </p>
+                            <div className="space-y-1.5">
+                              {pendingUnlistedTypo.candidates.map(cand => (
+                                <button
+                                  key={cand.student.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setPendingUnlistedTypo(null);
+                                    setPendingUnlistedConfirm({
+                                      reportId: report.id,
+                                      existingStudent: cand.student,
+                                    });
+                                  }}
+                                  className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 text-left text-[11px] text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                                >
+                                  <span>
+                                    şunu mu demek istedin: <strong>{cand.student.name}</strong> (
+                                    {cand.student.grade} ·{' '}
+                                    {cand.student.enrolledCourseIds
+                                      .map(cid => courses.find(c => c.id === cid)?.shortTitle || cid)
+                                      .join(', ')}
+                                    )?
+                                  </span>
+                                  <span className="text-[10px] font-medium text-amber-900 shrink-0">
+                                    bu öğrenciyi seç →
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                            <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  setPendingUnlistedTypo(null);
+                                  const msg = await onEnrollUnlistedStudent(report);
+                                  showTemporaryNotice(msg);
+                                }}
+                                className="rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-[11px] text-stone-700 hover:bg-stone-100 cursor-pointer"
+                              >
+                                hayır, "{report.studentName}" olarak yeni öğrenci kaydı oluştur
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setPendingUnlistedTypo(null)}
+                                className="text-[11px] text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                              >
+                                vazgeç
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -2344,32 +2735,389 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         </div>
       )}
 
-      {/* ================= CATEGORY: VERİ DOĞRULAMA & UYUMSUZLUK RAPORU ================= */}
+      {/* ================= CATEGORY: OLASI TEKRARLAR, KURU ÇALIŞTIRMA & KİMLİK BİRLEŞTİRME ================= */}
       {category === 'uyumsuzluklar' && (
-        <div className="rounded-2xl border border-stone-300/90 bg-white/90 p-6">
-          <div className="flex items-start gap-3 border-b border-stone-200 pb-4 mb-4">
-            <AlertCircle className="h-5 w-5 text-stone-700 shrink-0 mt-0.5" />
-            <div>
-              <h2 className="font-serif-art text-2xl text-stone-900">
-                pdf listeleri doğrulama ve birleştirme raporu
-              </h2>
-              <p className="text-xs text-stone-500 mt-1">
-                çevrim içi sınıf listesi, 2026 yüz yüze yoklama listesi ve ana öğrenci listesi karşılaştırılarak uygulanan birleştirmeler:
-              </p>
+        <div className="space-y-6">
+          {/* Live Duplicate Scanner & Safe Migration Panel (Requirement 3 & 4) */}
+          <div
+            data-testid="duplicates-migration-panel"
+            className="rounded-2xl border border-stone-300/90 bg-white/95 p-5 sm:p-6 space-y-5"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 border-b border-stone-200 pb-4">
+              <div>
+                <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900">
+                  olası tekrarlar & öğrenci kimliği birleştirme (stu-&lt;slug&gt;)
+                </h2>
+                <p className="text-xs text-stone-500 mt-1">
+                  adım a: kuru çalıştırma raporu (hiçbir şey yazmadan tespit edilen tekrarlar) · adım b: tam json yedek · adım c: tekil stu-&lt;slug&gt; kimliğinde birleştirme
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  data-testid="rescan-duplicates-btn"
+                  onClick={() => {
+                    setRescanCounter(prev => prev + 1);
+                    showTemporaryNotice('tüm öğrenci, yoklama ve liste dışı koleksiyonları yeniden tarandı.');
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300 bg-white px-3.5 py-2 text-xs font-medium text-stone-800 hover:border-stone-600 hover:bg-stone-50 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>yeniden tara</span>
+                </button>
+
+                {onDownloadMigrationBackup && (
+                  <button
+                    type="button"
+                    data-testid="download-migration-backup-btn"
+                    onClick={() => {
+                      onDownloadMigrationBackup();
+                      showTemporaryNotice('ilgili tüm koleksiyonların tam JSON yedeği indirildi.');
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300 bg-[#faf8f4] px-3.5 py-2 text-xs font-medium text-stone-800 hover:border-stone-600 hover:bg-white transition-colors cursor-pointer"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>adım b: tam json yedeği indir</span>
+                  </button>
+                )}
+
+                {canUndoMigration && onUndoMigration && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await onUndoMigration();
+                      showTemporaryNotice('birleştirme işlemi yedekten geri alındı.');
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400 bg-amber-50 px-3.5 py-2 text-xs font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    <span>birleştirmeyi geri al (yedekten yükle)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Summary Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div className="rounded-xl border border-stone-200 bg-[#faf8f4] p-3">
+                <div className="text-stone-500">birleştirilecek / taşınacak grup</div>
+                <div className="font-mono-num text-xl font-semibold text-stone-900 mt-0.5">
+                  {migrationDryRunReport.groupsToMigrate.length}
+                </div>
+              </div>
+              <div className="rounded-xl border border-stone-200 bg-[#faf8f4] p-3">
+                <div className="text-stone-500">soft-delete edilecek tekrar belge</div>
+                <div className="font-mono-num text-xl font-semibold text-stone-900 mt-0.5">
+                  {migrationDryRunReport.totalCustomDocsToSoftDelete}
+                </div>
+              </div>
+              <div className="rounded-xl border border-stone-200 bg-[#faf8f4] p-3">
+                <div className="text-stone-500">yönlendirilecek referans (yoklama + liste dışı)</div>
+                <div className="font-mono-num text-xl font-semibold text-stone-900 mt-0.5">
+                  {migrationDryRunReport.totalAttendanceDocsToUpdate +
+                    migrationDryRunReport.totalUnlistedDocsToUpdate}
+                </div>
+              </div>
+              <div className="rounded-xl border border-stone-200 bg-[#faf8f4] p-3">
+                <div className="text-stone-500">onay bekleyen çakışma (sınıf/isim/yoklama)</div>
+                <div
+                  className={`font-mono-num text-xl font-semibold mt-0.5 ${
+                    migrationDryRunReport.unresolvedConflictCount > 0
+                      ? 'text-amber-800'
+                      : 'text-emerald-800'
+                  }`}
+                >
+                  {migrationDryRunReport.unresolvedConflictCount}
+                </div>
+              </div>
+            </div>
+
+            {/* Step A: Groups to Migrate */}
+            <div className="space-y-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-600">
+                adım a · kuru çalıştırma: birleştirilecek tekrarlar ve stu-&lt;slug&gt; dönüşümleri ({migrationDryRunReport.groupsToMigrate.length})
+              </h3>
+
+              {migrationDryRunReport.groupsToMigrate.length === 0 ? (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 text-xs text-emerald-900">
+                  tüm öğrenci kimlikleri kanonik <code>stu-&lt;slug&gt;</code> formatında ve tekrar eden kayıt bulunmuyor.
+                </div>
+              ) : (
+                <div className="space-y-2.5 max-h-[460px] overflow-y-auto pr-1">
+                  {migrationDryRunReport.groupsToMigrate.map(group => (
+                    <div
+                      key={group.targetId}
+                      className={`rounded-xl border p-3.5 text-xs space-y-2 ${
+                        group.hasGradeConflict ||
+                        group.hasModalityConflict ||
+                        group.hasNameConflict
+                          ? 'border-amber-300 bg-amber-50/60'
+                          : 'border-stone-200 bg-[#faf8f4]/70'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="font-semibold text-stone-900 text-sm">
+                            {group.normalizedName}
+                          </span>
+                          <span className="ml-2 font-mono-num text-[11px] text-stone-500">
+                            → hedef kimlik: <strong>{group.targetId}</strong> (asıl kaynak: {group.primarySource}:{group.primaryOriginalId})
+                          </span>
+                        </div>
+                        <span className="rounded bg-stone-200/80 px-2 py-0.5 font-mono-num text-[10px] text-stone-700">
+                          {group.activeRecords.length} aktif kayıt → 1 tekil kayıt
+                        </span>
+                      </div>
+
+                      <div className="space-y-1 text-[11px] text-stone-600">
+                        {group.activeRecords.map(rec => (
+                          <div key={`${rec.source}:${rec.docId}`} className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-mono-num rounded bg-white border border-stone-200 px-1.5 py-0.5 text-stone-800">
+                              {rec.source}:{rec.docId}
+                            </span>
+                            <span>isim: "{rec.name}"</span>
+                            <span>· sınıf: {rec.grade} ({rec.modality})</span>
+                            <span>· dersler: [{rec.enrolledCourseIds.join(', ')}]</span>
+                            <span>· hafta: {rec.addedAtWeek}</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="pt-1 text-[11px] text-emerald-900 font-medium">
+                        birleşik dersler ({group.mergedCourseIds.length}): [{group.mergedCourseIds.join(', ')}] · en küçük hafta: {group.minAddedAtWeek}
+                      </div>
+
+                      {/* Conflict Selectors if grade / modality / spelling differs */}
+                      {(group.hasNameConflict ||
+                        group.hasGradeConflict ||
+                        group.hasModalityConflict) && (
+                        <div className="pt-2 border-t border-amber-200/80 flex flex-wrap items-center gap-4 text-[11px]">
+                          {group.hasNameConflict && (
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-medium text-amber-950">
+                                isim yazımı çakışması (seçin):
+                              </span>
+                              {group.distinctNames.map(nm => (
+                                <button
+                                  key={nm}
+                                  type="button"
+                                  onClick={() =>
+                                    setMigrationResolutions(prev => ({
+                                      ...prev,
+                                      nameByTargetId: {
+                                        ...(prev.nameByTargetId || {}),
+                                        [group.targetId]: nm,
+                                      },
+                                    }))
+                                  }
+                                  className={`rounded-lg border px-2 py-1 cursor-pointer ${
+                                    migrationResolutions.nameByTargetId?.[group.targetId] === nm
+                                      ? 'border-stone-900 bg-stone-900 text-white'
+                                      : 'border-amber-300 bg-white text-stone-800 hover:bg-amber-100'
+                                  }`}
+                                >
+                                  {nm}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {group.hasGradeConflict && (
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-medium text-amber-950">
+                                sınıf/grade çakışması (seçin):
+                              </span>
+                              {group.distinctGrades.map(gr => (
+                                <button
+                                  key={gr}
+                                  type="button"
+                                  onClick={() =>
+                                    setMigrationResolutions(prev => ({
+                                      ...prev,
+                                      gradeByTargetId: {
+                                        ...(prev.gradeByTargetId || {}),
+                                        [group.targetId]: gr,
+                                      },
+                                    }))
+                                  }
+                                  className={`rounded-lg border px-2 py-1 cursor-pointer ${
+                                    migrationResolutions.gradeByTargetId?.[group.targetId] === gr
+                                      ? 'border-stone-900 bg-stone-900 text-white'
+                                      : 'border-amber-300 bg-white text-stone-800 hover:bg-amber-100'
+                                  }`}
+                                >
+                                  {gr}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {group.hasModalityConflict && (
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-medium text-amber-950">
+                                modality çakışması (seçin):
+                              </span>
+                              {group.distinctModalities.map(md => (
+                                <button
+                                  key={md}
+                                  type="button"
+                                  onClick={() =>
+                                    setMigrationResolutions(prev => ({
+                                      ...prev,
+                                      modalityByTargetId: {
+                                        ...(prev.modalityByTargetId || {}),
+                                        [group.targetId]: md,
+                                      },
+                                    }))
+                                  }
+                                  className={`rounded-lg border px-2 py-1 cursor-pointer ${
+                                    migrationResolutions.modalityByTargetId?.[group.targetId] === md
+                                      ? 'border-stone-900 bg-stone-900 text-white'
+                                      : 'border-amber-300 bg-white text-stone-800 hover:bg-amber-100'
+                                  }`}
+                                >
+                                  {md}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Step C Action Button */}
+            {onExecuteStudentMigration && !migrationDryRunReport.isAlreadyClean && (
+              <div className="pt-2 border-t border-stone-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <p className="text-xs text-stone-600">
+                  birleştirme başlatıldığında önce otomatik tam JSON yedeği indirilir, ardından Firestore <code>writeBatch</code> ile tüm tekrarlar tekil <code>stu-&lt;slug&gt;</code> kimliğinde birleştirilir ve <code>audit_log</code>'a kaydedilir.
+                </p>
+                <button
+                  type="button"
+                  data-testid="execute-migration-btn"
+                  disabled={isApplyingMigration}
+                  onClick={async () => {
+                    setIsApplyingMigration(true);
+                    try {
+                      const summary = await onExecuteStudentMigration(migrationResolutions);
+                      showTemporaryNotice(summary);
+                    } finally {
+                      setIsApplyingMigration(false);
+                    }
+                  }}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-stone-900 px-5 py-2.5 text-xs font-medium text-stone-100 hover:bg-stone-800 disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  <span>
+                    {isApplyingMigration
+                      ? 'birleştiriliyor...'
+                      : 'adım c: yedekle ve birleştirmeyi uygula (writeBatch)'}
+                  </span>
+                </button>
+              </div>
+            )}
+
+            {/* Near-Duplicate / Typo Pairs Report ("Olası Tekrarlar" — Never Auto-Merged) */}
+            <div className="pt-4 border-t border-stone-200 space-y-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-600">
+                yazım hatası / benzer isim uyarıları (otomatik birleştirilmez · kullanıcı seçimine bağlı: {migrationDryRunReport.nearDuplicatePairs.length})
+              </h3>
+              {migrationDryRunReport.nearDuplicatePairs.length === 0 ? (
+                <p className="text-xs text-stone-500">
+                  benzer isimli öğrenci çifti bulunmadı.
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                  {migrationDryRunReport.nearDuplicatePairs.map(pair => (
+                    <div
+                      key={pair.pairKey}
+                      className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-xl border border-stone-200 bg-white p-3 text-xs"
+                    >
+                      <div>
+                        <div className="font-medium text-stone-900">
+                          1) <strong>{pair.studentA.name}</strong> ({pair.studentA.grade} · [{pair.studentA.enrolledCourseIds.join(', ')}])
+                          {' ↔ '}
+                          2) <strong>{pair.studentB.name}</strong> ({pair.studentB.grade} · [{pair.studentB.enrolledCourseIds.join(', ')}])
+                        </div>
+                        <div className="text-[11px] text-stone-500 mt-0.5">
+                          tespit nedeni: {pair.reason}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setMigrationResolutions(prev => ({
+                              ...prev,
+                              confirmedTypoMerges: [
+                                ...(prev.confirmedTypoMerges || []),
+                                {
+                                  fromStudentId: pair.studentB.id,
+                                  intoStudentId: pair.studentA.id,
+                                },
+                              ],
+                            }))
+                          }
+                          className="rounded-lg border border-stone-300 bg-[#faf8f4] px-2.5 py-1 text-[11px] text-stone-800 hover:bg-stone-200/70 cursor-pointer"
+                        >
+                          "{pair.studentA.name}" altında birleştir
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setMigrationResolutions(prev => ({
+                              ...prev,
+                              confirmedTypoMerges: [
+                                ...(prev.confirmedTypoMerges || []),
+                                {
+                                  fromStudentId: pair.studentA.id,
+                                  intoStudentId: pair.studentB.id,
+                                },
+                              ],
+                            }))
+                          }
+                          className="rounded-lg border border-stone-300 bg-[#faf8f4] px-2.5 py-1 text-[11px] text-stone-800 hover:bg-stone-200/70 cursor-pointer"
+                        >
+                          "{pair.studentB.name}" altında birleştir
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
-          <div className="space-y-4">
-            {DATA_DISCREPANCIES.map((item, idx) => (
-              <div key={idx} className="border-b border-stone-200/60 pb-3 last:border-none">
-                <div className="text-xs font-semibold text-stone-800">
-                  {idx + 1}. {item.category}
-                </div>
-                <p className="text-xs text-stone-600 mt-1 leading-relaxed">
-                  {item.detail}
+          {/* Static PDF Discrepancy Notes */}
+          <div className="rounded-2xl border border-stone-300/90 bg-white/90 p-6">
+            <div className="flex items-start gap-3 border-b border-stone-200 pb-4 mb-4">
+              <AlertCircle className="h-5 w-5 text-stone-700 shrink-0 mt-0.5" />
+              <div>
+                <h2 className="font-serif-art text-2xl text-stone-900">
+                  pdf listeleri doğrulama ve birleştirme raporu
+                </h2>
+                <p className="text-xs text-stone-500 mt-1">
+                  çevrim içi sınıf listesi, 2026 yüz yüze yoklama listesi ve ana öğrenci listesi karşılaştırılarak uygulanan birleştirmeler:
                 </p>
               </div>
-            ))}
+            </div>
+
+            <div className="space-y-4">
+              {DATA_DISCREPANCIES.map((item, idx) => (
+                <div key={idx} className="border-b border-stone-200/60 pb-3 last:border-none">
+                  <div className="text-xs font-semibold text-stone-800">
+                    {idx + 1}. {item.category}
+                  </div>
+                  <p className="text-xs text-stone-600 mt-1 leading-relaxed">
+                    {item.detail}
+                  </p>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
