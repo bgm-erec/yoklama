@@ -137,6 +137,16 @@ service cloud.firestore {
         && (!('note' in data) || data.note == null || (data.note is string && data.note.size() <= 500));
     }
 
+    function isValidCoordinatorAssignment(data) {
+      return data.keys().hasAll(['weekNumber', 'updatedAt'])
+        && data.keys().hasOnly(['weekNumber', 'saturday', 'sunday', 'updatedAt', 'updatedAtIso'])
+        && data.weekNumber is number && data.weekNumber >= 1 && data.weekNumber <= 52
+        && (!('saturday' in data) || (data.saturday is list && data.saturday.size() <= 4))
+        && (!('sunday' in data) || (data.sunday is list && data.sunday.size() <= 4))
+        && isValidTimeField(data.updatedAt)
+        && isValidOptionalTimeField(data, 'updatedAtIso');
+    }
+
     match /test/connection {
       allow get: if true;
     }
@@ -208,6 +218,13 @@ service cloud.firestore {
         && isValidNotDuplicatePair(incoming())
         && pairId == incoming().studentIdA + '__' + incoming().studentIdB;
       allow delete: if isValidId(pairId);
+    }
+
+    match /coordinator_assignments/{assignmentId} {
+      allow get: if isValidId(assignmentId);
+      allow list: if resource.data.weekNumber >= 1;
+      allow create, update: if isValidId(assignmentId) && isValidCoordinatorAssignment(incoming());
+      allow delete: if isValidId(assignmentId);
     }
   }
 }

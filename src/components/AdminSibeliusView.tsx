@@ -16,12 +16,14 @@ import {
   Plus,
   RefreshCw,
   Download,
+  Calendar,
 } from 'lucide-react';
 import {
   AttendanceRecord,
   AuditLogEntry,
   BASE_DB,
   buildStudentIdFromName,
+  CoordinatorAssignmentRecord,
   Course,
   DATA_DISCREPANCIES,
   getCanonicalStudentName,
@@ -31,13 +33,11 @@ import {
   normalizeName,
   normalizeTurkish,
   NotDuplicatePairRecord,
-  PlaceboSavePreferenceRecord,
   slugifyTurkish,
   Student,
   UnlistedStudentReport,
 } from '../data/database';
 import {
-  computeActivePlaceboSaveUsers,
   createNewStudentRecord,
   findMatchingStudentByFullName,
   findSimilarStudentsByName,
@@ -50,6 +50,7 @@ import {
   buildMigrationDryRunReport,
   MigrationUserResolutions,
 } from '../utils/studentMigration';
+import { CoordinatorTrackingView } from './CoordinatorTrackingView';
 
 interface AdminSibeliusViewProps {
   currentWeek: number;
@@ -60,7 +61,7 @@ interface AdminSibeliusViewProps {
   attendanceRecords: AttendanceRecord[];
   unlistedReports: UnlistedStudentReport[];
   notDuplicatePairs?: NotDuplicatePairRecord[];
-  placeboSavePrefs?: PlaceboSavePreferenceRecord[];
+  coordinatorAssignments?: CoordinatorAssignmentRecord[];
   auditLogs?: AuditLogEntry[];
   onAddStudent: (student: Student) => Promise<void>;
   onRemoveStudent: (student: Student) => Promise<void>;
@@ -89,6 +90,12 @@ interface AdminSibeliusViewProps {
   onExecuteStudentMigration?: (resolutions: MigrationUserResolutions) => Promise<string>;
   canUndoMigration?: boolean;
   onUndoMigration?: () => Promise<void>;
+  onSaveCoordinator?: (
+    weekNumber: number,
+    day: 'saturday' | 'sunday',
+    names: (string | null)[],
+    options?: { debounced?: boolean }
+  ) => Promise<void>;
   onResetZeroAttendance?: () => Promise<number>;
   onResetAllAttendance: () => Promise<void>;
   canUndoAttendanceReset?: boolean;
@@ -103,8 +110,8 @@ type AdminCategory =
   | 'menu'
   | 'ders'
   | 'ogrenci'
-  | 'egitmen'
   | 'liste_disi'
+  | 'koordinator'
   | 'uyumsuzluklar'
   | 'audit_log';
 
@@ -148,7 +155,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   attendanceRecords: rawAttendanceRecords,
   unlistedReports: rawUnlistedReports,
   notDuplicatePairs = [],
-  placeboSavePrefs = [],
+  coordinatorAssignments = [],
   auditLogs = [],
   onAddStudent,
   onRemoveStudent,
@@ -165,6 +172,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onExecuteStudentMigration,
   canUndoMigration,
   onUndoMigration,
+  onSaveCoordinator,
   onResetZeroAttendance,
   onResetAllAttendance,
   canUndoAttendanceReset,
@@ -188,7 +196,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [selectedCourseId, setSelectedCourseId] = useState<string | null>(null);
   const [selectedInstructorId, setSelectedInstructorId] = useState<string | null>(null);
-  const [showParanoyaNames, setShowParanoyaNames] = useState(false);
 
   // Compact top-right reset states with text confirmation ("SIFIRLA")
   const [confirmingAttendanceReset, setConfirmingAttendanceReset] = useState(false);
@@ -275,11 +282,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const pendingUnlistedCount = useMemo(
     () => unlistedReports.filter(r => r.status === 'pending').length,
     [unlistedReports]
-  );
-
-  const paranoyaStats = useMemo(
-    () => computeActivePlaceboSaveUsers(placeboSavePrefs),
-    [placeboSavePrefs]
   );
 
   // Available online courses for the currently chosen online grade (Student Add)
@@ -744,19 +746,25 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       });
   }, [instructors, courses, attendanceRecords, currentWeek]);
 
+  const cleanSearchQuery = normalizeName(searchQuery);
+
   const instructorStats = useMemo(() => {
-    if (!normalizedQuery) return baseInstructorStats;
+    if (!cleanSearchQuery) return baseInstructorStats;
     return baseInstructorStats.filter(item => {
+      const normInstructor = normalizeName(item.instructor.name);
+      const normAlias = item.instructor.alias
+        ? normalizeName(item.instructor.alias)
+        : '';
       const courseMatch = item.courses.some(c =>
-        c.title.includes(normalizedQuery)
+        normalizeName(c.title).includes(cleanSearchQuery)
       );
       return (
-        item.instructor.name.includes(normalizedQuery) ||
-        (item.instructor.alias && item.instructor.alias.includes(normalizedQuery)) ||
+        normInstructor.includes(cleanSearchQuery) ||
+        normAlias.includes(cleanSearchQuery) ||
         courseMatch
       );
     });
-  }, [baseInstructorStats, normalizedQuery]);
+  }, [baseInstructorStats, cleanSearchQuery]);
 
   // ================= COURSE METRICS (Highest absence / unrecorded this week on top) =================
   const baseCourseStats = useMemo(() => {
@@ -791,13 +799,16 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   }, [courses, attendanceRecords, currentWeek]);
 
   const courseStats = useMemo(() => {
-    if (!normalizedQuery) return baseCourseStats;
-    return baseCourseStats.filter(
-      item =>
-        item.course.title.includes(normalizedQuery) ||
-        item.course.instructorName.includes(normalizedQuery)
-    );
-  }, [baseCourseStats, normalizedQuery]);
+    if (!cleanSearchQuery) return baseCourseStats;
+    return baseCourseStats.filter(item => {
+      const normTitle = normalizeName(item.course.title);
+      const normInstructor = normalizeName(item.course.instructorName);
+      return (
+        normTitle.includes(cleanSearchQuery) ||
+        normInstructor.includes(cleanSearchQuery)
+      );
+    });
+  }, [baseCourseStats, cleanSearchQuery]);
 
   const resetDetailSelection = () => {
     setSelectedStudentId(null);
@@ -1213,15 +1224,15 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto">
-            {(['ders', 'ogrenci', 'egitmen', 'liste_disi', 'audit_log', 'uyumsuzluklar'] as const).map(
+            {(['ders', 'ogrenci', 'koordinator', 'liste_disi', 'audit_log', 'uyumsuzluklar'] as const).map(
               cat => {
                 const label =
                   cat === 'ders'
-                    ? 'ders arat'
+                    ? 'ders ara'
                     : cat === 'ogrenci'
                     ? 'öğrenci arat'
-                    : cat === 'egitmen'
-                    ? 'eğitmen arat'
+                    : cat === 'koordinator'
+                    ? 'koordinatör takip'
                     : cat === 'liste_disi'
                     ? `liste dışı öğrenciler${
                         pendingUnlistedCount > 0 ? ` (${pendingUnlistedCount})` : ''
@@ -1299,14 +1310,14 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               <div>
                 <BookOpen className="h-5 w-5 text-stone-700 mb-4" />
                 <h2 className="font-serif-art text-2xl text-stone-900 group-hover:translate-x-0.5 transition-transform">
-                  ders arat
+                  ders ara
                 </h2>
                 <p className="text-xs text-stone-600 mt-2 leading-relaxed">
-                  çevrim içi ve yüz yüze tüm sınıfları görüntüle; her sınıfın hafta hafta yoklama tablosunu incele.
+                  çevrim içi ve yüz yüze tüm dersleri ve eğitmenleri ara; sınıf veya eğitmen bazında yoklama ve katılım tablolarını incele.
                 </p>
               </div>
               <span className="mt-6 text-xs font-mono-num text-stone-500">
-                {courses.length} ders mevcut →
+                {courses.length} ders · {realInstructorsCount} eğitmen →
               </span>
             </button>
 
@@ -1335,23 +1346,22 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             <button
               type="button"
               onClick={() => {
-                setCategory('egitmen');
+                setCategory('koordinator');
                 resetDetailSelection();
               }}
               className="group flex flex-col justify-between rounded-2xl border border-stone-300/90 bg-white/85 p-5 sm:p-6 text-left hover:border-stone-700 hover:bg-white transition-all cursor-pointer"
             >
               <div>
-                <UserCheck className="h-5 w-5 text-stone-700 mb-4" />
+                <Calendar className="h-5 w-5 text-stone-700 mb-4" />
                 <h2 className="font-serif-art text-2xl text-stone-900 group-hover:translate-x-0.5 transition-transform">
-                  eğitmen arat
+                  koordinatör takip
                 </h2>
                 <p className="text-xs text-stone-600 mt-2 leading-relaxed">
-                  bu hafta yoklama almayan veya ders yapmayan eğitmenler en üstte listelenir. eğitmene tıklayarak sınıfının haftalık katılımını incele.
+                  hafta sonu (cumartesi ve pazar) nöbetçi koordinatör tablosunu incele ve düzenle.
                 </p>
               </div>
               <span className="mt-6 text-xs font-mono-num text-stone-500">
-                {realInstructorsCount} eğitmen kayıtlı
-                {unassignedBosCount > 0 ? ` (${unassignedBosCount} boş ders)` : ''} →
+                aktif dönem: {currentWeek}. hafta tablosu →
               </span>
             </button>
 
@@ -2154,60 +2164,39 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           </div>
 
           {/* Audit Log & Olası Tekrarlar / Kimlik Birleştirme Quick Links at Bottom of Menu */}
-          <div className="pt-2 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                data-testid="sibelius-audit-log-btn"
-                onClick={() => {
-                  setCategory('audit_log');
-                  resetDetailSelection();
-                }}
-                className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
-              >
-                <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
-              </button>
-
-              <button
-                type="button"
-                data-testid="sibelius-duplicates-btn"
-                onClick={() => {
-                  setCategory('uyumsuzluklar');
-                  resetDetailSelection();
-                }}
-                className="inline-flex items-center gap-2 rounded-xl border border-amber-400/90 bg-amber-50/90 px-3.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
-              >
-                <AlertCircle className="h-3.5 w-3.5 text-amber-800" />
-                <span>
-                  olası tekrarlar & kimlik birleştirme ({migrationDryRunReport.groupsToMigrate.length} grup · {migrationDryRunReport.nearDuplicatePairs.length} benzer) →
-                </span>
-              </button>
-            </div>
+          <div className="pt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              data-testid="sibelius-audit-log-btn"
+              onClick={() => {
+                setCategory('audit_log');
+                resetDetailSelection();
+              }}
+              className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
+            >
+              <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
+            </button>
 
             <button
               type="button"
-              data-testid="sibelius-paranoya-panel"
-              onClick={() => setShowParanoyaNames(prev => !prev)}
-              className="inline-flex items-center gap-2 rounded-xl border border-stone-300/70 bg-white/65 px-3 py-1.5 text-[11px] text-stone-500 hover:border-stone-400 hover:text-stone-700 transition-colors cursor-pointer"
+              data-testid="sibelius-duplicates-btn"
+              onClick={() => {
+                setCategory('uyumsuzluklar');
+                resetDetailSelection();
+              }}
+              className="inline-flex items-center gap-2 rounded-xl border border-amber-400/90 bg-amber-50/90 px-3.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
             >
+              <AlertCircle className="h-3.5 w-3.5 text-amber-800" />
               <span>
-                kaydet butonuna ihtiyaç duyan paranoya sayısı:{' '}
-                <strong className="font-mono-num font-medium text-stone-700">
-                  {paranoyaStats.count}
-                </strong>
+                olası tekrarlar & kimlik birleştirme ({migrationDryRunReport.groupsToMigrate.length} grup · {migrationDryRunReport.nearDuplicatePairs.length} benzer) →
               </span>
             </button>
-            {showParanoyaNames && paranoyaStats.names.length > 0 && (
-              <p className="w-full text-[11px] text-stone-500 text-right">
-                aktif edenler: {paranoyaStats.names.join(', ')}
-              </p>
-            )}
           </div>
         </div>
       )}
 
-      {/* Search Bar when inside ders / ogrenci / egitmen list */}
-      {(category === 'ders' || category === 'ogrenci' || category === 'egitmen') &&
+      {/* Search Bar when inside ders / ogrenci list */}
+      {(category === 'ders' || category === 'ogrenci') &&
         !selectedStudentId &&
         !selectedCourseId &&
         !selectedInstructorId && (
@@ -2226,9 +2215,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 placeholder={
                   category === 'ogrenci'
                     ? 'öğrenci adı veya sınıf düzeyi ara...'
-                    : category === 'egitmen'
-                    ? 'eğitmen adı, bos1-bos4 veya ders ara...'
-                    : 'ders adı, sınıf (örn. 6/a) veya eğitmen ara...'
+                    : 'ders adı veya eğitmen adı ara (örn. 5/a matematik, elif, bos1)...'
                 }
                 className="w-full rounded-2xl border border-stone-300 bg-white/95 pl-11 pr-4 py-3.5 text-base sm:text-sm text-stone-900 placeholder:text-stone-400 focus:border-stone-700 focus:outline-none"
               />
@@ -2384,59 +2371,30 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         );
       })()}
 
-      {/* ================= CATEGORY: EĞİTMEN ARAT ================= */}
-      {category === 'egitmen' && !selectedInstructorId && (
-        <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-5">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3 mb-3">
-            <span className="text-xs font-medium text-stone-700">
-              bu hafta ({currentWeek}. hafta) ders yapmayan / yoklama almayan eğitmenler en üstte listelenmektedir
-            </span>
-            <span className="text-xs font-mono-num text-stone-500">
-              {realInstructorsCount} eğitmen{unassignedBosCount > 0 ? ` + ${unassignedBosCount} boş` : ''}
-            </span>
+      {/* ================= CATEGORY: DERS ARA (UNIFIED COURSES + INSTRUCTORS) ================= */}
+      {/* 1. COURSE DETAIL DRILL-DOWN */}
+      {category === 'ders' && selectedCourseId && (() => {
+        const course = courses.find(c => c.id === selectedCourseId);
+        if (!course) return null;
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setSelectedCourseId(null)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300/80 bg-white/80 px-3 py-1.5 text-xs text-stone-600 hover:text-stone-900 hover:bg-white transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                <span>ders ve eğitmen listesine dön</span>
+              </button>
+            </div>
+            {renderCourseMatrix(course)}
           </div>
+        );
+      })()}
 
-          <div className="divide-y divide-stone-200/70">
-            {instructorStats.map(
-              ({ instructor, courses: instCourses, markedDidNotHold, didNotTakeAttendance }) => (
-                <button
-                  key={instructor.id}
-                  type="button"
-                  onClick={() => setSelectedInstructorId(instructor.id)}
-                  className="w-full flex flex-wrap items-center justify-between gap-2 py-3 px-3 rounded-xl hover:bg-stone-100/80 text-left transition-colors cursor-pointer"
-                >
-                  <div>
-                    <span className="text-sm font-medium text-stone-900">
-                      {instructor.name}
-                    </span>
-                    <span className="text-xs text-stone-500 ml-2">
-                      · {instCourses.map(c => c.title).join(', ')}
-                    </span>
-                  </div>
-                  <div className="text-xs">
-                    {markedDidNotHold ? (
-                      <span className="text-amber-700 font-medium">
-                        bu hafta ders yapmadı
-                      </span>
-                    ) : didNotTakeAttendance ? (
-                      <span className="text-rose-700 font-medium">
-                        bu hafta yoklama almadı
-                      </span>
-                    ) : (
-                      <span className="text-emerald-800">
-                        bu hafta yoklama aldı
-                      </span>
-                    )}
-                  </div>
-                </button>
-              )
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* INSTRUCTOR DETAIL VIEW */}
-      {category === 'egitmen' && selectedInstructorId && (() => {
+      {/* 2. INSTRUCTOR DETAIL DRILL-DOWN */}
+      {category === 'ders' && selectedInstructorId && (() => {
         const instructor = instructors.find(i => i.id === selectedInstructorId);
         if (!instructor) return null;
         const instCourses = instructor.courseIds
@@ -2444,66 +2402,156 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           .filter((c): c is Course => Boolean(c));
 
         return (
-          <div>
-            <div className="mb-4">
-              <h2 className="font-serif-art text-3xl text-stone-900">
-                {instructor.name} · sınıf katılım tablosu
-              </h2>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setSelectedInstructorId(null)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300/80 bg-white/80 px-3 py-1.5 text-xs text-stone-600 hover:text-stone-900 hover:bg-white transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                <span>ders ve eğitmen listesine dön</span>
+              </button>
             </div>
-            {instCourses.map(course => renderCourseMatrix(course))}
+            <div className="mb-4">
+              <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900">
+                {instructor.name} · eğitmenin dersleri
+              </h2>
+              <p className="text-xs text-stone-500 mt-1">
+                {instCourses.length} ders tanımlı · haftalık sınıf katılım tabloları
+              </p>
+            </div>
+            {instCourses.length === 0 ? (
+              <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-8 text-center text-xs text-stone-500">
+                bu eğitmene henüz tanımlı ders bulunmuyor.
+              </div>
+            ) : (
+              instCourses.map(course => renderCourseMatrix(course))
+            )}
           </div>
         );
       })()}
 
-      {/* ================= CATEGORY: DERS ARAT ================= */}
-      {category === 'ders' && !selectedCourseId && (
-        <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-5">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3 mb-3">
-            <span className="text-xs font-medium text-stone-700">
-              en çok devamsızlık olan ve yoklaması beklenen dersler en üstte listelenmektedir
-            </span>
-            <span className="text-xs font-mono-num text-stone-500">
-              {courseStats.length} ders
-            </span>
+      {/* 3. UNIFIED DERSLER & EĞİTMENLER LIST */}
+      {category === 'ders' && !selectedCourseId && !selectedInstructorId && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          {/* Group 1: Dersler */}
+          <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-5">
+            <div className="flex items-center justify-between border-b border-stone-200 pb-3 mb-3">
+              <div>
+                <h3 className="font-serif-art text-lg text-stone-900">Dersler</h3>
+                <p className="text-xs text-stone-500">
+                  en çok devamsızlık olan ve yoklaması beklenen dersler
+                </p>
+              </div>
+              <span className="text-xs font-mono-num text-stone-500">
+                {courseStats.length} ders
+              </span>
+            </div>
+
+            {courseStats.length === 0 ? (
+              <div className="py-8 text-center text-xs text-stone-500">
+                arama kriterine uygun ders bulunamadı.
+              </div>
+            ) : (
+              <div className="divide-y divide-stone-200/70 max-h-[600px] overflow-y-auto pr-1">
+                {courseStats.map(({ course, totalAbsences, noAttendanceThisWeek }) => (
+                  <button
+                    key={course.id}
+                    type="button"
+                    onClick={() => setSelectedCourseId(course.id)}
+                    className="w-full flex flex-wrap items-center justify-between gap-2 py-3 px-3 rounded-xl hover:bg-stone-100/80 text-left transition-colors cursor-pointer group"
+                  >
+                    <div>
+                      <span className="text-sm font-medium text-stone-900 group-hover:text-stone-950">
+                        {course.title}
+                      </span>
+                      <span className="text-xs text-stone-500 ml-2">
+                        · eğitmen: {course.instructorName} · {course.studentIds.length} öğrenci
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs font-mono-num">
+                      <span
+                        className={
+                          totalAbsences > 0 ? 'text-rose-700 font-medium' : 'text-stone-500'
+                        }
+                      >
+                        toplam gelmeyen: {totalAbsences}
+                      </span>
+                      <span className="text-stone-400">·</span>
+                      <span
+                        className={
+                          noAttendanceThisWeek ? 'text-amber-700 font-medium' : 'text-emerald-800'
+                        }
+                      >
+                        {noAttendanceThisWeek ? 'bu hafta girilmedi' : 'bu hafta girildi'}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          <div className="divide-y divide-stone-200/70">
-            {courseStats.map(({ course, totalAbsences, noAttendanceThisWeek }) => (
-              <button
-                key={course.id}
-                type="button"
-                onClick={() => setSelectedCourseId(course.id)}
-                className="w-full flex flex-wrap items-center justify-between gap-2 py-3 px-3 rounded-xl hover:bg-stone-100/80 text-left transition-colors cursor-pointer"
-              >
-                <div>
-                  <span className="text-sm font-medium text-stone-900">
-                    {course.title}
-                  </span>
-                  <span className="text-xs text-stone-500 ml-2">
-                    · eğitmen: {course.instructorName} · {course.studentIds.length} öğrenci
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 text-xs font-mono-num">
-                  <span className={totalAbsences > 0 ? 'text-rose-700 font-medium' : 'text-stone-500'}>
-                    toplam gelmeyen: {totalAbsences}
-                  </span>
-                  <span className="text-stone-400">·</span>
-                  <span className={noAttendanceThisWeek ? 'text-amber-700' : 'text-emerald-800'}>
-                    {noAttendanceThisWeek ? 'bu hafta girilmedi' : 'bu hafta girildi'}
-                  </span>
-                </div>
-              </button>
-            ))}
+          {/* Group 2: Eğitmenler */}
+          <div className="rounded-2xl border border-stone-300/80 bg-white/85 p-5">
+            <div className="flex items-center justify-between border-b border-stone-200 pb-3 mb-3">
+              <div>
+                <h3 className="font-serif-art text-lg text-stone-900">Eğitmenler</h3>
+                <p className="text-xs text-stone-500">
+                  bu hafta ({currentWeek}. hafta) ders yapmayan / yoklama almayanlar en üstte
+                </p>
+              </div>
+              <span className="text-xs font-mono-num text-stone-500">
+                {instructorStats.length} eğitmen
+              </span>
+            </div>
+
+            {instructorStats.length === 0 ? (
+              <div className="py-8 text-center text-xs text-stone-500">
+                arama kriterine uygun eğitmen bulunamadı.
+              </div>
+            ) : (
+              <div className="divide-y divide-stone-200/70 max-h-[600px] overflow-y-auto pr-1">
+                {instructorStats.map(
+                  ({ instructor, courses: instCourses, markedDidNotHold, didNotTakeAttendance }) => (
+                    <button
+                      key={instructor.id}
+                      type="button"
+                      onClick={() => setSelectedInstructorId(instructor.id)}
+                      className="w-full flex flex-wrap items-center justify-between gap-2 py-3 px-3 rounded-xl hover:bg-stone-100/80 text-left transition-colors cursor-pointer group"
+                    >
+                      <div>
+                        <span className="text-sm font-medium text-stone-900 group-hover:text-stone-950">
+                          {instructor.name}
+                        </span>
+                        <span className="text-xs text-stone-500 ml-2">
+                          · {instCourses.length > 0 ? instCourses.map(c => c.title).join(', ') : 'ders atanmadı'}
+                        </span>
+                      </div>
+                      <div className="text-xs font-medium">
+                        {markedDidNotHold ? (
+                          <span className="text-amber-700">
+                            bu hafta ders yapmadı
+                          </span>
+                        ) : didNotTakeAttendance ? (
+                          <span className="text-rose-700">
+                            bu hafta yoklama almadı
+                          </span>
+                        ) : (
+                          <span className="text-emerald-800">
+                            bu hafta yoklama aldı
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  )
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
-
-      {/* COURSE DETAIL VIEW */}
-      {category === 'ders' && selectedCourseId && (() => {
-        const course = courses.find(c => c.id === selectedCourseId);
-        if (!course) return null;
-        return renderCourseMatrix(course);
-      })()}
 
       {/* ================= CATEGORY: LİSTE DIŞI ÖĞRENCİLER ================= */}
       {category === 'liste_disi' && (
@@ -2810,6 +2858,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* ================= CATEGORY: KOORDİNATÖR TAKİP ================= */}
+      {category === 'koordinator' && onSaveCoordinator && (
+        <CoordinatorTrackingView
+          currentWeek={currentWeek}
+          instructors={instructors}
+          assignments={coordinatorAssignments}
+          onSaveCoordinator={onSaveCoordinator}
+          onBack={() => {
+            setCategory('menu');
+            resetDetailSelection();
+          }}
+        />
       )}
 
       {/* ================= CATEGORY: İŞLEM GEÇMİŞİ (AUDIT LOG) ================= */}

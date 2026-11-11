@@ -115,6 +115,15 @@ export interface NotDuplicatePairRecord {
   note?: string;
 }
 
+export interface CoordinatorAssignmentRecord {
+  id?: string; // docId: 'w01', 'w02', ...
+  weekNumber: number;
+  saturday: (string | null)[];
+  sunday: (string | null)[];
+  updatedAt: string;
+  updatedAtIso?: string;
+}
+
 // Raw Online Courses from BGM ÇEVRİM İÇİ SINIF LİSTESİ PDF
 interface RawCourseDef {
   id: string;

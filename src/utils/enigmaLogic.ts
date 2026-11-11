@@ -200,6 +200,70 @@ export function buildAttendanceDocId(
 }
 
 /**
+ * Generates document ID for coordinator assignments: "w01", "w02", ..., "w12"
+ */
+export function buildCoordinatorDocId(weekNumber: number): string {
+  return `w${Math.max(1, weekNumber).toString().padStart(2, '0')}`;
+}
+
+/**
+ * Returns formatted weekend dates (Saturday and Sunday) for a given academic week,
+ * calculated strictly from the term start date.
+ */
+export function getWeekWeekendDates(
+  weekNumber: number,
+  termStartIso: string = ACADEMIC_CONFIG.termStartMondayIso
+): {
+  saturdayFormatted: string;
+  sundayFormatted: string;
+  saturdayDayMonth: string;
+  sundayDayMonth: string;
+} {
+  const anchorUtcMs = parseIsoDateToUtcMidnightMs(termStartIso);
+  const weekMondayMs = anchorUtcMs + (weekNumber - 1) * 7 * 24 * 60 * 60 * 1000;
+  const satMs = weekMondayMs + 5 * 24 * 60 * 60 * 1000;
+  const sunMs = weekMondayMs + 6 * 24 * 60 * 60 * 1000;
+
+  const satDate = new Date(satMs);
+  const sunDate = new Date(sunMs);
+
+  const months = [
+    'ocak', 'şubat', 'mart', 'nisan', 'mayıs', 'haziran',
+    'temmuz', 'ağustos', 'eylül', 'ekim', 'kasım', 'aralık'
+  ];
+
+  const satDay = satDate.getUTCDate();
+  const satMonth = months[satDate.getUTCMonth()];
+  const sunDay = sunDate.getUTCDate();
+  const sunMonth = months[sunDate.getUTCMonth()];
+
+  const saturdayDayMonth = `${satDay} ${satMonth}`;
+  const sundayDayMonth = `${sunDay} ${sunMonth}`;
+
+  return {
+    saturdayFormatted: `${saturdayDayMonth} cumartesi`,
+    sundayFormatted: `${sundayDayMonth} pazar`,
+    saturdayDayMonth,
+    sundayDayMonth,
+  };
+}
+
+/**
+ * Converts whitespace-only or empty strings into null for Firestore storage.
+ */
+export function cleanCoordinatorNames(
+  names: Array<string | null | undefined>
+): (string | null)[] {
+  return names.map(n => {
+    if (typeof n === 'string') {
+      const trimmed = n.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    }
+    return null;
+  });
+}
+
+/**
  * KURAL: Öğrenci kimliği = "stu-" + slug(normalizeName(ad))
  */
 export function generatePermanentStudentId(rawName = ''): string {

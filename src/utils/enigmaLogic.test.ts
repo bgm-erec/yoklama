@@ -19,8 +19,11 @@ import {
   isZeroPresentAttendanceRecord,
   getZeroPresentAttendanceRecords,
   buildAttendanceDocId,
+  buildCoordinatorDocId,
+  cleanCoordinatorNames,
   detectConcurrentAttendanceConflict,
   findSimilarStudentsByName,
+  getWeekWeekendDates,
 } from './enigmaLogic';
 import {
   AttendanceRecord,
@@ -1068,5 +1071,72 @@ test('not_duplicates: two devices ignoring the same pair concurrently (even in o
   assert.equal(combined[0].createdAt, '2026-11-10T12:00:01.000Z');
   assert.equal(combined[0].note, 'kardeş öğrenciler');
 });
+
+test('coordinator tracking: buildCoordinatorDocId produces w01, w04, w12 formatted IDs', () => {
+  assert.equal(buildCoordinatorDocId(1), 'w01');
+  assert.equal(buildCoordinatorDocId(4), 'w04');
+  assert.equal(buildCoordinatorDocId(9), 'w09');
+  assert.equal(buildCoordinatorDocId(10), 'w10');
+  assert.equal(buildCoordinatorDocId(12), 'w12');
+});
+
+test('coordinator tracking: getWeekWeekendDates calculates correct Saturday and Sunday dates from term start', () => {
+  // Term start is Monday 2026-10-19
+  // Week 1: Monday Oct 19 -> Saturday Oct 24, Sunday Oct 25
+  const w1 = getWeekWeekendDates(1, '2026-10-19');
+  assert.equal(w1.saturdayDayMonth, '24 ekim');
+  assert.equal(w1.sundayDayMonth, '25 ekim');
+  assert.equal(w1.saturdayFormatted, '24 ekim cumartesi');
+  assert.equal(w1.sundayFormatted, '25 ekim pazar');
+
+  // Week 4: Monday Nov 09 -> Saturday Nov 14, Sunday Nov 15
+  const w4 = getWeekWeekendDates(4, '2026-10-19');
+  assert.equal(w4.saturdayDayMonth, '14 kasım');
+  assert.equal(w4.sundayDayMonth, '15 kasım');
+  assert.equal(w4.saturdayFormatted, '14 kasım cumartesi');
+  assert.equal(w4.sundayFormatted, '15 kasım pazar');
+
+  // Month boundary check: Week 2 (Monday Oct 26 -> Saturday Oct 31, Sunday Nov 1)
+  const w2 = getWeekWeekendDates(2, '2026-10-19');
+  assert.equal(w2.saturdayDayMonth, '31 ekim');
+  assert.equal(w2.sundayDayMonth, '1 kasım');
+});
+
+test('coordinator tracking: cleanCoordinatorNames converts empty and whitespace strings to null', () => {
+  const cleaned = cleanCoordinatorNames([
+    '  dila acarca  ',
+    '',
+    '   ',
+    null,
+    undefined,
+    'sıla acarca',
+  ]);
+  assert.deepEqual(cleaned, [
+    'dila acarca',
+    null,
+    null,
+    null,
+    null,
+    'sıla acarca',
+  ]);
+});
+
+test('coordinator tracking: duplicate detection correctly normalizes Turkish characters and whitespace', () => {
+  // Turkish I / ı and İ / i casing
+  assert.equal(normalizeName('İSMAİL ÇAĞLAR'), normalizeName('ismail çağlar'));
+  assert.equal(normalizeName('IŞIL KOÇ'), normalizeName('ışıl koç'));
+  // Whitespace normalization
+  assert.equal(normalizeName('   ahmet    yılmaz  '), normalizeName('ahmet yılmaz'));
+  // Duplicate comparison in the same cell
+  const slot1 = 'Zeynep  Ören ';
+  const slot2 = 'zeynep ören';
+  assert.equal(normalizeName(slot1), normalizeName(slot2));
+
+  // Distinct persons (e.g. siblings with short names) do NOT trigger same-person equality
+  const sib1 = 'dila acarca';
+  const sib2 = 'sıla acarca';
+  assert.notEqual(normalizeName(sib1), normalizeName(sib2));
+});
+
 
 

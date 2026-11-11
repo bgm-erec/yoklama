@@ -33,6 +33,7 @@ import {
   buildNotDuplicatePairId,
   buildStudentIdFromName,
   canonicalizeAttendanceRecordIds,
+  CoordinatorAssignmentRecord,
   deduplicateNotDuplicatePairs,
   FeedbackItem,
   getCanonicalStudentName,
@@ -54,6 +55,8 @@ import {
 } from './data/database';
 import {
   buildAttendanceDocId,
+  buildCoordinatorDocId,
+  cleanCoordinatorNames,
   createNewStudentRecord,
   detectConcurrentAttendanceConflict,
   findMatchingStudentByFullName,
@@ -187,6 +190,9 @@ export default function App() {
   >([]);
   const [notDuplicatePairs, setNotDuplicatePairs] = useState<
     NotDuplicatePairRecord[]
+  >([]);
+  const [coordinatorAssignments, setCoordinatorAssignments] = useState<
+    CoordinatorAssignmentRecord[]
   >([]);
   const [unlistedReports, setUnlistedReports] = useState<
     UnlistedStudentReport[]
@@ -466,11 +472,44 @@ export default function App() {
       }
     );
 
+    const coordinatorQuery = query(
+      collection(db, 'coordinator_assignments')
+    );
+    const unsubCoord = onSnapshot(
+      coordinatorQuery,
+      { includeMetadataChanges: true },
+      snapshot => {
+        const items: CoordinatorAssignmentRecord[] = [];
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data();
+          items.push({
+            id: docSnap.id,
+            weekNumber:
+              typeof data.weekNumber === 'number'
+                ? data.weekNumber
+                : Number(docSnap.id.replace(/\D/g, '')) || 1,
+            saturday: Array.isArray(data.saturday) ? data.saturday : [],
+            sunday: Array.isArray(data.sunday) ? data.sunday : [],
+            updatedAt: formatFirestoreTimestamp(
+              data.updatedAt,
+              data.updatedAtIso
+            ),
+            updatedAtIso: data.updatedAtIso,
+          });
+        });
+        setCoordinatorAssignments(items);
+      },
+      error => {
+        console.error('coordinator_assignments dinleme hatası:', error);
+      }
+    );
+
     return () => {
       unsubCustom();
       unsubRemoved();
       unsubAssign();
       unsubNotDups();
+      unsubCoord();
     };
   }, []);
 
@@ -1316,6 +1355,98 @@ export default function App() {
         }
       },
     });
+  };
+
+  const handleSaveCoordinatorAssignment = async (
+    weekNumber: number,
+    day: 'saturday' | 'sunday',
+    names: (string | null)[],
+    options?: { debounced?: boolean }
+  ) => {
+    const docId = buildCoordinatorDocId(weekNumber);
+    const cleanNames = cleanCoordinatorNames(names);
+    const nowIso = new Date().toISOString();
+
+    const prevAssignments = [...coordinatorAssignments];
+
+    // Optimistic UI state update
+    setCoordinatorAssignments(prev => {
+      const existing = prev.find(c => c.weekNumber === weekNumber);
+      if (existing) {
+        return prev.map(c =>
+          c.weekNumber === weekNumber
+            ? {
+                ...c,
+                [day]: cleanNames,
+                updatedAt: nowIso,
+                updatedAtIso: nowIso,
+              }
+            : c
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: docId,
+          weekNumber,
+          saturday: day === 'saturday' ? cleanNames : [],
+          sunday: day === 'sunday' ? cleanNames : [],
+          updatedAt: nowIso,
+          updatedAtIso: nowIso,
+        },
+      ];
+    });
+
+    const rollbackFn = () => {
+      setCoordinatorAssignments(prevAssignments);
+    };
+
+    const executeWrite = async () => {
+      try {
+        const docRef = doc(db, 'coordinator_assignments', docId);
+        // Field-based update with merge: true guarantees only the modified day is written, preserving concurrent edits to the other day
+        await setDoc(
+          docRef,
+          {
+            weekNumber,
+            [day]: cleanNames,
+            updatedAt: serverTimestamp(),
+            updatedAtIso: nowIso,
+          },
+          { merge: true }
+        );
+
+        void writeAuditLog({
+          actor: 'sibelius (ekip)',
+          action: 'koordinator_guncelle',
+          target: `${docId}_${day}`,
+          details: `${weekNumber}. hafta ${
+            day === 'saturday' ? 'cumartesi' : 'pazar'
+          } koordinatörleri güncellendi: ${
+            cleanNames.filter(Boolean).join(', ') || 'boş'
+          }.`,
+        });
+      } catch (error) {
+        handleFirestoreError(
+          error,
+          OperationType.WRITE,
+          `coordinator_assignments/${docId}`
+        );
+      }
+    };
+
+    const task = {
+      key: `coordinator_${docId}_${day}`,
+      label: `${weekNumber}. Hafta Koordinatör Kaydı`,
+      execute: executeWrite,
+      rollback: rollbackFn,
+    };
+
+    if (options?.debounced) {
+      writeQueueRef.current!.enqueueDebounced(task);
+    } else {
+      await writeQueueRef.current!.enqueueImmediate(task);
+    }
   };
 
   const handleSaveAttendance = async (
@@ -2728,7 +2859,7 @@ export default function App() {
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
             notDuplicatePairs={notDuplicatePairs}
-            placeboSavePrefs={placeboSavePrefs}
+            coordinatorAssignments={coordinatorAssignments}
             auditLogs={auditLogs}
             onAddStudent={handleAddStudent}
             onRemoveStudent={handleRemoveStudent}
@@ -2745,6 +2876,7 @@ export default function App() {
             onExecuteStudentMigration={handleExecuteStudentMigration}
             canUndoMigration={Boolean(lastMigrationBackup)}
             onUndoMigration={handleUndoStudentMigration}
+            onSaveCoordinator={handleSaveCoordinatorAssignment}
             onResetZeroAttendance={handleResetZeroPresentAttendance}
             onResetAllAttendance={handleResetAllAttendance}
             canUndoAttendanceReset={lastSoftDeletedAttendanceIds.length > 0}

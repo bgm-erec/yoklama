@@ -301,6 +301,30 @@
         }
       },
       "required": ["studentIdA", "studentIdB", "createdAt"]
+    },
+    "CoordinatorAssignment": {
+      "title": "CoordinatorAssignment",
+      "description": "Weekly weekend coordinator duty assignments for Saturday and Sunday.",
+      "type": "object",
+      "properties": {
+        "weekNumber": {
+          "type": "number",
+          "description": "Academic week number"
+        },
+        "saturday": {
+          "type": "array",
+          "description": "Up to 2 coordinator names or nulls assigned for Saturday"
+        },
+        "sunday": {
+          "type": "array",
+          "description": "Up to 2 coordinator names or nulls assigned for Sunday"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Server timestamp or ISO timestamp of last update"
+        }
+      },
+      "required": ["weekNumber", "updatedAt"]
     }
   },
   "firestore": {
@@ -339,6 +363,10 @@
     "/not_duplicates/{pairId}": {
       "schema": "NotDuplicatePair",
       "description": "Collection of ordered student ID pairs marked as distinct people (not duplicates)."
+    },
+    "/coordinator_assignments/{assignmentId}": {
+      "schema": "CoordinatorAssignment",
+      "description": "Collection of weekly coordinator assignments (w01, w02, ...)."
     }
   }
 }

@@ -26,6 +26,11 @@ export const ACADEMIC_CONFIG: AcademicCalendarConfig = {
 };
 
 /**
+ * Standard total semester/term weeks count (used in week selector and coordinator tracking).
+ */
+export const TOTAL_TERM_WEEKS = 12;
+
+/**
  * Offset in milliseconds between trusted server clock and local device clock:
  * trustedTimeMs = Date.now() + serverClockOffsetMs
  */
