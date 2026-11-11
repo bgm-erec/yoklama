@@ -273,6 +273,34 @@
         }
       },
       "required": ["actor", "action", "target", "details", "createdAt"]
+    },
+    "NotDuplicatePair": {
+      "title": "NotDuplicatePair",
+      "description": "Ordered pair of two student IDs permanently marked as distinct people (not duplicates).",
+      "type": "object",
+      "properties": {
+        "studentIdA": {
+          "type": "string",
+          "description": "Lexicographically smaller student ID",
+          "maxLength": 120
+        },
+        "studentIdB": {
+          "type": "string",
+          "description": "Lexicographically larger student ID",
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Server timestamp or ISO timestamp of creation",
+          "maxLength": 64
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional note explaining why these two students are distinct",
+          "maxLength": 500
+        }
+      },
+      "required": ["studentIdA", "studentIdB", "createdAt"]
     }
   },
   "firestore": {
@@ -307,6 +335,10 @@
     "/audit_log/{logId}": {
       "schema": "AuditLog",
       "description": "Audit trail of mutations (who, when, what)."
+    },
+    "/not_duplicates/{pairId}": {
+      "schema": "NotDuplicatePair",
+      "description": "Collection of ordered student ID pairs marked as distinct people (not duplicates)."
     }
   }
 }

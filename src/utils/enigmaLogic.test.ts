@@ -24,11 +24,17 @@ import {
 } from './enigmaLogic';
 import {
   AttendanceRecord,
+  buildNotDuplicatePairId,
   buildStudentIdFromName,
   canonicalizeAttendanceRecordIds,
   DB,
+  deduplicateNotDuplicatePairs,
+  isPairIgnoredAsNotDuplicate,
   isPlaceholderStudentName,
   normalizeName,
+  NotDuplicatePairRecord,
+  reconcileNotDuplicatesOnDelete,
+  reconcileNotDuplicatesOnMerge,
   slugifyTurkish,
   STUDENT_ID_ALIAS_MAP,
   syncDatabaseMutations,
@@ -861,4 +867,206 @@ test('WriteQueueController coalesces rapid clicks into a single write and waits 
   });
   assert.equal(queue.getSnapshot().phase, 'offline');
 });
+
+test('not_duplicates: A-B and B-A produce the exact same ordered document ID (studentIdA__studentIdB) and reject self-pairs', () => {
+  const pairAB = buildNotDuplicatePairId('Dila Acarca', 'Sıla Acarca');
+  const pairBA = buildNotDuplicatePairId('Sıla Acarca', 'Dila Acarca');
+  const pairByIdAB = buildNotDuplicatePairId('stu-dila-acarca', 'stu-sila-acarca');
+  const pairByIdBA = buildNotDuplicatePairId('stu-sila-acarca', 'stu-dila-acarca');
+
+  assert.ok(pairAB && pairBA && pairByIdAB && pairByIdBA);
+  assert.equal(pairAB.id, 'stu-dila-acarca__stu-sila-acarca');
+  assert.equal(pairBA.id, 'stu-dila-acarca__stu-sila-acarca');
+  assert.equal(pairByIdAB.id, 'stu-dila-acarca__stu-sila-acarca');
+  assert.equal(pairByIdBA.id, 'stu-dila-acarca__stu-sila-acarca');
+  assert.equal(pairAB.studentIdA, 'stu-dila-acarca');
+  assert.equal(pairAB.studentIdB, 'stu-sila-acarca');
+  assert.equal(pairBA.studentIdA, 'stu-dila-acarca');
+  assert.equal(pairBA.studentIdB, 'stu-sila-acarca');
+
+  // Exact normalized same name must NEVER be allowed in not_duplicates
+  assert.equal(buildNotDuplicatePairId('Dila Acarca', '  dila   acarca '), null);
+  assert.equal(buildNotDuplicatePairId('stu-dila-acarca', 'stu-dila-acarca'), null);
+});
+
+test('not_duplicates: "dila acarca" and "sıla acarca" trigger similarity warning initially, suppress warning in add/match/report when marked "farklı kişiler", and restore warning when removed', () => {
+  const dila = createNewStudentRecord({
+    rawName: 'Dila Acarca',
+    modality: 'online',
+    gradeLabel: '5. sınıf',
+    enrolledCourseIds: ['online-5a-mat'],
+    currentWeek: 2,
+  });
+  const sila = createNewStudentRecord({
+    rawName: 'Sıla Acarca',
+    modality: 'online',
+    gradeLabel: '5. sınıf',
+    enrolledCourseIds: ['online-5a-mat'],
+    currentWeek: 2,
+  });
+
+  // 1. Before ignoring: adding "sıla acarca" while "dila acarca" is registered triggers similarity warning
+  const beforeIgnoreSimilar = findSimilarStudentsByName('Sıla Acarca', [dila], []);
+  assert.equal(beforeIgnoreSimilar.length, 1);
+  assert.equal(beforeIgnoreSimilar[0].student.id, 'stu-dila-acarca');
+
+  // Also in dry-run migration report before ignoring: pair appears in nearDuplicatePairs and NOT in groupsToMigrate
+  const reportBefore = buildMigrationDryRunReport({
+    baseStudents: [],
+    customStudents: [dila, sila],
+    unlistedReports: [],
+    attendanceRecords: [],
+    notDuplicatePairs: [],
+  });
+  assert.equal(reportBefore.groupsToMigrate.length, 0);
+  assert.ok(
+    reportBefore.nearDuplicatePairs.some(
+      p => p.notDuplicatePairId === 'stu-dila-acarca__stu-sila-acarca'
+    )
+  );
+
+  // 2. Mark as "farklı kişiler" (not_duplicates)
+  const pairInfo = buildNotDuplicatePairId(dila.id, sila.id)!;
+  const ignoreList: NotDuplicatePairRecord[] = [
+    {
+      id: pairInfo.id,
+      studentIdA: pairInfo.studentIdA,
+      studentIdB: pairInfo.studentIdB,
+      createdAt: '2026-11-10T10:00:00.000Z',
+      note: 'dila acarca — sıla acarca',
+    },
+  ];
+
+  assert.equal(isPairIgnoredAsNotDuplicate('dila acarca', 'sıla acarca', ignoreList), true);
+  assert.equal(isPairIgnoredAsNotDuplicate('sıla acarca', 'dila acarca', ignoreList), true);
+
+  // Re-adding or matching unlisted student -> NO warning
+  const afterIgnoreSimilar = findSimilarStudentsByName(
+    'Sıla Acarca',
+    [dila],
+    ignoreList
+  );
+  assert.equal(afterIgnoreSimilar.length, 0);
+
+  // Running dry-run migration report -> NO warning in nearDuplicatePairs
+  const reportAfter = buildMigrationDryRunReport({
+    baseStudents: [],
+    customStudents: [dila, sila],
+    unlistedReports: [],
+    attendanceRecords: [],
+    notDuplicatePairs: ignoreList,
+  });
+  assert.equal(
+    reportAfter.nearDuplicatePairs.some(
+      p => p.notDuplicatePairId === 'stu-dila-acarca__stu-sila-acarca'
+    ),
+    false
+  );
+
+  // 3. Remove from ignore list ("Yoksaymayı kaldır") -> warning appears again!
+  const afterRemoveIgnoreSimilar = findSimilarStudentsByName(
+    'Sıla Acarca',
+    [dila],
+    []
+  );
+  assert.equal(afterRemoveIgnoreSimilar.length, 1);
+  assert.equal(afterRemoveIgnoreSimilar[0].student.id, 'stu-dila-acarca');
+});
+
+test('not_duplicates: merging an ignored student into another student migrates not_duplicates records to the primary ID and deletes self-pairs, and deleting a student cleans up their records', () => {
+  // Suppose stu-dila-acarca is ignored against stu-sila-acarca AND stu-ela-acarca
+  const initialPairs: NotDuplicatePairRecord[] = [
+    {
+      id: 'stu-dila-acarca__stu-sila-acarca',
+      studentIdA: 'stu-dila-acarca',
+      studentIdB: 'stu-sila-acarca',
+      createdAt: '2026-11-10T10:00:00.000Z',
+      note: 'dila acarca — sıla acarca',
+    },
+    {
+      id: 'stu-dila-acarca__stu-ela-acarca',
+      studentIdA: 'stu-dila-acarca',
+      studentIdB: 'stu-ela-acarca',
+      createdAt: '2026-11-10T10:05:00.000Z',
+      note: 'dila acarca — ela acarca',
+    },
+  ];
+
+  // Case A: stu-dila-acarca is merged into stu-dila-nur-acarca
+  const mergedIntoThird = reconcileNotDuplicatesOnMerge(
+    initialPairs,
+    'stu-dila-acarca',
+    'stu-dila-nur-acarca',
+    '2026-11-10T11:00:00.000Z'
+  );
+
+  // Old records with stu-dila-acarca are scheduled for deletion
+  assert.deepEqual(mergedIntoThird.toDeleteIds.sort(), [
+    'stu-dila-acarca__stu-ela-acarca',
+    'stu-dila-acarca__stu-sila-acarca',
+  ]);
+
+  // New records transferred to stu-dila-nur-acarca in canonical sorted order
+  assert.deepEqual(
+    mergedIntoThird.nextPairs.map(p => p.id).sort(),
+    [
+      'stu-dila-nur-acarca__stu-ela-acarca',
+      'stu-dila-nur-acarca__stu-sila-acarca',
+    ]
+  );
+
+  // Case B: If stu-dila-acarca and stu-sila-acarca themselves are merged as the same person,
+  // their mutual pair stu-dila-acarca__stu-sila-acarca is deleted (self-pair eliminated) while stu-ela-acarca is migrated!
+  const mergedSelf = reconcileNotDuplicatesOnMerge(
+    initialPairs,
+    'stu-dila-acarca',
+    'stu-sila-acarca',
+    '2026-11-10T11:10:00.000Z'
+  );
+  assert.equal(
+    mergedSelf.nextPairs.some(
+      p => p.studentIdA === p.studentIdB || p.id.includes('stu-dila-acarca')
+    ),
+    false
+  );
+  assert.deepEqual(
+    mergedSelf.nextPairs.map(p => p.id),
+    ['stu-ela-acarca__stu-sila-acarca']
+  );
+
+  // Case C: Deleting a student cleans up all not_duplicates records containing that student
+  const afterDelete = reconcileNotDuplicatesOnDelete(
+    mergedSelf.nextPairs,
+    'stu-sila-acarca'
+  );
+  assert.equal(afterDelete.nextPairs.length, 0);
+  assert.deepEqual(afterDelete.toDeleteIds, ['stu-ela-acarca__stu-sila-acarca']);
+});
+
+test('not_duplicates: two devices ignoring the same pair concurrently (even in opposite A-B / B-A order) converge to a single document', () => {
+  const device1 = buildNotDuplicatePairId('stu-dila-acarca', 'stu-sila-acarca')!;
+  const device2 = buildNotDuplicatePairId('stu-sila-acarca', 'stu-dila-acarca')!;
+
+  const combined = deduplicateNotDuplicatePairs([
+    {
+      id: device1.id,
+      studentIdA: device1.studentIdA,
+      studentIdB: device1.studentIdB,
+      createdAt: '2026-11-10T12:00:05.000Z',
+    },
+    {
+      id: device2.id,
+      studentIdA: device2.studentIdA,
+      studentIdB: device2.studentIdB,
+      createdAt: '2026-11-10T12:00:01.000Z',
+      note: 'kardeş öğrenciler',
+    },
+  ]);
+
+  assert.equal(combined.length, 1);
+  assert.equal(combined[0].id, 'stu-dila-acarca__stu-sila-acarca');
+  assert.equal(combined[0].createdAt, '2026-11-10T12:00:01.000Z');
+  assert.equal(combined[0].note, 'kardeş öğrenciler');
+});
+
 

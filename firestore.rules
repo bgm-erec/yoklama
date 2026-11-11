@@ -126,6 +126,17 @@ service cloud.firestore {
         && isValidOptionalTimeField(data, 'createdAtIso');
     }
 
+    function isValidNotDuplicatePair(data) {
+      return data.keys().hasAll(['studentIdA', 'studentIdB', 'createdAt'])
+        && data.keys().hasOnly(['studentIdA', 'studentIdB', 'createdAt', 'createdAtIso', 'note'])
+        && data.studentIdA is string && data.studentIdA.size() >= 1 && data.studentIdA.size() <= 120
+        && data.studentIdB is string && data.studentIdB.size() >= 1 && data.studentIdB.size() <= 120
+        && data.studentIdA < data.studentIdB
+        && isValidTimeField(data.createdAt)
+        && isValidOptionalTimeField(data, 'createdAtIso')
+        && (!('note' in data) || data.note == null || (data.note is string && data.note.size() <= 500));
+    }
+
     match /test/connection {
       allow get: if true;
     }
@@ -188,6 +199,15 @@ service cloud.firestore {
       allow list: if resource.data.createdAtIso >= '2020-01-01';
       allow create: if isValidId(logId) && isValidAuditLog(incoming());
       allow update, delete: if false;
+    }
+
+    match /not_duplicates/{pairId} {
+      allow get: if isValidId(pairId);
+      allow list: if resource.data.studentIdA >= '';
+      allow create, update: if isValidId(pairId)
+        && isValidNotDuplicatePair(incoming())
+        && pairId == incoming().studentIdA + '__' + incoming().studentIdB;
+      allow delete: if isValidId(pairId);
     }
   }
 }

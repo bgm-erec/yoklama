@@ -21,6 +21,7 @@ import {
   AttendanceRecord,
   AuditLogEntry,
   BASE_DB,
+  buildStudentIdFromName,
   Course,
   DATA_DISCREPANCIES,
   getCanonicalStudentName,
@@ -29,6 +30,7 @@ import {
   Modality,
   normalizeName,
   normalizeTurkish,
+  NotDuplicatePairRecord,
   PlaceboSavePreferenceRecord,
   slugifyTurkish,
   Student,
@@ -57,6 +59,7 @@ interface AdminSibeliusViewProps {
   instructors: Instructor[];
   attendanceRecords: AttendanceRecord[];
   unlistedReports: UnlistedStudentReport[];
+  notDuplicatePairs?: NotDuplicatePairRecord[];
   placeboSavePrefs?: PlaceboSavePreferenceRecord[];
   auditLogs?: AuditLogEntry[];
   onAddStudent: (student: Student) => Promise<void>;
@@ -72,6 +75,16 @@ interface AdminSibeliusViewProps {
   ) => Promise<string>;
   onMarkTemporaryUnlistedStudent: (report: UnlistedStudentReport) => Promise<string>;
   onDeleteUnlistedReport: (reportId: string) => Promise<void>;
+  onMarkNotDuplicatePairs?: (
+    pairs: Array<{ studentId1: string; studentId2: string; note?: string }>
+  ) => Promise<string[]>;
+  onRemoveNotDuplicatePair?: (pairId: string) => Promise<void>;
+  canUndoNotDuplicate?: boolean;
+  onUndoLastNotDuplicate?: () => Promise<void>;
+  onReconcileNotDuplicatesOnMerge?: (
+    fromStudentId: string,
+    intoStudentId: string
+  ) => Promise<void>;
   onDownloadMigrationBackup?: () => void;
   onExecuteStudentMigration?: (resolutions: MigrationUserResolutions) => Promise<string>;
   canUndoMigration?: boolean;
@@ -134,6 +147,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   instructors,
   attendanceRecords: rawAttendanceRecords,
   unlistedReports: rawUnlistedReports,
+  notDuplicatePairs = [],
   placeboSavePrefs = [],
   auditLogs = [],
   onAddStudent,
@@ -142,6 +156,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onEnrollUnlistedStudent,
   onMarkTemporaryUnlistedStudent,
   onDeleteUnlistedReport,
+  onMarkNotDuplicatePairs,
+  onRemoveNotDuplicatePair,
+  canUndoNotDuplicate,
+  onUndoLastNotDuplicate,
+  onReconcileNotDuplicatesOnMerge,
   onDownloadMigrationBackup,
   onExecuteStudentMigration,
   canUndoMigration,
@@ -177,6 +196,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [confirmingFeedbackReset, setConfirmingFeedbackReset] = useState(false);
   const [feedbackResetConfirmText, setFeedbackResetConfirmText] = useState('');
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [showUndoIgnoreInNotice, setShowUndoIgnoreInNotice] = useState(false);
 
   // Add / Remove Student Panel states
   const [activeStudentPanel, setActiveStudentPanel] = useState<'none' | 'add' | 'remove'>('none');
@@ -329,9 +349,37 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     }
   }, [availableCoursesForInstructorAssign, assignTargetCourseId]);
 
-  const showTemporaryNotice = (msg: string) => {
+  const showTemporaryNotice = (msg: string, withUndoIgnore = false) => {
     setActionNotice(msg);
-    setTimeout(() => setActionNotice(null), 4000);
+    setShowUndoIgnoreInNotice(withUndoIgnore);
+    setTimeout(() => {
+      setActionNotice(null);
+      setShowUndoIgnoreInNotice(false);
+    }, 5500);
+  };
+
+  const resolveStudentDisplayNameById = (
+    studentId: string,
+    fallbackNote?: string
+  ): string => {
+    const matchActive = students.find(
+      s => s.id === studentId || buildStudentIdFromName(s.name) === studentId
+    );
+    if (matchActive) return matchActive.name;
+    const matchCustom = rawCustomStudents.find(
+      s => s.id === studentId || buildStudentIdFromName(s.name) === studentId
+    );
+    if (matchCustom) return matchCustom.name;
+    const matchBase = BASE_DB.students.find(
+      s => s.id === studentId || buildStudentIdFromName(s.name) === studentId
+    );
+    if (matchBase) return matchBase.name;
+    const matchUnlisted = unlistedReports.find(
+      u => buildStudentIdFromName(u.studentName) === studentId
+    );
+    if (matchUnlisted) return matchUnlisted.studentName;
+    if (fallbackNote) return fallbackNote;
+    return studentId.replace(/^stu-/, '').replace(/-/g, ' ');
   };
 
   const migrationDryRunReport = useMemo(
@@ -343,6 +391,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           unlistedReports: rawUnlistedReports,
           attendanceRecords: rawAttendanceRecords,
           courses,
+          notDuplicatePairs,
         },
         migrationResolutions
       ),
@@ -351,6 +400,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       rawUnlistedReports,
       rawAttendanceRecords,
       courses,
+      notDuplicatePairs,
       migrationResolutions,
       rescanCounter,
     ]
@@ -360,7 +410,8 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     cleanName: string,
     modality: Modality,
     gradeLabel: string,
-    enrolledCourseIds: string[]
+    enrolledCourseIds: string[],
+    withUndoIgnore = false
   ) => {
     const newStudent = createNewStudentRecord({
       rawName: cleanName,
@@ -377,7 +428,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     setPendingTypoAddCandidates(null);
     setActiveStudentPanel('none');
     showTemporaryNotice(
-      `${newStudent.name} sisteme eklendi (${currentWeek}. haftadan itibaren değerlendirmeye alındı).`
+      withUndoIgnore
+        ? `"${newStudent.name}" farklı kişi olarak işaretlendi ve ayrı öğrenci olarak sisteme eklendi.`
+        : `${newStudent.name} sisteme eklendi (${currentWeek}. haftadan itibaren değerlendirmeye alındı).`,
+      withUndoIgnore
     );
   };
 
@@ -445,7 +499,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
 
     setAddFormError(null);
 
-    // 1. Check exact normalized name match across existing students (Requirement 2)
+    // 1. Check exact normalized name match across existing students (Requirement 2 & 3)
     const existingMatch = findMatchingStudentByFullName(cleanName, students);
     if (existingMatch) {
       setPendingTypoAddCandidates(null);
@@ -456,8 +510,12 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       return;
     }
 
-    // 2. Check similar names / typos ("Şunu mu demek istedin: <ad>?")
-    const similar = findSimilarStudentsByName(cleanName, students);
+    // 2. Check similar names / typos ("Şunu mu demek istedin: <ad>?") filtered by notDuplicatePairs
+    const similar = findSimilarStudentsByName(
+      cleanName,
+      students,
+      notDuplicatePairs
+    );
     if (similar.length > 0) {
       setPendingDuplicateAddConfirm(null);
       setPendingTypoAddCandidates({
@@ -1195,11 +1253,34 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
         )}
       </div>
 
-      {/* Temporary Action Notice Banner */}
+      {/* Temporary Action Notice Banner with Optional "geri al" Undo Button */}
       {actionNotice && (
-        <div className="mb-6 flex items-center gap-2 rounded-xl bg-emerald-50 border border-emerald-200 px-4 py-2.5 text-xs text-emerald-900">
-          <Check className="h-4 w-4 text-emerald-700 shrink-0" />
-          <span>{actionNotice}</span>
+        <div
+          data-testid="admin-action-notice-banner"
+          className="mb-6 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-emerald-50 border border-emerald-200 px-4 py-2.5 text-xs text-emerald-900"
+        >
+          <div className="flex items-center gap-2">
+            <Check className="h-4 w-4 text-emerald-700 shrink-0" />
+            <span>{actionNotice}</span>
+          </div>
+          {(showUndoIgnoreInNotice || canUndoNotDuplicate) &&
+            onUndoLastNotDuplicate && (
+              <button
+                type="button"
+                data-testid="admin-undo-not-duplicate-btn"
+                onClick={async () => {
+                  await onUndoLastNotDuplicate();
+                  showTemporaryNotice(
+                    'Benzer isim yoksayma işlemi geri alındı.',
+                    false
+                  );
+                }}
+                className="inline-flex items-center gap-1 rounded-lg border border-amber-400 bg-amber-50 px-2.5 py-1 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer shrink-0"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>geri al</span>
+              </button>
+            )}
         </div>
       )}
 
@@ -1599,28 +1680,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   </div>
                 )}
 
-                {/* Typo / Similar Student Prompt: "Şunu mu demek istedin: <ad>?" (Requirement 2) */}
+                {/* Typo / Similar Student Prompt: "Şunu mu demek istedin: <ad>?" with 3 Options */}
                 {pendingTypoAddCandidates && (
                   <div
                     data-testid="admin-typo-student-prompt"
-                    className="rounded-xl border border-amber-300 bg-amber-50/95 p-4 space-y-2.5 text-xs"
+                    className="rounded-xl border border-amber-300 bg-amber-50/95 p-4 space-y-3 text-xs"
                   >
                     <p className="font-medium text-amber-950">
                       yazım benzerliği uyarısı — şunu mu demek istedin?
                     </p>
-                    <div className="space-y-1.5">
+                    <div className="space-y-2">
                       {pendingTypoAddCandidates.candidates.map(cand => (
-                        <button
+                        <div
                           key={cand.student.id}
-                          type="button"
-                          onClick={() => {
-                            setPendingTypoAddCandidates(null);
-                            setPendingDuplicateAddConfirm({
-                              existingStudent: cand.student,
-                              newCourseIds: pendingTypoAddCandidates.newCourseIds,
-                            });
-                          }}
-                          className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-left text-xs text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                          className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs text-stone-900"
                         >
                           <span>
                             şunu mu demek istedin: <strong>{cand.student.name}</strong> (
@@ -1630,33 +1703,70 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                               .join(', ')}
                             )?
                           </span>
-                          <span className="text-[11px] font-medium text-amber-900 shrink-0">
-                            bu öğrenciyi seç →
-                          </span>
-                        </button>
+                          <button
+                            type="button"
+                            data-testid={`admin-typo-merge-${cand.student.id}`}
+                            onClick={async () => {
+                              const typedId = buildStudentIdFromName(
+                                pendingTypoAddCandidates.typedName
+                              );
+                              if (onReconcileNotDuplicatesOnMerge) {
+                                await onReconcileNotDuplicatesOnMerge(
+                                  typedId,
+                                  cand.student.id
+                                );
+                              }
+                              await handleConfirmMergeExistingOnAdd(
+                                cand.student,
+                                pendingTypoAddCandidates.newCourseIds
+                              );
+                            }}
+                            className="rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-stone-100 hover:bg-stone-800 shrink-0 cursor-pointer"
+                          >
+                            Aynı kişi, birleştir
+                          </button>
+                        </div>
                       ))}
                     </div>
                     <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
                       <button
                         type="button"
-                        onClick={() =>
-                          void executeCreateNewStudentRecord(
-                            pendingTypoAddCandidates.typedName,
-                            pendingTypoAddCandidates.modality,
-                            pendingTypoAddCandidates.gradeLabel,
-                            pendingTypoAddCandidates.newCourseIds
-                          )
-                        }
-                        className="rounded-xl border border-stone-300 bg-white px-3.5 py-2 text-xs text-stone-700 hover:bg-stone-100 cursor-pointer"
+                        data-testid="admin-typo-not-duplicate-btn"
+                        onClick={async () => {
+                          const typedName = pendingTypoAddCandidates.typedName;
+                          const typedId = buildStudentIdFromName(typedName);
+                          const cands = pendingTypoAddCandidates.candidates;
+                          const mod = pendingTypoAddCandidates.modality;
+                          const gr = pendingTypoAddCandidates.gradeLabel;
+                          const cIds = pendingTypoAddCandidates.newCourseIds;
+                          if (onMarkNotDuplicatePairs) {
+                            await onMarkNotDuplicatePairs(
+                              cands.map(c => ({
+                                studentId1: typedId,
+                                studentId2: c.student.id,
+                                note: `${typedName} — ${c.student.name}`,
+                              }))
+                            );
+                          }
+                          await executeCreateNewStudentRecord(
+                            typedName,
+                            mod,
+                            gr,
+                            cIds,
+                            true
+                          );
+                        }}
+                        className="rounded-xl border border-stone-300 bg-white px-3.5 py-2 text-xs font-medium text-stone-800 hover:bg-stone-100 cursor-pointer"
                       >
-                        hayır, "{pendingTypoAddCandidates.typedName}" farklı bir öğrenci (yeni kayıt aç)
+                        Farklı kişiler, bir daha sorma
                       </button>
                       <button
                         type="button"
+                        data-testid="admin-typo-cancel-btn"
                         onClick={() => setPendingTypoAddCandidates(null)}
-                        className="text-xs text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                        className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs text-stone-600 hover:text-stone-900 cursor-pointer"
                       >
-                        vazgeç
+                        İptal
                       </button>
                     </div>
                   </div>
@@ -2534,7 +2644,8 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                               if (!existingStudent) {
                                 const similar = findSimilarStudentsByName(
                                   report.studentName,
-                                  students
+                                  students,
+                                  notDuplicatePairs
                                 );
                                 if (similar.length > 0) {
                                   setPendingUnlistedConfirm(null);
@@ -2615,25 +2726,17 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                           </div>
                         )}
 
-                        {/* Typo warning for unlisted student enrollment */}
+                        {/* Typo warning for unlisted student enrollment with 3 Options */}
                         {pendingUnlistedTypo?.reportId === report.id && (
-                          <div className="rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2">
+                          <div className="rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2.5">
                             <p className="font-medium text-amber-950">
                               şunu mu demek istedin? (benzer isimli kayıtlı öğrenci bulundu):
                             </p>
-                            <div className="space-y-1.5">
+                            <div className="space-y-2">
                               {pendingUnlistedTypo.candidates.map(cand => (
-                                <button
+                                <div
                                   key={cand.student.id}
-                                  type="button"
-                                  onClick={() => {
-                                    setPendingUnlistedTypo(null);
-                                    setPendingUnlistedConfirm({
-                                      reportId: report.id,
-                                      existingStudent: cand.student,
-                                    });
-                                  }}
-                                  className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 text-left text-[11px] text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                                  className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-2 text-[11px] text-stone-900"
                                 >
                                   <span>
                                     şunu mu demek istedin: <strong>{cand.student.name}</strong> (
@@ -2643,30 +2746,59 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                                       .join(', ')}
                                     )?
                                   </span>
-                                  <span className="text-[10px] font-medium text-amber-900 shrink-0">
-                                    bu öğrenciyi seç →
-                                  </span>
-                                </button>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      const unlistedId = buildStudentIdFromName(report.studentName);
+                                      if (onReconcileNotDuplicatesOnMerge) {
+                                        await onReconcileNotDuplicatesOnMerge(
+                                          unlistedId,
+                                          cand.student.id
+                                        );
+                                      }
+                                      setPendingUnlistedTypo(null);
+                                      const msg = await onEnrollUnlistedStudent(
+                                        report,
+                                        cand.student.name
+                                      );
+                                      showTemporaryNotice(msg);
+                                    }}
+                                    className="rounded-lg bg-stone-900 px-2.5 py-1 text-[11px] font-medium text-stone-100 hover:bg-stone-800 shrink-0 cursor-pointer"
+                                  >
+                                    Aynı kişi, birleştir
+                                  </button>
+                                </div>
                               ))}
                             </div>
                             <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
                               <button
                                 type="button"
                                 onClick={async () => {
+                                  const unlistedId = buildStudentIdFromName(report.studentName);
+                                  const cands = pendingUnlistedTypo.candidates;
+                                  if (onMarkNotDuplicatePairs) {
+                                    await onMarkNotDuplicatePairs(
+                                      cands.map(c => ({
+                                        studentId1: unlistedId,
+                                        studentId2: c.student.id,
+                                        note: `${report.studentName} — ${c.student.name}`,
+                                      }))
+                                    );
+                                  }
                                   setPendingUnlistedTypo(null);
                                   const msg = await onEnrollUnlistedStudent(report);
-                                  showTemporaryNotice(msg);
+                                  showTemporaryNotice(msg, true);
                                 }}
-                                className="rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-[11px] text-stone-700 hover:bg-stone-100 cursor-pointer"
+                                className="rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-[11px] font-medium text-stone-800 hover:bg-stone-100 cursor-pointer"
                               >
-                                hayır, "{report.studentName}" olarak yeni öğrenci kaydı oluştur
+                                Farklı kişiler, bir daha sorma
                               </button>
                               <button
                                 type="button"
                                 onClick={() => setPendingUnlistedTypo(null)}
-                                className="text-[11px] text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                                className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-[11px] text-stone-600 hover:text-stone-900 cursor-pointer"
                               >
-                                vazgeç
+                                İptal
                               </button>
                             </div>
                           </div>
@@ -3021,36 +3153,73 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               </div>
             )}
 
-            {/* Near-Duplicate / Typo Pairs Report ("Olası Tekrarlar" — Never Auto-Merged) */}
-            <div className="pt-4 border-t border-stone-200 space-y-3">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-600">
-                yazım hatası / benzer isim uyarıları (otomatik birleştirilmez · kullanıcı seçimine bağlı: {migrationDryRunReport.nearDuplicatePairs.length})
-              </h3>
+            {/* Near-Duplicate / Similar Names Report ("Benzer İsimler" — Never Auto-Merged) */}
+            <div
+              data-testid="near-duplicate-pairs-section"
+              className="pt-4 border-t border-stone-200 space-y-3"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-600">
+                  benzer isimler · olası tekrar uyarıları (otomatik birleştirilmez: {migrationDryRunReport.nearDuplicatePairs.length})
+                </h3>
+                {migrationDryRunReport.nearDuplicatePairs.length > 0 &&
+                  onMarkNotDuplicatePairs && (
+                    <button
+                      type="button"
+                      data-testid="bulk-ignore-near-duplicates-btn"
+                      onClick={async () => {
+                        const pairsToIgnore =
+                          migrationDryRunReport.nearDuplicatePairs.map(p => ({
+                            studentId1: p.studentA.id,
+                            studentId2: p.studentB.id,
+                            note: `${p.studentA.name} — ${p.studentB.name}`,
+                          }));
+                        await onMarkNotDuplicatePairs(pairsToIgnore);
+                        showTemporaryNotice(
+                          `${pairsToIgnore.length} benzer isim çifti "farklı kişiler" olarak işaretlendi ve rapordan çıkarıldı.`,
+                          true
+                        );
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300 bg-[#faf8f4] px-3 py-1.5 text-[11px] font-medium text-stone-800 hover:border-stone-600 hover:bg-white transition-colors cursor-pointer"
+                    >
+                      <span>Tüm benzer çiftleri farklı kişiler olarak yoksay</span>
+                    </button>
+                  )}
+              </div>
+
               {migrationDryRunReport.nearDuplicatePairs.length === 0 ? (
                 <p className="text-xs text-stone-500">
-                  benzer isimli öğrenci çifti bulunmadı.
+                  bekleyen benzer isimli öğrenci çifti bulunmadı.
                 </p>
               ) : (
                 <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
                   {migrationDryRunReport.nearDuplicatePairs.map(pair => (
                     <div
                       key={pair.pairKey}
+                      data-testid={`near-duplicate-pair-${pair.notDuplicatePairId}`}
                       className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-xl border border-stone-200 bg-white p-3 text-xs"
                     >
                       <div>
                         <div className="font-medium text-stone-900">
-                          1) <strong>{pair.studentA.name}</strong> ({pair.studentA.grade} · [{pair.studentA.enrolledCourseIds.join(', ')}])
-                          {' ↔ '}
-                          2) <strong>{pair.studentB.name}</strong> ({pair.studentB.grade} · [{pair.studentB.enrolledCourseIds.join(', ')}])
+                          <strong>{pair.studentA.name}</strong> ({pair.studentA.grade} · [{pair.studentA.enrolledCourseIds.join(', ')}])
+                          {' — '}
+                          <strong>{pair.studentB.name}</strong> ({pair.studentB.grade} · [{pair.studentB.enrolledCourseIds.join(', ')}])
                         </div>
                         <div className="text-[11px] text-stone-500 mt-0.5">
-                          tespit nedeni: {pair.reason}
+                          tespit nedeni: {pair.reason} · çift id: <code className="font-mono-num">{pair.notDuplicatePairId}</code>
                         </div>
                       </div>
-                      <div className="flex items-center gap-1.5 shrink-0">
+                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                         <button
                           type="button"
-                          onClick={() =>
+                          data-testid={`merge-pair-btn-${pair.notDuplicatePairId}`}
+                          onClick={async () => {
+                            if (onReconcileNotDuplicatesOnMerge) {
+                              await onReconcileNotDuplicatesOnMerge(
+                                pair.studentB.id,
+                                pair.studentA.id
+                              );
+                            }
                             setMigrationResolutions(prev => ({
                               ...prev,
                               confirmedTypoMerges: [
@@ -3060,33 +3229,134 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                                   intoStudentId: pair.studentA.id,
                                 },
                               ],
-                            }))
-                          }
-                          className="rounded-lg border border-stone-300 bg-[#faf8f4] px-2.5 py-1 text-[11px] text-stone-800 hover:bg-stone-200/70 cursor-pointer"
+                            }));
+                            showTemporaryNotice(
+                              `"${pair.studentB.name}" → "${pair.studentA.name}" birleştirme listesine eklendi (Adım C ile uygulayabilirsin).`
+                            );
+                          }}
+                          className="rounded-lg bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-100 hover:bg-stone-800 cursor-pointer"
                         >
-                          "{pair.studentA.name}" altında birleştir
+                          Aynı kişi, birleştir
                         </button>
                         <button
                           type="button"
+                          data-testid={`ignore-pair-btn-${pair.notDuplicatePairId}`}
+                          onClick={async () => {
+                            if (onMarkNotDuplicatePairs) {
+                              await onMarkNotDuplicatePairs([
+                                {
+                                  studentId1: pair.studentA.id,
+                                  studentId2: pair.studentB.id,
+                                  note: `${pair.studentA.name} — ${pair.studentB.name}`,
+                                },
+                              ]);
+                              showTemporaryNotice(
+                                `"${pair.studentA.name} — ${pair.studentB.name}" çifti farklı kişiler olarak işaretlendi.`,
+                                true
+                              );
+                            }
+                          }}
+                          className="rounded-lg border border-stone-300 bg-[#faf8f4] px-2.5 py-1.5 text-[11px] font-medium text-stone-800 hover:bg-stone-200/70 cursor-pointer"
+                        >
+                          Farklı kişiler, bir daha sorma
+                        </button>
+                        <button
+                          type="button"
+                          data-testid={`cancel-pair-btn-${pair.notDuplicatePairId}`}
                           onClick={() =>
                             setMigrationResolutions(prev => ({
                               ...prev,
-                              confirmedTypoMerges: [
-                                ...(prev.confirmedTypoMerges || []),
-                                {
-                                  fromStudentId: pair.studentA.id,
-                                  intoStudentId: pair.studentB.id,
-                                },
-                              ],
+                              confirmedTypoMerges: (
+                                prev.confirmedTypoMerges || []
+                              ).filter(
+                                m =>
+                                  !(
+                                    (m.fromStudentId === pair.studentA.id &&
+                                      m.intoStudentId === pair.studentB.id) ||
+                                    (m.fromStudentId === pair.studentB.id &&
+                                      m.intoStudentId === pair.studentA.id)
+                                  )
+                              ),
                             }))
                           }
-                          className="rounded-lg border border-stone-300 bg-[#faf8f4] px-2.5 py-1 text-[11px] text-stone-800 hover:bg-stone-200/70 cursor-pointer"
+                          className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-[11px] text-stone-600 hover:text-stone-900 cursor-pointer"
                         >
-                          "{pair.studentB.name}" altında birleştir
+                          İptal
                         </button>
                       </div>
                     </div>
                   ))}
+                </div>
+              )}
+            </div>
+
+            {/* Requirement 4: Admin Management Screen — "Farklı kişi olarak işaretlenen çiftler" */}
+            <div
+              data-testid="not-duplicates-management-list"
+              className="pt-4 border-t border-stone-200 space-y-3"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-600">
+                    Farklı kişi olarak işaretlenen çiftler ({notDuplicatePairs.length})
+                  </h3>
+                  <p className="text-[11px] text-stone-500 mt-0.5">
+                    bu listedeki öğrenci çiftleri için öğrenci eklerken, liste dışı eşleştirirken veya raporda benzerlik uyarısı gösterilmez.
+                  </p>
+                </div>
+              </div>
+
+              {notDuplicatePairs.length === 0 ? (
+                <p className="text-xs text-stone-500">
+                  henüz farklı kişi olarak işaretlenmiş bir öğrenci çifti bulunmuyor.
+                </p>
+              ) : (
+                <div className="divide-y divide-stone-200/80 rounded-xl border border-stone-200 bg-[#faf8f4]/70">
+                  {notDuplicatePairs.map(pair => {
+                    const noteParts = pair.note
+                      ? pair.note.split(' — ').map(s => s.trim())
+                      : [];
+                    const nameA = resolveStudentDisplayNameById(
+                      pair.studentIdA,
+                      noteParts[0]
+                    );
+                    const nameB = resolveStudentDisplayNameById(
+                      pair.studentIdB,
+                      noteParts[1]
+                    );
+                    return (
+                      <div
+                        key={pair.id}
+                        data-testid={`not-duplicate-row-${pair.id}`}
+                        className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3.5 py-2.5 text-xs"
+                      >
+                        <div>
+                          <span className="font-medium text-stone-900">
+                            {nameA} — {nameB}
+                          </span>
+                          <span className="ml-2 font-mono-num text-[11px] text-stone-500">
+                            ({pair.id})
+                          </span>
+                        </div>
+                        {onRemoveNotDuplicatePair && (
+                          <button
+                            type="button"
+                            data-testid={`remove-not-duplicate-btn-${pair.id}`}
+                            onClick={async () => {
+                              await onRemoveNotDuplicatePair(pair.id);
+                              showTemporaryNotice(
+                                `"${nameA} — ${nameB}" için yoksayma kaldırıldı; benzerlik uyarıları yeniden aktif.`
+                              );
+                            }}
+                            className="inline-flex items-center gap-1.5 self-start sm:self-auto rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-[11px] font-medium text-stone-700 hover:border-rose-600 hover:text-rose-800 transition-colors cursor-pointer shrink-0"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>yoksaymayı kaldır</span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

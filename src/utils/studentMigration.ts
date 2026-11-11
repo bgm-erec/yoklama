@@ -1,13 +1,17 @@
 import {
   AttendanceRecord,
   BASE_DB,
+  buildNotDuplicatePairId,
   buildStudentIdFromName,
   Course,
   InstructorAssignmentRecord,
+  isPairIgnoredAsNotDuplicate,
   isPlaceholderStudentName,
   Modality,
   normalizeName,
   normalizeTurkish,
+  NotDuplicatePairRecord,
+  reconcileNotDuplicatesOnMerge,
   RemovedStudentRecord,
   slugifyTurkish,
   Student,
@@ -90,6 +94,7 @@ export interface MigrationGroupPlan {
 
 export interface NearDuplicatePair {
   pairKey: string;
+  notDuplicatePairId: string;
   studentA: Student;
   studentB: Student;
   reason: string;
@@ -128,6 +133,7 @@ export interface MigrationInputCollections {
   unlistedReports: UnlistedStudentReport[];
   attendanceRecords: AttendanceRecord[];
   instructorAssignments?: InstructorAssignmentRecord[];
+  notDuplicatePairs?: NotDuplicatePairRecord[];
   courses?: Course[];
 }
 
@@ -141,6 +147,7 @@ export interface MigrationBackupPayload {
     unlistedReports: number;
     attendanceRecords: number;
     instructorAssignments: number;
+    notDuplicatePairs?: number;
   };
   data: {
     baseStudents: Student[];
@@ -149,6 +156,7 @@ export interface MigrationBackupPayload {
     unlistedReports: UnlistedStudentReport[];
     attendanceRecords: AttendanceRecord[];
     instructorAssignments: InstructorAssignmentRecord[];
+    notDuplicatePairs?: NotDuplicatePairRecord[];
   };
 }
 
@@ -166,6 +174,7 @@ export function createMigrationBackupPayload(
   const baseStudents = input.baseStudents || BASE_DB.students;
   const removedStudents = input.removedStudents || [];
   const instructorAssignments = input.instructorAssignments || [];
+  const notDuplicatePairs = input.notDuplicatePairs || [];
 
   return {
     version: 1,
@@ -177,6 +186,7 @@ export function createMigrationBackupPayload(
       unlistedReports: input.unlistedReports.length,
       attendanceRecords: input.attendanceRecords.length,
       instructorAssignments: instructorAssignments.length,
+      notDuplicatePairs: notDuplicatePairs.length,
     },
     data: {
       baseStudents: [...baseStudents],
@@ -185,15 +195,18 @@ export function createMigrationBackupPayload(
       unlistedReports: [...input.unlistedReports],
       attendanceRecords: [...input.attendanceRecords],
       instructorAssignments: [...instructorAssignments],
+      notDuplicatePairs: [...notDuplicatePairs],
     },
   };
 }
 
 /**
- * Adım A, KURU ÇALIŞTIRMA:
- * Hiçbir şey yazmadan rapor üretir. Normalize edilmiş isme (ve stu-<slug> hedef kimliğine) göre
- * gruplanmış tüm tekrarları, her grubun hangi kimliklerle ve hangi derslerle bulunduğunu,
- * sınıf/modality/isim/yoklama çelişkilerini ve yazım benzerliği olan ("olası tekrarlar") aday çiftleri listeler.
+ * Adım A, KURU ÇALIŞTIRMA (Requirement 3 & 5):
+ * Hiçbir şey yazmadan rapor üretir.
+ * KURAL (Requirement 5): Benzer isimli çiftleri otomatik olarak "olası tekrar" diye BİRLEŞTİRMEZ;
+ * yalnızca birebir aynı normalize isimleri (veya kullanıcının açıkça "Aynı kişi, birleştir" dediği çiftleri) birleştirir.
+ * Benzer ama aynı olmayan çiftleri ayrı bir `nearDuplicatePairs` ("benzer isimler") listesinde gösterir
+ * ve `not_duplicates` listesindeki çiftleri bu listeden hariç tutar.
  */
 export function buildMigrationDryRunReport(
   input: MigrationInputCollections,
@@ -202,23 +215,69 @@ export function buildMigrationDryRunReport(
 ): MigrationDryRunReport {
   const baseStudents = input.baseStudents || BASE_DB.students;
   const removedStudents = input.removedStudents || [];
+  const notDuplicatePairs = input.notDuplicatePairs || [];
   const skippedPlaceholders: string[] = [];
 
-  // Map confirmed typo merges if user explicitly selected any
+  // Map confirmed typo merges ONLY if user explicitly clicked "Aynı kişi, birleştir"
   const explicitTypoTargetNameMap = new Map<string, string>();
   const allKnownStudentsForTypoLookup = [...baseStudents, ...input.customStudents];
   for (const merge of resolutions.confirmedTypoMerges || []) {
-    const fromStu = allKnownStudentsForTypoLookup.find(s => s.id === merge.fromStudentId);
-    const intoStu = allKnownStudentsForTypoLookup.find(s => s.id === merge.intoStudentId);
+    const fromStu = allKnownStudentsForTypoLookup.find(
+      s => s.id === merge.fromStudentId || buildStudentIdFromName(s.name) === merge.fromStudentId
+    );
+    const intoStu = allKnownStudentsForTypoLookup.find(
+      s => s.id === merge.intoStudentId || buildStudentIdFromName(s.name) === merge.intoStudentId
+    );
     if (fromStu && intoStu) {
       explicitTypoTargetNameMap.set(normalizeName(fromStu.name), normalizeName(intoStu.name));
     }
   }
 
-  const byTargetId = new Map<string, MigrationSourceRecord[]>();
+  // Group strictly by exact normalizedName (plus explicit user-confirmed typo merges)
+  const byNormName = new Map<string, MigrationSourceRecord[]>();
   const oldIdToTargetId = new Map<string, string>();
   const oldIdToCourses = new Map<string, string[]>();
   const targetIdToName = new Map<string, string>();
+
+  // First pass: see which distinct normalizedNames map to each slug so we never auto-merge different normalized names that share an ASCII slug
+  const slugToDistinctNorms = new Map<string, Set<string>>();
+  for (const s of baseStudents) {
+    if (isPlaceholderStudentName(s.name)) continue;
+    const rawNorm = normalizeName(s.name);
+    const norm = explicitTypoTargetNameMap.get(rawNorm) || rawNorm;
+    const slugId = buildStudentIdFromName(norm);
+    if (!slugToDistinctNorms.has(slugId)) slugToDistinctNorms.set(slugId, new Set());
+    slugToDistinctNorms.get(slugId)!.add(norm);
+  }
+  for (const c of input.customStudents) {
+    if (c.deletedAt || isPlaceholderStudentName(c.name)) continue;
+    const rawNorm = normalizeName(c.name);
+    const norm = explicitTypoTargetNameMap.get(rawNorm) || rawNorm;
+    const slugId = buildStudentIdFromName(norm);
+    if (!slugToDistinctNorms.has(slugId)) slugToDistinctNorms.set(slugId, new Set());
+    slugToDistinctNorms.get(slugId)!.add(norm);
+  }
+
+  // Choose which norm owns the canonical `stu-<slug>` when two unmerged diacritic variants share a slug
+  const primaryNormForSlug = new Map<string, string>();
+  for (const [slugId, normSet] of slugToDistinctNorms.entries()) {
+    const norms = Array.from(normSet);
+    if (norms.length === 1) {
+      primaryNormForSlug.set(slugId, norms[0]);
+    } else {
+      const baseMatch = norms.find(n =>
+        baseStudents.some(b => normalizeName(b.name) === n)
+      );
+      if (baseMatch) {
+        primaryNormForSlug.set(slugId, baseMatch);
+      } else {
+        const sorted = [...norms].sort(
+          (a, b) => countTurkishDiacritics(b) - countTurkishDiacritics(a)
+        );
+        primaryNormForSlug.set(slugId, sorted[0]);
+      }
+    }
+  }
 
   // 1. Collect built-in students
   for (const s of baseStudents) {
@@ -236,7 +295,7 @@ export function buildMigrationDryRunReport(
       id: s.id,
       docId: s.id,
       name: s.name,
-      normalizedName: norm,
+      normalizedName: rawNorm,
       targetId,
       grade: normalizeTurkish(s.grade),
       modality: s.modality,
@@ -245,9 +304,9 @@ export function buildMigrationDryRunReport(
       addedAt: s.addedAt || '2026-10-19T00:00:00.000Z',
       deletedAt: null,
     };
-    const list = byTargetId.get(targetId) || [];
+    const list = byNormName.get(norm) || [];
     list.push(rec);
-    byTargetId.set(targetId, list);
+    byNormName.set(norm, list);
     oldIdToTargetId.set(s.id, targetId);
     oldIdToCourses.set(s.id, [...s.enrolledCourseIds]);
   }
@@ -262,7 +321,14 @@ export function buildMigrationDryRunReport(
     }
     const rawNorm = normalizeName(c.name);
     const norm = explicitTypoTargetNameMap.get(rawNorm) || rawNorm;
-    const targetId = buildStudentIdFromName(norm);
+    const slugId = buildStudentIdFromName(norm);
+    const isSlugSharedByUnmergedNorms =
+      (slugToDistinctNorms.get(slugId)?.size || 0) > 1 &&
+      primaryNormForSlug.get(slugId) !== norm;
+
+    // If this record's normalizedName differs from another active record sharing the same ASCII slug,
+    // keep its own ID until the user explicitly chooses "Aynı kişi, birleştir"
+    const targetId = isSlugSharedByUnmergedNorms ? c.id : slugId;
     if (!targetIdToName.has(targetId)) {
       targetIdToName.set(targetId, norm);
     }
@@ -272,7 +338,7 @@ export function buildMigrationDryRunReport(
       id: c.id,
       docId: c.id,
       name: c.name,
-      normalizedName: norm,
+      normalizedName: rawNorm,
       targetId,
       grade: normalizeTurkish(c.grade),
       modality: c.modality,
@@ -281,9 +347,9 @@ export function buildMigrationDryRunReport(
       addedAt: c.addedAt || '2026-10-19T00:00:00.000Z',
       deletedAt: c.deletedAt || null,
     };
-    const list = byTargetId.get(targetId) || [];
+    const list = byNormName.get(norm) || [];
     list.push(rec);
-    byTargetId.set(targetId, list);
+    byNormName.set(norm, list);
     if (c.id) {
       oldIdToTargetId.set(c.id, targetId);
       oldIdToCourses.set(c.id, [...rec.enrolledCourseIds]);
@@ -302,7 +368,7 @@ export function buildMigrationDryRunReport(
     const norm = explicitTypoTargetNameMap.get(rawNorm) || rawNorm;
     const targetStuId = buildStudentIdFromName(norm);
     const expectedTargetId =
-      u.status === 'temporary' && !byTargetId.has(targetStuId)
+      u.status === 'temporary' && !byNormName.has(norm)
         ? `temp-${slugifyTurkish(norm)}`
         : targetStuId;
 
@@ -415,13 +481,25 @@ export function buildMigrationDryRunReport(
     }
   }
 
-  // 5. Build MigrationGroupPlans for any group with >1 record or non-canonical ID
+  // 5. Build MigrationGroupPlans for any exact-normalizedName group with >1 record or non-canonical ID
   const groupsToMigrate: MigrationGroupPlan[] = [];
 
-  for (const [targetId, records] of byTargetId.entries()) {
+  for (const [normKey, records] of byNormName.entries()) {
     const activeRecords = records.filter(r => !r.deletedAt);
     if (activeRecords.length === 0) continue;
 
+    const slugId = buildStudentIdFromName(normKey);
+    const isCollidingUnmergedSecondary =
+      (slugToDistinctNorms.get(slugId)?.size || 0) > 1 &&
+      primaryNormForSlug.get(slugId) !== normKey &&
+      activeRecords.length === 1;
+
+    // Do not auto-migrate a single record into a colliding slug owned by another distinct normalizedName
+    if (isCollidingUnmergedSecondary) {
+      continue;
+    }
+
+    const targetId = slugId;
     const customActive = activeRecords.filter(r => r.source === 'custom_students');
     const baseRecord = activeRecords.find(r => r.source === 'base');
 
@@ -430,14 +508,14 @@ export function buildMigrationDryRunReport(
     );
     const hasNameConflict = distinctNames.length > 1;
 
-    // Pick best default normalized name (base if available, else the spelling with rich Turkish diacritics)
     const bestDefaultName =
       resolutions.nameByTargetId?.[targetId] ||
       (baseRecord
         ? baseRecord.normalizedName
         : [...distinctNames].sort(
             (a, b) => countTurkishDiacritics(b) - countTurkishDiacritics(a)
-          )[0]);
+          )[0]) ||
+      normKey;
 
     const hasNonCanonicalCustomDoc = customActive.some(
       r => r.id !== targetId || r.docId !== targetId || r.name !== bestDefaultName
@@ -541,24 +619,19 @@ export function buildMigrationDryRunReport(
     });
   }
 
-  // 6. Compute Near-Duplicate / Typo Pairs ("Olası Tekrarlar") across all active students
-  const byExactNorm = new Map<string, MigrationSourceRecord[]>();
-  for (const records of byTargetId.values()) {
-    for (const r of records) {
-      if (r.deletedAt) continue;
-      const list = byExactNorm.get(r.normalizedName) || [];
-      list.push(r);
-      byExactNorm.set(r.normalizedName, list);
-    }
-  }
-
+  // 6. Compute Near-Duplicate / Typo Pairs ("Benzer İsimler") across all active students
   const unifiedActiveStudents: Student[] = [];
-  for (const [normName, active] of byExactNorm.entries()) {
+  for (const [normName, records] of byNormName.entries()) {
+    const active = records.filter(r => !r.deletedAt);
     if (active.length === 0) continue;
-    const targetId = buildStudentIdFromName(normName);
+    const slugId = buildStudentIdFromName(normName);
+    const isSecondaryCollision =
+      (slugToDistinctNorms.get(slugId)?.size || 0) > 1 &&
+      primaryNormForSlug.get(slugId) !== normName;
+    const effectiveId = isSecondaryCollision ? active[0].id : slugId;
     const allCourses = Array.from(new Set(active.flatMap(r => r.enrolledCourseIds)));
     unifiedActiveStudents.push({
-      id: targetId,
+      id: effectiveId,
       name: normName,
       grade: active[0].grade,
       modality: active[0].modality,
@@ -577,15 +650,29 @@ export function buildMigrationDryRunReport(
       const normB = normalizeName(b.name);
       if (normA === normB) continue;
 
+      // Requirement 1, 3, 5: Skip pairs already marked in not_duplicates!
+      if (
+        isPairIgnoredAsNotDuplicate(a.id, b.id, notDuplicatePairs) ||
+        isPairIgnoredAsNotDuplicate(normA, normB, notDuplicatePairs)
+      ) {
+        continue;
+      }
+
+      const builtPair =
+        buildNotDuplicatePairId(a.id, b.id) ||
+        buildNotDuplicatePairId(normA, normB);
+      const notDuplicatePairId = builtPair ? builtPair.id : `${normA}__${normB}`;
+
       const slugA = slugifyTurkish(normA);
       const slugB = slugifyTurkish(normB);
 
       if (slugA === slugB) {
         nearDuplicatePairs.push({
           pairKey: `${normA}__${normB}`,
+          notDuplicatePairId,
           studentA: a,
           studentB: b,
-          reason: 'Aynı slug / Türkçe harf farkı (ş/s, ı/i, ö/o, ü/u, ç/c, ğ/g)',
+          reason: 'Türkçe karakter farkı (ş/s, ı/i, ö/o, ü/u, ç/c, ğ/g)',
           distance: 0.5,
           sameSlug: true,
         });
@@ -595,9 +682,10 @@ export function buildMigrationDryRunReport(
       const distNorm = levenshteinDistance(normA, normB);
       const distSlug = levenshteinDistance(slugA, slugB);
       const minDist = Math.min(distNorm, distSlug);
-      if (minDist <= 2 && Math.max(normA.length, normB.length) >= 6) {
+      if (minDist <= 2 && Math.max(normA.length, normB.length) >= 5) {
         nearDuplicatePairs.push({
           pairKey: `${normA}__${normB}`,
+          notDuplicatePairId,
           studentA: a,
           studentB: b,
           reason: minDist === 1 ? '1 harf yazım farkı' : '2 harf yazım farkı',
@@ -609,18 +697,43 @@ export function buildMigrationDryRunReport(
 
       const tokensA = normA.split(' ').filter(Boolean);
       const tokensB = normB.split(' ').filter(Boolean);
-      if (tokensA.length >= 2 && tokensB.length >= 2 && tokensA.length !== tokensB.length) {
-        const smaller = tokensA.length < tokensB.length ? tokensA : tokensB;
-        const larger = tokensA.length < tokensB.length ? tokensB : tokensA;
-        if (smaller.every(t => larger.includes(t))) {
-          nearDuplicatePairs.push({
-            pairKey: `${normA}__${normB}`,
-            studentA: a,
-            studentB: b,
-            reason: 'Eksik/fazla ikinci ad veya soyad örtüşmesi',
-            distance: 1.5,
-            sameSlug: false,
-          });
+      if (tokensA.length >= 2 && tokensB.length >= 2) {
+        const sameLast = tokensA[tokensA.length - 1] === tokensB[tokensB.length - 1];
+        if (sameLast) {
+          const givenA = tokensA.slice(0, -1).join(' ');
+          const givenB = tokensB.slice(0, -1).join(' ');
+          const givenDist = Math.min(
+            levenshteinDistance(givenA, givenB),
+            levenshteinDistance(slugifyTurkish(givenA), slugifyTurkish(givenB))
+          );
+          if (givenDist >= 1 && givenDist <= 2) {
+            nearDuplicatePairs.push({
+              pairKey: `${normA}__${normB}`,
+              notDuplicatePairId,
+              studentA: a,
+              studentB: b,
+              reason: givenDist === 1 ? '1 harf farkı (aynı soyad)' : 'benzer ad ve aynı soyad',
+              distance: givenDist,
+              sameSlug: false,
+            });
+            continue;
+          }
+        }
+
+        if (tokensA.length !== tokensB.length) {
+          const smaller = tokensA.length < tokensB.length ? tokensA : tokensB;
+          const larger = tokensA.length < tokensB.length ? tokensB : tokensA;
+          if (smaller.every(t => larger.includes(t))) {
+            nearDuplicatePairs.push({
+              pairKey: `${normA}__${normB}`,
+              notDuplicatePairId,
+              studentA: a,
+              studentB: b,
+              reason: 'Eksik/fazla ikinci ad veya soyad örtüşmesi',
+              distance: 1.5,
+              sameSlug: false,
+            });
+          }
         }
       }
     }
@@ -680,6 +793,7 @@ export function buildMigrationDryRunReport(
 /**
  * Bellekte (veya birim testlerinde) migrasyon planını idempotent olarak uygular.
  * İki kez çalıştırıldığında ikinci çalıştırma hiçbir şeyi bozmaz ve 0 değişiklik üretir.
+ * Ayrıca birleşen öğrencilerin not_duplicates kayıtlarını asıl kimliğe taşır (Requirement 3).
  */
 export function applyMigrationPlanInMemory(
   input: MigrationInputCollections,
@@ -690,15 +804,19 @@ export function applyMigrationPlanInMemory(
   removedStudents: RemovedStudentRecord[];
   unlistedReports: UnlistedStudentReport[];
   attendanceRecords: AttendanceRecord[];
+  notDuplicatePairs: NotDuplicatePairRecord[];
   report: MigrationDryRunReport;
 } {
   const report = buildMigrationDryRunReport(input, resolutions, nowIso);
+  let currentNotDuplicates = [...(input.notDuplicatePairs || [])];
+
   if (report.isAlreadyClean) {
     return {
       customStudents: [...input.customStudents],
       removedStudents: [...(input.removedStudents || [])],
       unlistedReports: [...input.unlistedReports],
       attendanceRecords: [...input.attendanceRecords],
+      notDuplicatePairs: currentNotDuplicates,
       report,
     };
   }
@@ -737,7 +855,34 @@ export function applyMigrationPlanInMemory(
           deletedAt: nowIso,
         });
       }
+      currentNotDuplicates = reconcileNotDuplicatesOnMerge(
+        currentNotDuplicates,
+        dupId,
+        group.targetId,
+        nowIso
+      ).nextPairs;
     }
+
+    for (const rec of group.activeRecords) {
+      const recSlugId = buildStudentIdFromName(rec.normalizedName);
+      if (recSlugId && recSlugId !== group.targetId) {
+        currentNotDuplicates = reconcileNotDuplicatesOnMerge(
+          currentNotDuplicates,
+          recSlugId,
+          group.targetId,
+          nowIso
+        ).nextPairs;
+      }
+    }
+  }
+
+  for (const merge of resolutions.confirmedTypoMerges || []) {
+    currentNotDuplicates = reconcileNotDuplicatesOnMerge(
+      currentNotDuplicates,
+      merge.fromStudentId,
+      merge.intoStudentId,
+      nowIso
+    ).nextPairs;
   }
 
   const softDeleteRemovedSet = new Set(
@@ -782,6 +927,8 @@ export function applyMigrationPlanInMemory(
     removedStudents: nextRemovedStudents,
     unlistedReports: nextUnlistedReports,
     attendanceRecords: nextAttendanceRecords,
+    notDuplicatePairs: currentNotDuplicates,
     report,
   };
 }
+

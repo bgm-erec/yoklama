@@ -30,8 +30,10 @@ import {
   AttendanceRecord,
   AuditLogEntry,
   BASE_DB,
+  buildNotDuplicatePairId,
   buildStudentIdFromName,
   canonicalizeAttendanceRecordIds,
+  deduplicateNotDuplicatePairs,
   FeedbackItem,
   getCanonicalStudentName,
   Instructor,
@@ -39,7 +41,10 @@ import {
   Modality,
   normalizeName,
   normalizeTurkish,
+  NotDuplicatePairRecord,
   PlaceboSavePreferenceRecord,
+  reconcileNotDuplicatesOnDelete,
+  reconcileNotDuplicatesOnMerge,
   RemovedStudentRecord,
   slugifyTurkish,
   Student,
@@ -166,6 +171,9 @@ export default function App() {
   >([]);
   const [lastMigrationBackup, setLastMigrationBackup] =
     useState<MigrationBackupPayload | null>(null);
+  const [lastIgnoredNotDuplicateIds, setLastIgnoredNotDuplicateIds] = useState<
+    string[]
+  >([]);
 
   // Real-time synced lists from Firestore
   const [attendanceRecords, setAttendanceRecords] = useState<
@@ -176,6 +184,9 @@ export default function App() {
   const [removedStudentIds, setRemovedStudentIds] = useState<string[]>([]);
   const [instructorAssignments, setInstructorAssignments] = useState<
     InstructorAssignmentRecord[]
+  >([]);
+  const [notDuplicatePairs, setNotDuplicatePairs] = useState<
+    NotDuplicatePairRecord[]
   >([]);
   const [unlistedReports, setUnlistedReports] = useState<
     UnlistedStudentReport[]
@@ -420,10 +431,46 @@ export default function App() {
       }
     );
 
+    const notDuplicatesQuery = query(
+      collection(db, 'not_duplicates'),
+      where('studentIdA', '>=', '')
+    );
+    const unsubNotDups = onSnapshot(
+      notDuplicatesQuery,
+      { includeMetadataChanges: true },
+      snapshot => {
+        const items: NotDuplicatePairRecord[] = [];
+        snapshot.forEach(docSnap => {
+          const data = docSnap.data();
+          if (data.deletedAt) return;
+          const pair = buildNotDuplicatePairId(
+            String(data.studentIdA || ''),
+            String(data.studentIdB || '')
+          );
+          if (!pair) return;
+          items.push({
+            id: pair.id,
+            studentIdA: pair.studentIdA,
+            studentIdB: pair.studentIdB,
+            createdAt: formatFirestoreTimestamp(
+              data.createdAt,
+              data.createdAtIso
+            ),
+            note: typeof data.note === 'string' ? data.note : undefined,
+          });
+        });
+        setNotDuplicatePairs(deduplicateNotDuplicatePairs(items));
+      },
+      error => {
+        console.error('not_duplicates dinleme hatası:', error);
+      }
+    );
+
     return () => {
       unsubCustom();
       unsubRemoved();
       unsubAssign();
+      unsubNotDups();
     };
   }, []);
 
@@ -930,7 +977,13 @@ export default function App() {
   const handleRemoveStudent = async (student: Student) => {
     const prevCustom = [...customStudents];
     const prevRemoved = [...removedStudentIds];
+    const prevNotDups = [...notDuplicatePairs];
     const isBaseStudent = BASE_DB.students.some(s => s.id === student.id);
+
+    const notDupCleanup = reconcileNotDuplicatesOnDelete(
+      notDuplicatePairs,
+      student.id
+    );
 
     if (isBaseStudent) {
       setRemovedStudentIds(prev =>
@@ -938,6 +991,7 @@ export default function App() {
       );
     }
     setCustomStudents(prev => prev.filter(s => s.id !== student.id));
+    setNotDuplicatePairs(notDupCleanup.nextPairs);
 
     await writeQueueRef.current!.enqueueImmediate({
       key: `student_remove_${student.id}`,
@@ -945,6 +999,7 @@ export default function App() {
       rollback: () => {
         setCustomStudents(prevCustom);
         setRemovedStudentIds(prevRemoved);
+        setNotDuplicatePairs(prevNotDups);
       },
       execute: async () => {
         const nowIso = new Date().toISOString();
@@ -973,17 +1028,236 @@ export default function App() {
               deletedAt: null,
             });
           }
+          if (notDupCleanup.toDeleteIds.length > 0) {
+            await Promise.all(
+              notDupCleanup.toDeleteIds.map(pairId =>
+                deleteDoc(doc(db, 'not_duplicates', pairId))
+              )
+            );
+          }
           void writeAuditLog({
             actor: 'sibelius (ekip)',
             action: 'ogrenci_kaldir',
             target: student.id,
-            details: `${student.name} (${student.id}) sistemden kaldırıldı (soft delete).`,
+            details: `${student.name} (${student.id}) sistemden kaldırıldı (soft delete${
+              notDupCleanup.toDeleteIds.length > 0
+                ? `, ${notDupCleanup.toDeleteIds.length} yoksayma kaydı temizlendi`
+                : ''
+            }).`,
           });
         } catch (error) {
           handleFirestoreError(
             error,
             OperationType.WRITE,
             `removed_students/${student.id}`
+          );
+        }
+      },
+    });
+  };
+
+  const handleMarkNotDuplicatePairs = async (
+    rawPairs: Array<{ studentId1: string; studentId2: string; note?: string }>
+  ): Promise<string[]> => {
+    const nowIso = new Date().toISOString();
+    const validRecords: NotDuplicatePairRecord[] = [];
+    for (const item of rawPairs) {
+      const built = buildNotDuplicatePairId(item.studentId1, item.studentId2);
+      if (!built) continue;
+      validRecords.push({
+        id: built.id,
+        studentIdA: built.studentIdA,
+        studentIdB: built.studentIdB,
+        createdAt: nowIso,
+        ...(item.note ? { note: item.note } : {}),
+      });
+    }
+    const dedupedNew = deduplicateNotDuplicatePairs(validRecords);
+    if (dedupedNew.length === 0) return [];
+
+    const prevNotDups = [...notDuplicatePairs];
+    const addedIds = dedupedNew.map(r => r.id);
+
+    setNotDuplicatePairs(prev =>
+      deduplicateNotDuplicatePairs([...prev, ...dedupedNew])
+    );
+    setLastIgnoredNotDuplicateIds(addedIds);
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: `not_duplicates_add_${addedIds.join('_')}`,
+      label: 'Farklı Kişiler Olarak İşaretle',
+      rollback: () => {
+        setNotDuplicatePairs(prevNotDups);
+      },
+      execute: async () => {
+        const isOnline =
+          typeof navigator !== 'undefined' ? navigator.onLine : true;
+        try {
+          if (isOnline && dedupedNew.length === 1) {
+            const rec = dedupedNew[0];
+            const docRef = doc(db, 'not_duplicates', rec.id);
+            await runTransaction(db, async tx => {
+              const snap = await tx.get(docRef);
+              const existingCreatedAtIso = snap.exists()
+                ? formatFirestoreTimestamp(
+                    snap.data().createdAt,
+                    snap.data().createdAtIso
+                  )
+                : rec.createdAt;
+              tx.set(docRef, {
+                studentIdA: rec.studentIdA,
+                studentIdB: rec.studentIdB,
+                createdAt: serverTimestamp(),
+                createdAtIso: existingCreatedAtIso || nowIso,
+                ...(rec.note ? { note: rec.note } : {}),
+              });
+            });
+          } else {
+            const batch = writeBatch(db);
+            for (const rec of dedupedNew) {
+              batch.set(doc(db, 'not_duplicates', rec.id), {
+                studentIdA: rec.studentIdA,
+                studentIdB: rec.studentIdB,
+                createdAt: serverTimestamp(),
+                createdAtIso: rec.createdAt || nowIso,
+                ...(rec.note ? { note: rec.note } : {}),
+              });
+            }
+            await batch.commit();
+          }
+
+          void writeAuditLog({
+            actor: 'sibelius (ekip)',
+            action: 'farkli_kisiler_yoksay',
+            target: addedIds.join(','),
+            details: `${dedupedNew
+              .map(r => `${r.studentIdA} ↔ ${r.studentIdB}`)
+              .join(', ')} farklı kişiler olarak işaretlendi (not_duplicates).`,
+          });
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.WRITE,
+            `not_duplicates/${addedIds[0]}`
+          );
+        }
+      },
+    });
+
+    return addedIds;
+  };
+
+  const handleRemoveNotDuplicatePair = async (pairId: string) => {
+    const prevNotDups = [...notDuplicatePairs];
+    setNotDuplicatePairs(prev => prev.filter(p => p.id !== pairId));
+    setLastIgnoredNotDuplicateIds(prev => prev.filter(id => id !== pairId));
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: `not_duplicates_del_${pairId}`,
+      label: 'Benzerlik Yoksaymayı Kaldır',
+      rollback: () => setNotDuplicatePairs(prevNotDups),
+      execute: async () => {
+        try {
+          await deleteDoc(doc(db, 'not_duplicates', pairId));
+          void writeAuditLog({
+            actor: 'sibelius (ekip)',
+            action: 'farkli_kisiler_yoksay_kaldir',
+            target: pairId,
+            details: `${pairId} çifti için benzer isim yoksayması kaldırıldı.`,
+          });
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.DELETE,
+            `not_duplicates/${pairId}`
+          );
+        }
+      },
+    });
+  };
+
+  const handleUndoLastNotDuplicatePairs = async () => {
+    if (lastIgnoredNotDuplicateIds.length === 0) return;
+    const idsToRemove = [...lastIgnoredNotDuplicateIds];
+    const prevNotDups = [...notDuplicatePairs];
+
+    setNotDuplicatePairs(prev =>
+      prev.filter(p => !idsToRemove.includes(p.id))
+    );
+    setLastIgnoredNotDuplicateIds([]);
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: `not_duplicates_undo_${idsToRemove.join('_')}`,
+      label: 'Yoksaymayı Geri Al',
+      rollback: () => setNotDuplicatePairs(prevNotDups),
+      execute: async () => {
+        try {
+          await Promise.all(
+            idsToRemove.map(id => deleteDoc(doc(db, 'not_duplicates', id)))
+          );
+          void writeAuditLog({
+            actor: 'sibelius (ekip)',
+            action: 'farkli_kisiler_yoksay_geri_al',
+            target: idsToRemove.join(','),
+            details: `${idsToRemove.join(', ')} yoksayma işlemi geri alındı.`,
+          });
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.DELETE,
+            `not_duplicates/${idsToRemove[0]}`
+          );
+        }
+      },
+    });
+  };
+
+  const handleReconcileNotDuplicatesForMerge = async (
+    fromStudentId: string,
+    intoStudentId: string
+  ) => {
+    const nowIso = new Date().toISOString();
+    const reconciled = reconcileNotDuplicatesOnMerge(
+      notDuplicatePairs,
+      fromStudentId,
+      intoStudentId,
+      nowIso
+    );
+    if (
+      reconciled.toDeleteIds.length === 0 &&
+      reconciled.toUpsert.length === 0
+    ) {
+      return;
+    }
+
+    const prevNotDups = [...notDuplicatePairs];
+    setNotDuplicatePairs(reconciled.nextPairs);
+
+    await writeQueueRef.current!.enqueueImmediate({
+      key: `not_duplicates_reconcile_${fromStudentId}_${intoStudentId}`,
+      label: 'Yoksayma Kayıtlarını Birleştirilen Kimliğe Taşı',
+      rollback: () => setNotDuplicatePairs(prevNotDups),
+      execute: async () => {
+        try {
+          const batch = writeBatch(db);
+          for (const delId of reconciled.toDeleteIds) {
+            batch.delete(doc(db, 'not_duplicates', delId));
+          }
+          for (const upsertRec of reconciled.toUpsert) {
+            batch.set(doc(db, 'not_duplicates', upsertRec.id), {
+              studentIdA: upsertRec.studentIdA,
+              studentIdB: upsertRec.studentIdB,
+              createdAt: serverTimestamp(),
+              createdAtIso: upsertRec.createdAt || nowIso,
+              ...(upsertRec.note ? { note: upsertRec.note } : {}),
+            });
+          }
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.WRITE,
+            `not_duplicates/${intoStudentId}`
           );
         }
       },
@@ -1936,6 +2210,7 @@ export default function App() {
       unlistedReports,
       attendanceRecords,
       instructorAssignments,
+      notDuplicatePairs,
     });
     setLastMigrationBackup(backup);
     triggerJsonBackupDownload('ogrenci-birlestirme-tam-yedek', backup);
@@ -1957,6 +2232,7 @@ export default function App() {
         unlistedReports,
         attendanceRecords,
         instructorAssignments,
+        notDuplicatePairs,
       },
       nowIso
     );
@@ -1970,6 +2246,7 @@ export default function App() {
         unlistedReports,
         attendanceRecords,
         courses: effectiveDb.courses,
+        notDuplicatePairs,
       },
       resolutions,
       nowIso
@@ -1978,6 +2255,47 @@ export default function App() {
     if (report.isAlreadyClean) {
       return 'Tüm öğrenci kimlikleri zaten birleştirilmiş durumda (idempotent kontrol: yapılacak değişiklik yok).';
     }
+
+    // Reconcile any not_duplicates pairs when students are merged
+    let nextNotDups = [...notDuplicatePairs];
+    const notDupIdsToDelete = new Set<string>();
+    const notDupRecordsToUpsert = new Map<string, NotDuplicatePairRecord>();
+
+    const applyMergeOnNotDups = (fromId: string, intoId: string) => {
+      const rec = reconcileNotDuplicatesOnMerge(
+        nextNotDups,
+        fromId,
+        intoId,
+        nowIso
+      );
+      nextNotDups = rec.nextPairs;
+      for (const dId of rec.toDeleteIds) {
+        notDupIdsToDelete.add(dId);
+        notDupRecordsToUpsert.delete(dId);
+      }
+      for (const uRec of rec.toUpsert) {
+        notDupIdsToDelete.delete(uRec.id);
+        notDupRecordsToUpsert.set(uRec.id, uRec);
+      }
+    };
+
+    for (const group of report.groupsToMigrate) {
+      for (const rec of group.activeRecords) {
+        if (rec.id !== group.targetId) {
+          applyMergeOnNotDups(rec.id, group.targetId);
+        }
+        if (rec.docId !== group.targetId) {
+          applyMergeOnNotDups(rec.docId, group.targetId);
+        }
+      }
+    }
+    if (resolutions.confirmedTypoMerges) {
+      for (const tm of resolutions.confirmedTypoMerges) {
+        applyMergeOnNotDups(tm.fromStudentId, tm.intoStudentId);
+      }
+    }
+
+    setNotDuplicatePairs(nextNotDups);
 
     await writeQueueRef.current!.enqueueImmediate({
       key: 'student_identity_migration_batch',
@@ -2072,12 +2390,25 @@ export default function App() {
             }
           }
 
+          for (const delPairId of notDupIdsToDelete) {
+            batch.delete(doc(db, 'not_duplicates', delPairId));
+          }
+          for (const upsertPair of notDupRecordsToUpsert.values()) {
+            batch.set(doc(db, 'not_duplicates', upsertPair.id), {
+              studentIdA: upsertPair.studentIdA,
+              studentIdB: upsertPair.studentIdB,
+              createdAt: serverTimestamp(),
+              createdAtIso: upsertPair.createdAt || nowIso,
+              ...(upsertPair.note ? { note: upsertPair.note } : {}),
+            });
+          }
+
           await batch.commit();
 
           void writeAuditLog({
             actor: 'sibelius (ekip)',
             action: 'ogrenci_kimlik_migrasyonu',
-            target: 'custom_students,unlisted_students,attendance',
+            target: 'custom_students,unlisted_students,attendance,not_duplicates',
             details: `${report.groupsToMigrate.length} öğrenci grubu stu-<slug> kimliğinde birleştirildi (${report.totalCustomDocsToSoftDelete} tekrar belge soft-delete, ${report.totalUnlistedDocsToUpdate} liste dışı ve ${report.totalAttendanceDocsToUpdate} yoklama referansı güncellendi).`,
           });
         } catch (error) {
@@ -2135,6 +2466,17 @@ export default function App() {
               resolvedAtIso: u.resolvedAt || null,
               deletedAt: u.deletedAt || null,
             });
+          }
+          if (backup.data.notDuplicatePairs) {
+            for (const p of backup.data.notDuplicatePairs) {
+              batch.set(doc(db, 'not_duplicates', p.id), {
+                studentIdA: p.studentIdA,
+                studentIdB: p.studentIdB,
+                createdAt: p.createdAt,
+                createdAtIso: p.createdAt,
+                ...(p.note ? { note: p.note } : {}),
+              });
+            }
           }
           await batch.commit();
           void writeAuditLog({
@@ -2359,10 +2701,14 @@ export default function App() {
             allCourses={effectiveDb.courses}
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
+            notDuplicatePairs={notDuplicatePairs}
             onSaveAttendance={handleSaveAttendance}
             onAddStudent={handleAddStudent}
             onAddUnlistedStudent={handleAddUnlistedStudent}
             onRemoveUnlistedStudent={handleDeleteUnlistedReport}
+            onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
+            onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
+            onReconcileNotDuplicatesOnMerge={handleReconcileNotDuplicatesForMerge}
             onDeleteCourseSession={handleDeleteCourseSession}
             onBackToLogin={performReturnHome}
             onGuardedNavigate={handleGuardedNavigate}
@@ -2381,6 +2727,7 @@ export default function App() {
             instructors={effectiveDb.instructors}
             attendanceRecords={attendanceRecords}
             unlistedReports={unlistedReports}
+            notDuplicatePairs={notDuplicatePairs}
             placeboSavePrefs={placeboSavePrefs}
             auditLogs={auditLogs}
             onAddStudent={handleAddStudent}
@@ -2389,6 +2736,11 @@ export default function App() {
             onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
             onMarkTemporaryUnlistedStudent={handleMarkTemporaryUnlistedStudent}
             onDeleteUnlistedReport={handleDeleteUnlistedReport}
+            onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
+            onRemoveNotDuplicatePair={handleRemoveNotDuplicatePair}
+            canUndoNotDuplicate={lastIgnoredNotDuplicateIds.length > 0}
+            onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
+            onReconcileNotDuplicatesOnMerge={handleReconcileNotDuplicatesForMerge}
             onDownloadMigrationBackup={handleDownloadMigrationBackup}
             onExecuteStudentMigration={handleExecuteStudentMigration}
             canUndoMigration={Boolean(lastMigrationBackup)}

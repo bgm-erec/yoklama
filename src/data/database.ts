@@ -107,6 +107,14 @@ export interface AuditLogEntry {
   createdAt: string;
 }
 
+export interface NotDuplicatePairRecord {
+  id: string; // `${studentIdA}__${studentIdB}` where studentIdA < studentIdB
+  studentIdA: string;
+  studentIdB: string;
+  createdAt: string;
+  note?: string;
+}
+
 // Raw Online Courses from BGM ÇEVRİM İÇİ SINIF LİSTESİ PDF
 interface RawCourseDef {
   id: string;
@@ -1910,6 +1918,197 @@ export function canonicalizeAttendanceRecordIds(record: AttendanceRecord): Atten
     ...record,
     absentStudentIds: mappedIds,
   };
+}
+
+function toCanonicalStudentIdForPair(idOrName: string): string {
+  const trimmed = (idOrName || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('stu-') || trimmed.startsWith('stu_')) {
+    return resolveCanonicalStudentId(trimmed);
+  }
+  return buildStudentIdFromName(trimmed);
+}
+
+/**
+ * Requirement 1 & 6:
+ * Her kayıt iki öğrenci kimliğinin sıralı çiftidir (belge kimliği: küçük kimlik + "__" + büyük kimlik;
+ * böylece A-B ile B-A aynı kayıt olur).
+ */
+export function buildNotDuplicatePairId(
+  idOrName1: string,
+  idOrName2: string
+): { id: string; studentIdA: string; studentIdB: string } | null {
+  const a = toCanonicalStudentIdForPair(idOrName1);
+  const b = toCanonicalStudentIdForPair(idOrName2);
+  if (!a || !b || a === b) return null;
+  const studentIdA = a < b ? a : b;
+  const studentIdB = a < b ? b : a;
+  return {
+    id: `${studentIdA}__${studentIdB}`,
+    studentIdA,
+    studentIdB,
+  };
+}
+
+/**
+ * Bir çift not_duplicates listesindeyse true döner.
+ * Kural 3: Birebir aynı kimlik veya aynı normalize isim için asla true dönmez.
+ */
+export function isPairIgnoredAsNotDuplicate(
+  idOrName1: string,
+  idOrName2: string,
+  notDuplicatePairs: NotDuplicatePairRecord[] = []
+): boolean {
+  if (!notDuplicatePairs || notDuplicatePairs.length === 0) return false;
+  const pair = buildNotDuplicatePairId(idOrName1, idOrName2);
+  if (!pair) return false;
+  for (const rec of notDuplicatePairs) {
+    if (rec.id === pair.id) return true;
+    const recPair = buildNotDuplicatePairId(rec.studentIdA, rec.studentIdB);
+    if (recPair && recPair.id === pair.id) return true;
+  }
+  return false;
+}
+
+/**
+ * İki cihazdan aynı çifti aynı anda yoksayma veya A-B / B-A kayıtlarını tekilleştirme.
+ */
+export function deduplicateNotDuplicatePairs(
+  pairs: NotDuplicatePairRecord[]
+): NotDuplicatePairRecord[] {
+  const map = new Map<string, NotDuplicatePairRecord>();
+  for (const p of pairs) {
+    const built = buildNotDuplicatePairId(p.studentIdA, p.studentIdB);
+    if (!built) continue;
+    const existing = map.get(built.id);
+    if (!existing || (p.createdAt && p.createdAt < existing.createdAt)) {
+      map.set(built.id, {
+        id: built.id,
+        studentIdA: built.studentIdA,
+        studentIdB: built.studentIdB,
+        createdAt: p.createdAt,
+        ...(p.note ? { note: p.note } : existing?.note ? { note: existing.note } : {}),
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
+/**
+ * Requirement 3:
+ * Bir öğrenci birleştirilirse (aynı kişi çıkarsa) o öğrencinin not_duplicates kayıtlarını asıl kimliğe taşı;
+ * birleşen kimlik içeren çiftleri güncelle, kendisiyle eşleşen çifti sil.
+ */
+export function reconcileNotDuplicatesOnMerge(
+  pairs: NotDuplicatePairRecord[],
+  fromStudentId: string,
+  intoStudentId: string,
+  nowIso = new Date().toISOString()
+): {
+  nextPairs: NotDuplicatePairRecord[];
+  toUpsert: NotDuplicatePairRecord[];
+  toDeleteIds: string[];
+} {
+  const cleanFrom = (fromStudentId || '').trim();
+  const cleanInto = toCanonicalStudentIdForPair(intoStudentId) || (intoStudentId || '').trim();
+  if (!cleanFrom || !cleanInto || cleanFrom === cleanInto) {
+    return { nextPairs: [...pairs], toUpsert: [], toDeleteIds: [] };
+  }
+
+  const nextMap = new Map<string, NotDuplicatePairRecord>();
+  const toUpsertMap = new Map<string, NotDuplicatePairRecord>();
+  const toDeleteSet = new Set<string>();
+
+  // First keep all unaffected pairs
+  for (const p of pairs) {
+    const matchesFrom =
+      p.studentIdA === cleanFrom ||
+      p.studentIdB === cleanFrom ||
+      toCanonicalStudentIdForPair(p.studentIdA) === cleanFrom ||
+      toCanonicalStudentIdForPair(p.studentIdB) === cleanFrom;
+    if (!matchesFrom) {
+      nextMap.set(p.id, { ...p });
+    }
+  }
+
+  // Now process affected pairs
+  for (const p of pairs) {
+    const isAFrom =
+      p.studentIdA === cleanFrom || toCanonicalStudentIdForPair(p.studentIdA) === cleanFrom;
+    const isBFrom =
+      p.studentIdB === cleanFrom || toCanonicalStudentIdForPair(p.studentIdB) === cleanFrom;
+    if (!isAFrom && !isBFrom) continue;
+
+    toDeleteSet.add(p.id);
+    const mappedA = isAFrom ? cleanInto : toCanonicalStudentIdForPair(p.studentIdA) || p.studentIdA;
+    const mappedB = isBFrom ? cleanInto : toCanonicalStudentIdForPair(p.studentIdB) || p.studentIdB;
+
+    if (mappedA === mappedB) {
+      // Self-pair (kendisiyle eşleşen çift): delete and do not recreate!
+      continue;
+    }
+
+    const studentIdA = mappedA < mappedB ? mappedA : mappedB;
+    const studentIdB = mappedA < mappedB ? mappedB : mappedA;
+    const newId = `${studentIdA}__${studentIdB}`;
+
+    // If the newId was somehow the same as p.id, don't delete it
+    if (newId === p.id) {
+      toDeleteSet.delete(p.id);
+    }
+
+    if (!nextMap.has(newId)) {
+      const migratedRec: NotDuplicatePairRecord = {
+        id: newId,
+        studentIdA,
+        studentIdB,
+        createdAt: p.createdAt || nowIso,
+        ...(p.note ? { note: p.note } : {}),
+      };
+      nextMap.set(newId, migratedRec);
+      toUpsertMap.set(newId, migratedRec);
+    }
+  }
+
+  return {
+    nextPairs: Array.from(nextMap.values()),
+    toUpsert: Array.from(toUpsertMap.values()),
+    toDeleteIds: Array.from(toDeleteSet),
+  };
+}
+
+/**
+ * Requirement 3:
+ * Bir öğrenci silinirse onunla ilgili not_duplicates kayıtlarını da temizle.
+ */
+export function reconcileNotDuplicatesOnDelete(
+  pairs: NotDuplicatePairRecord[],
+  deletedStudentId: string
+): {
+  nextPairs: NotDuplicatePairRecord[];
+  toDeleteIds: string[];
+} {
+  const cleanDel = (deletedStudentId || '').trim();
+  const canonDel = toCanonicalStudentIdForPair(cleanDel) || cleanDel;
+  const nextPairs: NotDuplicatePairRecord[] = [];
+  const toDeleteIds: string[] = [];
+
+  for (const p of pairs) {
+    const matches =
+      p.studentIdA === cleanDel ||
+      p.studentIdB === cleanDel ||
+      p.studentIdA === canonDel ||
+      p.studentIdB === canonDel ||
+      toCanonicalStudentIdForPair(p.studentIdA) === canonDel ||
+      toCanonicalStudentIdForPair(p.studentIdB) === canonDel;
+    if (matches) {
+      toDeleteIds.push(p.id);
+    } else {
+      nextPairs.push({ ...p });
+    }
+  }
+
+  return { nextPairs, toDeleteIds };
 }
 
 export function syncDatabaseMutations(

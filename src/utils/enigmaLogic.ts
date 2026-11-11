@@ -4,10 +4,12 @@ import {
   Course,
   DB,
   Instructor,
+  isPairIgnoredAsNotDuplicate,
   isPlaceholderStudentName,
   Modality,
   normalizeName,
   normalizeTurkish,
+  NotDuplicatePairRecord,
   resolveCanonicalStudentId,
   SessionType,
   slugifyTurkish,
@@ -338,19 +340,22 @@ export interface SimilarStudentCandidate {
 }
 
 /**
- * Yazım hatası uyarısı (Requirement 2):
+ * Yazım hatası / benzer isim uyarısı (Requirement 2 & 3):
  * Çok benzer ama normalizeName ile birebir aynı olmayan isimleri (ş/s, ı/i, ö/o, ğ/g, ü/u, ç/c farkı,
- * 1-2 harf yazım hatası veya eksik/fazla göbek adı) bulur. Otomatik birleştirme yapmaz,
- * kullanıcıya "Şunu mu demek istedin: <ad>?" sorusu için aday listesi döner.
+ * 1-2 harf yazım hatası, aynı soyadı paylaşıp ad kısmı kısa/1-2 harf farklı olanlar veya eksik/fazla göbek adı) bulur.
+ * not_duplicates listesindeki çiftler için asla uyarı üretmez.
+ * Birebir aynı normalize isimler (stNorm === norm) burada yer almaz (her zaman aynı kişidir).
  */
 export function findSimilarStudentsByName(
   rawName: string,
-  students: Student[]
+  students: Student[],
+  notDuplicatePairs: NotDuplicatePairRecord[] = []
 ): SimilarStudentCandidate[] {
   if (isPlaceholderStudentName(rawName)) return [];
   const norm = normalizeName(rawName);
   if (!norm || norm.length < 3) return [];
   const slug = slugifyTurkish(norm);
+  const candidateId = buildStudentIdFromName(norm);
   const inputTokens = norm.split(' ').filter(Boolean);
 
   const candidates: SimilarStudentCandidate[] = [];
@@ -359,8 +364,16 @@ export function findSimilarStudentsByName(
   for (const st of students) {
     if (isPlaceholderStudentName(st.name)) continue;
     const stNorm = normalizeName(st.name);
-    if (!stNorm || stNorm === norm) continue; // exact matches are handled by findMatchingStudentByFullName
+    if (!stNorm || stNorm === norm) continue; // exact matches are ALWAYS the same person (findMatchingStudentByFullName)
     if (seenIds.has(st.id)) continue;
+
+    // Requirement 1 & 3: If this pair is in not_duplicates, never warn!
+    if (
+      isPairIgnoredAsNotDuplicate(candidateId, st.id, notDuplicatePairs) ||
+      isPairIgnoredAsNotDuplicate(norm, stNorm, notDuplicatePairs)
+    ) {
+      continue;
+    }
 
     const stSlug = slugifyTurkish(stNorm);
 
@@ -389,7 +402,7 @@ export function findSimilarStudentsByName(
       continue;
     }
 
-    // 3. Token subset / missing middle name or fused given name (e.g. "cemre kıllı" vs "fatma cemre kıllı", "aynurnisa ipek" vs "aynur nisa ipek")
+    // 3. Token subset / missing middle name or fused given name, or same surname with short given name difference
     const stTokens = stNorm.split(' ').filter(Boolean);
     if (norm.replace(/\s+/g, '') === stNorm.replace(/\s+/g, '')) {
       seenIds.add(st.id);
@@ -404,6 +417,26 @@ export function findSimilarStudentsByName(
     if (inputTokens.length >= 2 && stTokens.length >= 2) {
       const sameLast = inputTokens[inputTokens.length - 1] === stTokens[stTokens.length - 1];
       const sameFirst = inputTokens[0] === stTokens[0];
+
+      // Same surname + short given name with 1-2 char difference (e.g. "dila acarca" / "sıla acarca")
+      if (sameLast) {
+        const givenA = inputTokens.slice(0, -1).join(' ');
+        const givenB = stTokens.slice(0, -1).join(' ');
+        const givenDist = Math.min(
+          levenshteinDistance(givenA, givenB),
+          levenshteinDistance(slugifyTurkish(givenA), slugifyTurkish(givenB))
+        );
+        if (givenDist >= 1 && givenDist <= 2) {
+          seenIds.add(st.id);
+          candidates.push({
+            student: st,
+            reason: givenDist === 1 ? '1 harf farkı (aynı soyad)' : 'benzer ad ve aynı soyad',
+            distance: givenDist,
+          });
+          continue;
+        }
+      }
+
       if (sameLast && sameFirst && inputTokens.length !== stTokens.length) {
         seenIds.add(st.id);
         candidates.push({

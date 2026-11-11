@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import {
   AttendanceRecord,
+  buildStudentIdFromName,
   Course,
   DB,
   getCanonicalStudentName,
@@ -19,6 +20,7 @@ import {
   isPlaceholderStudentName,
   normalizeName,
   normalizeTurkish,
+  NotDuplicatePairRecord,
   SessionType,
   slugifyTurkish,
   Student,
@@ -55,6 +57,7 @@ interface InstructorViewProps {
   allCourses?: Course[];
   attendanceRecords: AttendanceRecord[];
   unlistedReports?: UnlistedStudentReport[];
+  notDuplicatePairs?: NotDuplicatePairRecord[];
   onSaveAttendance: (
     record: AttendanceRecord,
     options?: {
@@ -66,6 +69,14 @@ interface InstructorViewProps {
   onAddStudent?: (student: Student) => Promise<void>;
   onAddUnlistedStudent?: (report: UnlistedStudentReport) => Promise<void>;
   onRemoveUnlistedStudent?: (reportId: string) => Promise<void>;
+  onMarkNotDuplicatePairs?: (
+    pairs: Array<{ studentId1: string; studentId2: string; note?: string }>
+  ) => Promise<string[]>;
+  onUndoLastNotDuplicate?: () => Promise<void>;
+  onReconcileNotDuplicatesOnMerge?: (
+    fromStudentId: string,
+    intoStudentId: string
+  ) => Promise<void>;
   onDeleteCourseSession?: (
     courseId: string,
     weekNumber: number,
@@ -95,10 +106,14 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   allCourses = DB.courses,
   attendanceRecords,
   unlistedReports = [],
+  notDuplicatePairs = [],
   onSaveAttendance,
   onAddStudent,
   onAddUnlistedStudent,
   onRemoveUnlistedStudent,
+  onMarkNotDuplicatePairs,
+  onUndoLastNotDuplicate,
+  onReconcileNotDuplicatesOnMerge,
   onDeleteCourseSession,
   onBackToLogin,
   onGuardedNavigate,
@@ -125,6 +140,7 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   const [unlistedFeedback, setUnlistedFeedback] = useState<{
     type: 'error' | 'ok';
     text: string;
+    canUndoIgnore?: boolean;
   } | null>(null);
   const [pendingExistingMatch, setPendingExistingMatch] = useState<Student | null>(null);
   const [pendingTypoCandidates, setPendingTypoCandidates] = useState<{
@@ -530,7 +546,11 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
 
     // 3. Check for typo / near-duplicate candidates ("şunu mu demek istedin: <ad>?")
     if (!skipTypoWarning) {
-      const similar = findSimilarStudentsByName(cleanName, allStudents);
+      const similar = findSimilarStudentsByName(
+        cleanName,
+        allStudents,
+        notDuplicatePairs
+      );
       if (similar.length > 0) {
         setPendingExistingMatch(null);
         setPendingTypoCandidates({
@@ -952,26 +972,20 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                     </div>
                   )}
 
-                  {/* Typo warning: "Şunu mu demek istedin: <ad>?" */}
+                  {/* Typo warning: "Şunu mu demek istedin: <ad>?" with 3 options */}
                   {pendingTypoCandidates && (
                     <div
                       data-testid="instructor-typo-student-prompt"
-                      className="mt-2 rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2"
+                      className="mt-2 rounded-xl border border-amber-300 bg-amber-50/95 p-3 text-xs space-y-2.5"
                     >
                       <p className="font-medium text-amber-950">
                         şunu mu demek istedin? (benzer isimli kayıtlı öğrenci bulundu):
                       </p>
-                      <div className="space-y-1.5">
+                      <div className="space-y-2">
                         {pendingTypoCandidates.candidates.map(cand => (
-                          <button
+                          <div
                             key={cand.student.id}
-                            type="button"
-                            onClick={() => {
-                              setUnlistedNameInput(cand.student.name);
-                              setPendingTypoCandidates(null);
-                              void processCandidateNameForUnlisted(cand.student.name, true);
-                            }}
-                            className="w-full flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 text-left text-[11px] text-stone-900 hover:bg-amber-100/70 cursor-pointer"
+                            className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg border border-amber-300 bg-white px-2.5 py-2 text-[11px] text-stone-900"
                           >
                             <span>
                               şunu mu demek istedin: <strong>{cand.student.name}</strong> (
@@ -981,46 +995,103 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                                 .join(', ')}
                               )?
                             </span>
-                            <span className="text-[10px] text-amber-800 shrink-0">
-                              bu öğrenciyi seç →
-                            </span>
-                          </button>
+                            <button
+                              type="button"
+                              data-testid={`instructor-typo-merge-${cand.student.id}`}
+                              onClick={async () => {
+                                const typedId = buildStudentIdFromName(
+                                  pendingTypoCandidates.typedName
+                                );
+                                if (onReconcileNotDuplicatesOnMerge) {
+                                  await onReconcileNotDuplicatesOnMerge(
+                                    typedId,
+                                    cand.student.id
+                                  );
+                                }
+                                setPendingTypoCandidates(null);
+                                await handleConfirmEnrollExistingToCourse(cand.student);
+                              }}
+                              className="rounded-lg bg-stone-900 px-2.5 py-1 text-[11px] font-medium text-stone-100 hover:bg-stone-800 shrink-0 cursor-pointer"
+                            >
+                              Aynı kişi, birleştir
+                            </button>
+                          </div>
                         ))}
                       </div>
-                      <div className="pt-1 flex items-center justify-between gap-2">
+                      <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
                         <button
                           type="button"
-                          onClick={() =>
-                            void finalizeUnlistedReportSubmission(pendingTypoCandidates.typedName)
-                          }
-                          className="rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-[11px] text-stone-700 hover:bg-stone-100 cursor-pointer"
+                          data-testid="instructor-typo-not-duplicate-btn"
+                          onClick={async () => {
+                            const typedName = pendingTypoCandidates.typedName;
+                            const typedId = buildStudentIdFromName(typedName);
+                            const cands = pendingTypoCandidates.candidates;
+                            if (onMarkNotDuplicatePairs) {
+                              await onMarkNotDuplicatePairs(
+                                cands.map(c => ({
+                                  studentId1: typedId,
+                                  studentId2: c.student.id,
+                                  note: `${typedName} — ${c.student.name}`,
+                                }))
+                              );
+                            }
+                            await finalizeUnlistedReportSubmission(typedName);
+                            setUnlistedFeedback({
+                              type: 'ok',
+                              text: `"${typedName}" farklı kişi olarak kaydedildi ve ayrı öğrenci olarak eklendi.`,
+                              canUndoIgnore: true,
+                            });
+                            setTimeout(() => setUnlistedFeedback(null), 6000);
+                          }}
+                          className="rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-[11px] font-medium text-stone-800 hover:bg-stone-100 cursor-pointer"
                         >
-                          hayır, "{pendingTypoCandidates.typedName}" farklı bir öğrenci (yeni ekle)
+                          Farklı kişiler, bir daha sorma
                         </button>
                         <button
                           type="button"
+                          data-testid="instructor-typo-cancel-btn"
                           onClick={() => setPendingTypoCandidates(null)}
-                          className="text-[11px] text-stone-500 hover:text-stone-900 underline cursor-pointer"
+                          className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-[11px] text-stone-600 hover:text-stone-900 cursor-pointer"
                         >
-                          vazgeç
+                          İptal
                         </button>
                       </div>
                     </div>
                   )}
 
                   {unlistedFeedback && (
-                    <p
-                      className={`mt-1.5 text-[11px] flex items-center gap-1 ${
+                    <div
+                      className={`mt-1.5 text-[11px] flex flex-wrap items-center justify-between gap-2 ${
                         unlistedFeedback.type === 'error'
                           ? 'text-rose-700'
                           : 'text-emerald-800'
                       }`}
                     >
-                      {unlistedFeedback.type === 'ok' && (
-                        <Check className="h-3 w-3 shrink-0" />
+                      <span className="flex items-center gap-1">
+                        {unlistedFeedback.type === 'ok' && (
+                          <Check className="h-3 w-3 shrink-0" />
+                        )}
+                        <span>{unlistedFeedback.text}</span>
+                      </span>
+                      {unlistedFeedback.canUndoIgnore && onUndoLastNotDuplicate && (
+                        <button
+                          type="button"
+                          data-testid="instructor-undo-not-duplicate-btn"
+                          onClick={async () => {
+                            await onUndoLastNotDuplicate();
+                            setUnlistedFeedback({
+                              type: 'ok',
+                              text: 'Yoksayma işlemi geri alındı.',
+                            });
+                            setTimeout(() => setUnlistedFeedback(null), 3000);
+                          }}
+                          className="inline-flex items-center gap-1 rounded border border-amber-400 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-950 hover:bg-amber-100 cursor-pointer"
+                        >
+                          <RotateCcw className="h-2.5 w-2.5" />
+                          <span>geri al</span>
+                        </button>
                       )}
-                      <span>{unlistedFeedback.text}</span>
-                    </p>
+                    </div>
                   )}
 
                   {sessionUnlistedReports.length > 0 && (
