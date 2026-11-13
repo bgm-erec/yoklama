@@ -473,7 +473,8 @@ export default function App() {
     );
 
     const coordinatorQuery = query(
-      collection(db, 'coordinator_assignments')
+      collection(db, 'coordinator_assignments'),
+      where('weekNumber', '>=', 1)
     );
     const unsubCoord = onSnapshot(
       coordinatorQuery,

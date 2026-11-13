@@ -44,6 +44,7 @@ import {
   getWeekDateRangeLabel,
   isStudentResponsibleForSession,
   isUnassignedBosInstructor,
+  isYuzyuzeHolidayWeek,
   SimilarStudentCandidate,
 } from '../utils/enigmaLogic';
 import {
@@ -263,7 +264,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     newInstructorName: string;
   } | null>(null);
 
-  const maxWeekToShow = Math.max(currentWeek, 4);
+  const maxWeekToShow = Math.max(currentWeek, 5);
   const weeksList = Array.from({ length: maxWeekToShow }, (_, i) => i + 1);
 
   const normalizedQuery = normalizeTurkish(searchQuery);
@@ -713,18 +714,23 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const baseInstructorStats = useMemo(() => {
     return instructors
       .map(instructor => {
+        const instCourses = instructor.courseIds
+          .map(cid => courses.find(c => c.id === cid))
+          .filter((c): c is Course => Boolean(c));
+
+        const isHolidayThisWeek =
+          instCourses.length > 0 &&
+          instCourses.every(c => c.modality === 'yuzyuze') &&
+          isYuzyuzeHolidayWeek(currentWeek);
+
         const thisWeekRecords = attendanceRecords.filter(
           r =>
             (r.instructorId === instructor.id || instructor.courseIds.includes(r.courseId)) &&
             r.weekNumber === currentWeek
         );
-        const didNotTakeAttendance = thisWeekRecords.length === 0;
-        const markedDidNotHold = thisWeekRecords.some(r => r.didNotHoldClass);
+        const didNotTakeAttendance = !isHolidayThisWeek && thisWeekRecords.length === 0;
+        const markedDidNotHold = !isHolidayThisWeek && thisWeekRecords.some(r => r.didNotHoldClass);
         const inactiveThisWeek = didNotTakeAttendance || markedDidNotHold;
-
-        const instCourses = instructor.courseIds
-          .map(cid => courses.find(c => c.id === cid))
-          .filter((c): c is Course => Boolean(c));
 
         return {
           instructor,
@@ -733,6 +739,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           didNotTakeAttendance,
           markedDidNotHold,
           inactiveThisWeek,
+          isHolidayThisWeek,
         };
       })
       .sort((a, b) => {
@@ -770,6 +777,9 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const baseCourseStats = useMemo(() => {
     return courses
       .map(course => {
+        const isHolidayThisWeek =
+          course.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(currentWeek);
+
         const courseRecords = attendanceRecords.filter(
           r => r.courseId === course.id && r.weekNumber <= currentWeek
         );
@@ -778,13 +788,14 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
           (sum, r) => sum + r.absentStudentIds.length,
           0
         );
-        const noAttendanceThisWeek = thisWeekRecords.length === 0;
+        const noAttendanceThisWeek = !isHolidayThisWeek && thisWeekRecords.length === 0;
 
         return {
           course,
           thisWeekRecords,
           totalAbsences,
           noAttendanceThisWeek,
+          isHolidayThisWeek,
         };
       })
       .sort((a, b) => {
@@ -818,6 +829,19 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
 
   // Helper to render a cell for (courseId, studentId, weekNumber)
   const renderStudentCourseWeekCell = (courseId: string, studentId: string, week: number) => {
+    const course = courses.find(c => c.id === courseId);
+    if (course?.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(week)) {
+      return (
+        <span
+          data-testid={`matrix-holiday-cell-${courseId}-w${week}`}
+          className="inline-flex items-center gap-1 rounded-md border border-amber-200/90 bg-amber-50/90 px-2 py-0.5 text-[11px] font-medium text-amber-900"
+        >
+          <span aria-hidden="true">🏖️</span>
+          <span>tatil</span>
+        </span>
+      );
+    }
+
     const student = students.find(s => s.id === studentId);
     if (student?.addedAtWeek && week < student.addedAtWeek) {
       return <span className="text-stone-400 italic">kayıt öncesi</span>;
@@ -916,14 +940,30 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             <thead>
               <tr className="border-b border-stone-200 text-xs text-stone-500">
                 <th className="py-2.5 pr-3 font-medium sticky left-0 bg-white/95 z-10">öğrenci</th>
-                {weeksList.map(w => (
-                  <th key={w} className="py-2.5 px-3 font-medium font-mono-num whitespace-nowrap">
-                    {w}. hafta
-                    <div className="text-[10px] font-normal text-stone-400">
-                      {getWeekDateRangeLabel(w)}
-                    </div>
-                  </th>
-                ))}
+                {weeksList.map(w => {
+                  const isHolidayCol =
+                    course.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(w);
+                  return (
+                    <th
+                      key={w}
+                      className={`py-2.5 px-3 font-medium font-mono-num whitespace-nowrap ${
+                        isHolidayCol ? 'bg-amber-50/70 text-amber-950' : ''
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>{w}. hafta</span>
+                        {isHolidayCol && (
+                          <span className="inline-flex items-center gap-0.5 rounded border border-amber-300 bg-amber-100 px-1.5 py-0.5 text-[9px] font-sans font-medium text-amber-900">
+                            🏖️ tatil
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] font-normal text-stone-400">
+                        {getWeekDateRangeLabel(w)}
+                      </div>
+                    </th>
+                  );
+                })}
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-200/60 text-xs">
@@ -942,11 +982,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                       {st.name}
                     </button>
                   </td>
-                  {weeksList.map(w => (
-                    <td key={w} className="py-3 sm:py-2.5 px-3 whitespace-nowrap">
-                      {renderStudentCourseWeekCell(course.id, st.id, w)}
-                    </td>
-                  ))}
+                  {weeksList.map(w => {
+                    const isHolidayCol =
+                      course.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(w);
+                    return (
+                      <td
+                        key={w}
+                        className={`py-3 sm:py-2.5 px-3 whitespace-nowrap ${
+                          isHolidayCol ? 'bg-amber-50/35' : ''
+                        }`}
+                      >
+                        {renderStudentCourseWeekCell(course.id, st.id, w)}
+                      </td>
+                    );
+                  })}
                 </tr>
               ))}
 
@@ -978,6 +1027,21 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                     </span>
                   </td>
                   {weeksList.map(w => {
+                    const isHolidayCol =
+                      course.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(w);
+                    if (isHolidayCol) {
+                      return (
+                        <td
+                          key={w}
+                          className="py-3 sm:py-2.5 px-3 whitespace-nowrap bg-amber-50/35"
+                        >
+                          <span className="inline-flex items-center gap-1 rounded-md border border-amber-200/90 bg-amber-50/90 px-2 py-0.5 text-[11px] font-medium text-amber-900">
+                            <span aria-hidden="true">🏖️</span>
+                            <span>tatil</span>
+                          </span>
+                        </td>
+                      );
+                    }
                     const weekReports = tempItem.reports.filter(r => r.weekNumber === w);
                     if (weekReports.length === 0) {
                       return (
@@ -2455,7 +2519,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               </div>
             ) : (
               <div className="divide-y divide-stone-200/70 max-h-[600px] overflow-y-auto pr-1">
-                {courseStats.map(({ course, totalAbsences, noAttendanceThisWeek }) => (
+                {courseStats.map(({ course, totalAbsences, noAttendanceThisWeek, isHolidayThisWeek }) => (
                   <button
                     key={course.id}
                     type="button"
@@ -2479,13 +2543,19 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                         toplam gelmeyen: {totalAbsences}
                       </span>
                       <span className="text-stone-400">·</span>
-                      <span
-                        className={
-                          noAttendanceThisWeek ? 'text-amber-700 font-medium' : 'text-emerald-800'
-                        }
-                      >
-                        {noAttendanceThisWeek ? 'bu hafta girilmedi' : 'bu hafta girildi'}
-                      </span>
+                      {isHolidayThisWeek ? (
+                        <span className="text-amber-700 font-medium">
+                          🏖️ bu hafta tatil
+                        </span>
+                      ) : (
+                        <span
+                          className={
+                            noAttendanceThisWeek ? 'text-amber-700 font-medium' : 'text-emerald-800'
+                          }
+                        >
+                          {noAttendanceThisWeek ? 'bu hafta girilmedi' : 'bu hafta girildi'}
+                        </span>
+                      )}
                     </div>
                   </button>
                 ))}
@@ -2514,7 +2584,13 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             ) : (
               <div className="divide-y divide-stone-200/70 max-h-[600px] overflow-y-auto pr-1">
                 {instructorStats.map(
-                  ({ instructor, courses: instCourses, markedDidNotHold, didNotTakeAttendance }) => (
+                  ({
+                    instructor,
+                    courses: instCourses,
+                    markedDidNotHold,
+                    didNotTakeAttendance,
+                    isHolidayThisWeek,
+                  }) => (
                     <button
                       key={instructor.id}
                       type="button"
@@ -2530,7 +2606,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                         </span>
                       </div>
                       <div className="text-xs font-medium">
-                        {markedDidNotHold ? (
+                        {isHolidayThisWeek ? (
+                          <span className="text-amber-700">
+                            🏖️ bu hafta tatil (yüz yüze)
+                          </span>
+                        ) : markedDidNotHold ? (
                           <span className="text-amber-700">
                             bu hafta ders yapmadı
                           </span>

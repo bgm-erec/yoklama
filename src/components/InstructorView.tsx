@@ -33,8 +33,11 @@ import {
   findMatchingStudentByFullName,
   findSimilarStudentsByName,
   getWeekDateRangeLabel,
+  isYuzyuzeHolidayWeek,
   resolveExitPromptDecision,
   shouldPromptEmptyExit,
+  shouldShowOnlineWeek5ThankYou,
+  shouldShowYuzyuzeHolidayMessage,
   SimilarStudentCandidate,
 } from '../utils/enigmaLogic';
 
@@ -276,7 +279,23 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     });
   };
 
+  const isCurrentCourseHolidayWeek = shouldShowYuzyuzeHolidayMessage(
+    activeCourse?.modality,
+    selectedWeek
+  );
+
+  const showOnlineWeek5ThankYou = shouldShowOnlineWeek5ThankYou(
+    activeCourse?.modality,
+    selectedWeek,
+    currentWeek
+  );
+
   const attemptNavigationOrExit = (action: () => void) => {
+    if (isCurrentCourseHolidayWeek) {
+      onGuardedNavigate(action);
+      return;
+    }
+
     const needsPrompt = shouldPromptEmptyExit({
       selectedSession,
       presentStudentCount: presentStudentIds.length,
@@ -597,6 +616,15 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 <span>aktif hafta</span>
               </>
             )}
+            {isCurrentCourseHolidayWeek && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-100/90 px-2 py-0.5 text-[11px] font-medium text-amber-900">
+                  <span aria-hidden="true">🏖️</span>
+                  <span>tatil haftası</span>
+                </span>
+              </>
+            )}
           </div>
         </div>
 
@@ -612,15 +640,20 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
               onChange={e => {
                 const nextWeek = Number(e.target.value);
                 if (nextWeek === selectedWeek) return;
-                attemptNavigationOrExit(() => onSelectWeek(nextWeek));
+                onGuardedNavigate(() => onSelectWeek(nextWeek));
               }}
               className="rounded-lg border border-stone-300 bg-white/90 px-2.5 py-1.5 text-xs font-mono-num text-stone-800 focus:border-stone-600 focus:outline-none cursor-pointer"
             >
-              {Array.from({ length: Math.max(currentWeek + 2, 12) }, (_, i) => i + 1).map(w => (
-                <option key={w} value={w}>
-                  {w}. hafta {w === currentWeek ? '(bu hafta)' : ''}
-                </option>
-              ))}
+              {Array.from({ length: Math.max(currentWeek + 2, 12) }, (_, i) => i + 1).map(w => {
+                const isWeekYuzyuzeHoliday =
+                  activeCourse?.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(w);
+                return (
+                  <option key={w} value={w}>
+                    {w}. hafta{isWeekYuzyuzeHoliday ? ' (tatil)' : ''}{' '}
+                    {w === currentWeek ? '(bu hafta)' : ''}
+                  </option>
+                );
+              })}
             </select>
           </div>
         </div>
@@ -695,11 +728,59 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
         </div>
       )}
 
-      {/* Four session options: 1. ders, 2. ders, ek dersler, ders yapmadım */}
-      <div className="mb-6 sm:mb-8">
-        <p className="text-sm text-stone-700 mb-3">
-          bu hafta hangi dersin yoklamasını giriyorsun?
-        </p>
+      {/* Online Week 5 Sincere & Emoji-Rich Thank-You Banner (Active only for Online courses on Week 5, expires Week 6+) */}
+      {showOnlineWeek5ThankYou && (
+        <div
+          data-testid="online-week5-thankyou-banner"
+          role="status"
+          className="mb-6 rounded-2xl border-2 border-emerald-300/90 bg-gradient-to-br from-emerald-50/95 via-[#f7fdf9] to-teal-50/90 p-5 sm:p-6 shadow-sm"
+        >
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3.5 sm:gap-4">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-emerald-300 bg-emerald-100/90 text-2xl">
+              💛
+            </div>
+            <div className="space-y-1.5">
+              <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-200/75 px-2.5 py-0.5 text-[11px] font-medium text-emerald-950">
+                <span>✨ 5. hafta · çevrim içi eğitmenlerimize özel ✨</span>
+              </div>
+              <h2 className="font-serif-art text-xl sm:text-2xl text-stone-900 leading-snug">
+                bu hafta ders yaptığın için teşekkür ederiz 🥰🎉🌸
+              </h2>
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
+                yüz yüze derslerin tatilde olduğu bu 5. haftada bile ekran başında öğrencilerimizle buluştuğun, enerjini ve güzel emeğini esirgemediğin için sana kocaman sarılıyoruz! 🤗💫 iyi ki varsın, iyi ki bgm ailesindesin — dersin su gibi keyifli geçsin canım hocamız! 📚🍀✨🙏
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Yüz Yüze Week 4 & Week 5 Holiday Message OR Session Attendance Area */}
+      {isCurrentCourseHolidayWeek ? (
+        <div
+          data-testid="yuzyuze-holiday-banner"
+          role="status"
+          className="rounded-2xl border-2 border-amber-300/90 bg-gradient-to-br from-amber-50/95 via-[#fdfaf2] to-orange-50/90 p-6 sm:p-10 text-center shadow-sm"
+        >
+          <div className="mx-auto mb-3.5 flex h-14 w-14 items-center justify-center rounded-2xl border border-amber-300 bg-amber-100/90 text-3xl">
+            🏖️
+          </div>
+          <span className="inline-block rounded-full bg-amber-200/80 px-3 py-0.5 text-[11px] font-mono-num font-medium text-amber-950 mb-2.5">
+            {selectedWeek}. hafta ({getWeekDateRangeLabel(selectedWeek)}) · yüz yüze derslere tatil
+          </span>
+          <h2 className="font-serif-art text-2xl sm:text-3xl text-stone-900 leading-snug">
+            bu hafta bgm&apos;ye tatil, teşekkür ederiz, iyi eğlenceler 🎉☀️🎈
+          </h2>
+          <p className="mx-auto mt-3 max-w-xl text-xs sm:text-sm text-stone-600 leading-relaxed">
+            4. ve 5. haftalarda yüz yüze derslerimiz tatildir; bu hafta için yoklama almana gerek bulunmuyor. bolca dinlendiğin, keyifli ve harika bir hafta dileriz! 🌸✨
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Four session options: 1. ders, 2. ders, ek dersler, ders yapmadım */}
+          <div className="mb-6 sm:mb-8">
+            <p className="text-sm text-stone-700 mb-3">
+              bu hafta hangi dersin yoklamasını giriyorsun?
+            </p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3">
           {SESSION_OPTIONS.map(session => {
             const isSelected = selectedSession === session;
@@ -1184,6 +1265,8 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
             yoklama listesini açmak için yukarıdaki dört seçenekten birini (1. ders, 2. ders, ek dersler veya ders yapmadım) seç.
           </p>
         </div>
+      )}
+        </>
       )}
 
       {/* Exit / Uninteracted Attendance Prompt Modal: "durum nedir?" */}

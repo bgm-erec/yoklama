@@ -20,7 +20,10 @@ import {
   ACADEMIC_CONFIG,
   getTrustedNow,
   getZonedDateParts,
+  ONLINE_THANK_YOU_EXPIRES_WEEK,
+  ONLINE_THANK_YOU_WEEK,
   parseIsoDateToUtcMidnightMs,
+  YUZYUZE_HOLIDAY_WEEKS,
 } from '../config/academicConfig';
 
 export type LoginResolution =
@@ -261,6 +264,39 @@ export function cleanCoordinatorNames(
     }
     return null;
   });
+}
+
+/**
+ * Returns true if the given academic week is an official holiday for yüz yüze (in-person) classes
+ * and weekend coordinator tracking (weeks 4 and 5).
+ */
+export function isYuzyuzeHolidayWeek(weekNumber: number): boolean {
+  return YUZYUZE_HOLIDAY_WEEKS.includes(weekNumber);
+}
+
+/**
+ * Returns true if the online instructor should see the warm thank-you message for week 5.
+ * Shown only for online modality, when viewing week 5, and expires from week 6 onwards.
+ */
+export function shouldShowOnlineWeek5ThankYou(
+  modality: Modality | undefined,
+  selectedWeek: number,
+  currentWeek: number
+): boolean {
+  if (modality !== 'online') return false;
+  if (currentWeek >= ONLINE_THANK_YOU_EXPIRES_WEEK) return false;
+  return selectedWeek === ONLINE_THANK_YOU_WEEK;
+}
+
+/**
+ * Returns true if the yüz yüze instructor is viewing a holiday week (week 4 or 5)
+ * on the attendance sheet.
+ */
+export function shouldShowYuzyuzeHolidayMessage(
+  modality: Modality | undefined,
+  selectedWeek: number
+): boolean {
+  return modality === 'yuzyuze' && isYuzyuzeHolidayWeek(selectedWeek);
 }
 
 /**

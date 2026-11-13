@@ -24,6 +24,9 @@ import {
   detectConcurrentAttendanceConflict,
   findSimilarStudentsByName,
   getWeekWeekendDates,
+  isYuzyuzeHolidayWeek,
+  shouldShowOnlineWeek5ThankYou,
+  shouldShowYuzyuzeHolidayMessage,
 } from './enigmaLogic';
 import {
   AttendanceRecord,
@@ -1138,5 +1141,38 @@ test('coordinator tracking: duplicate detection correctly normalizes Turkish cha
   assert.notEqual(normalizeName(sib1), normalizeName(sib2));
 });
 
+test('holiday logic: weeks 4 and 5 are holidays for yüz yüze and coordinator tracking', () => {
+  assert.equal(isYuzyuzeHolidayWeek(1), false);
+  assert.equal(isYuzyuzeHolidayWeek(2), false);
+  assert.equal(isYuzyuzeHolidayWeek(3), false);
+  assert.equal(isYuzyuzeHolidayWeek(4), true);
+  assert.equal(isYuzyuzeHolidayWeek(5), true);
+  assert.equal(isYuzyuzeHolidayWeek(6), false);
+  assert.equal(isYuzyuzeHolidayWeek(12), false);
 
+  // Yüz yüze holiday message only shows for yuzyuze modality on weeks 4 and 5
+  assert.equal(shouldShowYuzyuzeHolidayMessage('yuzyuze', 4), true);
+  assert.equal(shouldShowYuzyuzeHolidayMessage('yuzyuze', 5), true);
+  assert.equal(shouldShowYuzyuzeHolidayMessage('yuzyuze', 3), false);
+  assert.equal(shouldShowYuzyuzeHolidayMessage('yuzyuze', 6), false);
+  assert.equal(shouldShowYuzyuzeHolidayMessage('online', 4), false);
+  assert.equal(shouldShowYuzyuzeHolidayMessage('online', 5), false);
+});
 
+test('online week 5 thank-you message: shows only for online instructors on week 5 and expires from week 6 onwards', () => {
+  // Online instructor in week 5 -> true
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 5, 5), true);
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 5, 4), true);
+
+  // Online instructor viewing week 4 -> false
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 4, 4), false);
+
+  // Online instructor from week 6 onwards -> expired (false)
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 5, 6), false);
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 6, 6), false);
+  assert.equal(shouldShowOnlineWeek5ThankYou('online', 5, 7), false);
+
+  // Yüz yüze instructor -> never sees the online week 5 message
+  assert.equal(shouldShowOnlineWeek5ThankYou('yuzyuze', 5, 5), false);
+  assert.equal(shouldShowOnlineWeek5ThankYou('yuzyuze', 5, 4), false);
+});

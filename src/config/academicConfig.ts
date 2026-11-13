@@ -31,6 +31,18 @@ export const ACADEMIC_CONFIG: AcademicCalendarConfig = {
 export const TOTAL_TERM_WEEKS = 12;
 
 /**
+ * Weeks that are official holidays for in-person ("yüz yüze") courses and weekend coordinators.
+ */
+export const YUZYUZE_HOLIDAY_WEEKS: readonly number[] = [4, 5];
+
+/**
+ * Week number during which online ("çevrim içi") instructors see a warm thank-you message
+ * (active for week 5, expires starting week 6).
+ */
+export const ONLINE_THANK_YOU_WEEK = 5;
+export const ONLINE_THANK_YOU_EXPIRES_WEEK = 6;
+
+/**
  * Offset in milliseconds between trusted server clock and local device clock:
  * trustedTimeMs = Date.now() + serverClockOffsetMs
  */

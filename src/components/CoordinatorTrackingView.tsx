@@ -10,6 +10,7 @@ import {
   cleanCoordinatorNames,
   getWeekWeekendDates,
   isUnassignedBosInstructor,
+  isYuzyuzeHolidayWeek,
 } from '../utils/enigmaLogic';
 
 interface CoordinatorTrackingViewProps {
@@ -270,6 +271,7 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                 const dates = getWeekWeekendDates(weekNum);
                 const isCurrent = weekNum === currentWeek;
                 const isPast = weekNum < currentWeek;
+                const isHoliday = isYuzyuzeHolidayWeek(weekNum);
 
                 const weekDraft = localDrafts[weekNum] || {
                   saturday: {
@@ -303,9 +305,12 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                     key={weekNum}
                     ref={isCurrent ? currentWeekRef : undefined}
                     id={`coordinator-week-${weekNum}`}
+                    data-testid={`coordinator-row-week-${weekNum}`}
                     className={`transition-colors ${
                       isCurrent
                         ? 'bg-amber-50/70 border-l-4 border-l-stone-900 font-medium'
+                        : isHoliday
+                        ? 'bg-amber-50/35'
                         : isPast
                         ? 'bg-stone-50/40 text-stone-600 opacity-75 hover:opacity-100'
                         : 'hover:bg-stone-50/80'
@@ -330,6 +335,15 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                             gelecek hafta
                           </span>
                         )}
+                        {isHoliday && (
+                          <span
+                            data-testid={`coordinator-holiday-badge-${weekNum}`}
+                            className="inline-flex items-center gap-1 w-fit rounded-md border border-amber-300 bg-amber-100/90 px-2 py-0.5 text-[10px] font-medium text-amber-900"
+                          >
+                            <span aria-hidden="true">🏖️</span>
+                            <span>tatil</span>
+                          </span>
+                        )}
                       </div>
                     </td>
 
@@ -338,7 +352,7 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                       <div className="space-y-2">
                         <div className="flex items-center justify-between text-xs text-stone-500 font-mono-num">
                           <span>{dates.saturdayFormatted}</span>
-                          {isSatFailed && (
+                          {!isHoliday && isSatFailed && (
                             <button
                               type="button"
                               onClick={() =>
@@ -357,59 +371,71 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                           )}
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <input
-                            type="text"
-                            list="coordinator-instructor-suggestions"
-                            value={weekDraft.saturday.slot0}
-                            onChange={e =>
-                              handleInputChange(
-                                weekNum,
-                                'saturday',
-                                0,
-                                e.target.value
-                              )
-                            }
-                            onBlur={() => handleInputBlur(weekNum, 'saturday')}
-                            placeholder="henüz atanmadı"
-                            className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
-                              isSatFailed
-                                ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
-                                : isSatDuplicate
-                                ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
-                                : 'border-stone-300 bg-white focus:border-stone-800'
-                            }`}
-                          />
-
-                          <input
-                            type="text"
-                            list="coordinator-instructor-suggestions"
-                            value={weekDraft.saturday.slot1}
-                            onChange={e =>
-                              handleInputChange(
-                                weekNum,
-                                'saturday',
-                                1,
-                                e.target.value
-                              )
-                            }
-                            onBlur={() => handleInputBlur(weekNum, 'saturday')}
-                            placeholder="henüz atanmadı"
-                            className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
-                              isSatFailed
-                                ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
-                                : isSatDuplicate
-                                ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
-                                : 'border-stone-300 bg-white focus:border-stone-800'
-                            }`}
-                          />
-                        </div>
-
-                        {isSatDuplicate && (
-                          <div className="flex items-center gap-1 text-[11px] text-amber-800 bg-amber-50/80 rounded-md px-2 py-0.5 border border-amber-200">
-                            <AlertCircle className="h-3 w-3 shrink-0 text-amber-700" />
-                            <span>aynı kişi cumartesi günü için iki kez yazıldı</span>
+                        {isHoliday ? (
+                          <div
+                            data-testid={`coordinator-holiday-sat-${weekNum}`}
+                            className="flex items-center gap-2 rounded-xl border border-amber-200/90 bg-amber-50/80 px-3 py-2 text-xs font-medium text-amber-900"
+                          >
+                            <span aria-hidden="true">🏖️</span>
+                            <span>tatil (yüz yüze derslere tatil)</span>
                           </div>
+                        ) : (
+                          <>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              <input
+                                type="text"
+                                list="coordinator-instructor-suggestions"
+                                value={weekDraft.saturday.slot0}
+                                onChange={e =>
+                                  handleInputChange(
+                                    weekNum,
+                                    'saturday',
+                                    0,
+                                    e.target.value
+                                  )
+                                }
+                                onBlur={() => handleInputBlur(weekNum, 'saturday')}
+                                placeholder="henüz atanmadı"
+                                className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
+                                  isSatFailed
+                                    ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
+                                    : isSatDuplicate
+                                    ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
+                                    : 'border-stone-300 bg-white focus:border-stone-800'
+                                }`}
+                              />
+
+                              <input
+                                type="text"
+                                list="coordinator-instructor-suggestions"
+                                value={weekDraft.saturday.slot1}
+                                onChange={e =>
+                                  handleInputChange(
+                                    weekNum,
+                                    'saturday',
+                                    1,
+                                    e.target.value
+                                  )
+                                }
+                                onBlur={() => handleInputBlur(weekNum, 'saturday')}
+                                placeholder="henüz atanmadı"
+                                className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
+                                  isSatFailed
+                                    ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
+                                    : isSatDuplicate
+                                    ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
+                                    : 'border-stone-300 bg-white focus:border-stone-800'
+                                }`}
+                              />
+                            </div>
+
+                            {isSatDuplicate && (
+                              <div className="flex items-center gap-1 text-[11px] text-amber-800 bg-amber-50/80 rounded-md px-2 py-0.5 border border-amber-200">
+                                <AlertCircle className="h-3 w-3 shrink-0 text-amber-700" />
+                                <span>aynı kişi cumartesi günü için iki kez yazıldı</span>
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     </td>
@@ -419,7 +445,7 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                       <div className="space-y-2">
                         <div className="flex items-center justify-between text-xs text-stone-500 font-mono-num">
                           <span>{dates.sundayFormatted}</span>
-                          {isSunFailed && (
+                          {!isHoliday && isSunFailed && (
                             <button
                               type="button"
                               onClick={() =>
@@ -438,59 +464,71 @@ export const CoordinatorTrackingView: React.FC<CoordinatorTrackingViewProps> = (
                           )}
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <input
-                            type="text"
-                            list="coordinator-instructor-suggestions"
-                            value={weekDraft.sunday.slot0}
-                            onChange={e =>
-                              handleInputChange(
-                                weekNum,
-                                'sunday',
-                                0,
-                                e.target.value
-                              )
-                            }
-                            onBlur={() => handleInputBlur(weekNum, 'sunday')}
-                            placeholder="henüz atanmadı"
-                            className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
-                              isSunFailed
-                                ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
-                                : isSunDuplicate
-                                ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
-                                : 'border-stone-300 bg-white focus:border-stone-800'
-                            }`}
-                          />
-
-                          <input
-                            type="text"
-                            list="coordinator-instructor-suggestions"
-                            value={weekDraft.sunday.slot1}
-                            onChange={e =>
-                              handleInputChange(
-                                weekNum,
-                                'sunday',
-                                1,
-                                e.target.value
-                              )
-                            }
-                            onBlur={() => handleInputBlur(weekNum, 'sunday')}
-                            placeholder="henüz atanmadı"
-                            className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
-                              isSunFailed
-                                ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
-                                : isSunDuplicate
-                                ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
-                                : 'border-stone-300 bg-white focus:border-stone-800'
-                            }`}
-                          />
-                        </div>
-
-                        {isSunDuplicate && (
-                          <div className="flex items-center gap-1 text-[11px] text-amber-800 bg-amber-50/80 rounded-md px-2 py-0.5 border border-amber-200">
-                            <AlertCircle className="h-3 w-3 shrink-0 text-amber-700" />
-                            <span>aynı kişi pazar günü için iki kez yazıldı</span>
+                        {isHoliday ? (
+                          <div
+                            data-testid={`coordinator-holiday-sun-${weekNum}`}
+                            className="flex items-center gap-2 rounded-xl border border-amber-200/90 bg-amber-50/80 px-3 py-2 text-xs font-medium text-amber-900"
+                          >
+                            <span aria-hidden="true">🏖️</span>
+                            <span>tatil (yüz yüze derslere tatil)</span>
                           </div>
+                        ) : (
+                          <>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              <input
+                                type="text"
+                                list="coordinator-instructor-suggestions"
+                                value={weekDraft.sunday.slot0}
+                                onChange={e =>
+                                  handleInputChange(
+                                    weekNum,
+                                    'sunday',
+                                    0,
+                                    e.target.value
+                                  )
+                                }
+                                onBlur={() => handleInputBlur(weekNum, 'sunday')}
+                                placeholder="henüz atanmadı"
+                                className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
+                                  isSunFailed
+                                    ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
+                                    : isSunDuplicate
+                                    ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
+                                    : 'border-stone-300 bg-white focus:border-stone-800'
+                                }`}
+                              />
+
+                              <input
+                                type="text"
+                                list="coordinator-instructor-suggestions"
+                                value={weekDraft.sunday.slot1}
+                                onChange={e =>
+                                  handleInputChange(
+                                    weekNum,
+                                    'sunday',
+                                    1,
+                                    e.target.value
+                                  )
+                                }
+                                onBlur={() => handleInputBlur(weekNum, 'sunday')}
+                                placeholder="henüz atanmadı"
+                                className={`w-full rounded-xl border px-3 py-1.5 text-xs text-stone-900 placeholder:text-stone-400 placeholder:italic focus:outline-none transition-colors ${
+                                  isSunFailed
+                                    ? 'border-rose-500 bg-rose-50/60 focus:border-rose-700'
+                                    : isSunDuplicate
+                                    ? 'border-amber-400 bg-amber-50/50 focus:border-amber-600'
+                                    : 'border-stone-300 bg-white focus:border-stone-800'
+                                }`}
+                              />
+                            </div>
+
+                            {isSunDuplicate && (
+                              <div className="flex items-center gap-1 text-[11px] text-amber-800 bg-amber-50/80 rounded-md px-2 py-0.5 border border-amber-200">
+                                <AlertCircle className="h-3 w-3 shrink-0 text-amber-700" />
+                                <span>aynı kişi pazar günü için iki kez yazıldı</span>
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     </td>
