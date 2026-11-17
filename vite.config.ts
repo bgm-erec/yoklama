@@ -6,7 +6,22 @@ import {defineConfig} from 'vite';
 export default defineConfig(() => {
   return {
     base: './',
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      {
+        name: 'disable-vite-hmr-ws',
+        transform(code, id) {
+          if (id.includes('vite/dist/client/client.mjs')) {
+            return code.replace(
+              /const createWebSocketModuleRunnerTransport = \(options\) => \{[\s\S]*?\n\};\n/,
+              'const createWebSocketModuleRunnerTransport = () => ({ async connect() {}, async disconnect() {}, send() {} });\n'
+            );
+          }
+          return null;
+        },
+      },
+    ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
