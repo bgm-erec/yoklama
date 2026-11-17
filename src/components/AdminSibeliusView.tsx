@@ -52,6 +52,7 @@ import {
   MigrationUserResolutions,
 } from '../utils/studentMigration';
 import { CoordinatorTrackingView } from './CoordinatorTrackingView';
+import { SibeliusAssistantWidget } from './SibeliusAssistantWidget';
 
 interface AdminSibeliusViewProps {
   currentWeek: number;
@@ -1358,6 +1359,16 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             )}
         </div>
       )}
+
+      {/* Modular Sibelius AI Question Assistant (can be hidden by user or disabled via ENABLE_SIBELIUS_CHATBOT) */}
+      <SibeliusAssistantWidget
+        currentWeek={currentWeek}
+        students={students}
+        courses={courses}
+        instructors={instructors}
+        attendanceRecords={attendanceRecords}
+        unlistedReports={unlistedReports}
+      />
 
       {/* Category 0: Main Menu + Liste Dışı Öğrenciler + Student Add/Remove + Instructor Assignment */}
       {category === 'menu' && (
