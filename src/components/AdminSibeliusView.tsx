@@ -42,7 +42,6 @@ import {
   findMatchingStudentByFullName,
   findSimilarStudentsByName,
   getWeekDateRangeLabel,
-  isStudentResponsibleForSession,
   isUnassignedBosInstructor,
   isYuzyuzeHolidayWeek,
   SimilarStudentCandidate,
@@ -51,8 +50,15 @@ import {
   buildMigrationDryRunReport,
   MigrationUserResolutions,
 } from '../utils/studentMigration';
+import {
+  buildAttendanceIndex,
+  computeCourseStats,
+  computeInstructorStats,
+  computeStudentStats,
+  resolveStudentCourseWeekCell,
+} from '../utils/sibeliusStats';
+import { YuzyuzeUnionExecutionResult } from '../utils/yuzyuzeUnion';
 import { CoordinatorTrackingView } from './CoordinatorTrackingView';
-import { SibeliusAssistantWidget } from './SibeliusAssistantWidget';
 
 interface AdminSibeliusViewProps {
   currentWeek: number;
@@ -65,6 +71,7 @@ interface AdminSibeliusViewProps {
   notDuplicatePairs?: NotDuplicatePairRecord[];
   coordinatorAssignments?: CoordinatorAssignmentRecord[];
   auditLogs?: AuditLogEntry[];
+  onCategoryChange?: (category: AdminCategory) => void;
   onAddStudent: (student: Student) => Promise<void>;
   onRemoveStudent: (student: Student) => Promise<void>;
   onAssignInstructor: (
@@ -88,7 +95,7 @@ interface AdminSibeliusViewProps {
     fromStudentId: string,
     intoStudentId: string
   ) => Promise<void>;
-  onDownloadMigrationBackup?: () => void;
+  onDownloadMigrationBackup?: () => void | Promise<void>;
   onExecuteStudentMigration?: (resolutions: MigrationUserResolutions) => Promise<string>;
   canUndoMigration?: boolean;
   onUndoMigration?: () => Promise<void>;
@@ -105,10 +112,11 @@ interface AdminSibeliusViewProps {
   onResetAllFeedbacks: () => Promise<void>;
   canUndoFeedbackReset?: boolean;
   onUndoFeedbackReset?: () => Promise<void>;
+  onUnifyYuzyuzeClasses?: () => Promise<YuzyuzeUnionExecutionResult>;
   onBackToLogin: () => void;
 }
 
-type AdminCategory =
+export type AdminCategory =
   | 'menu'
   | 'ders'
   | 'ogrenci'
@@ -182,6 +190,8 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   onResetAllFeedbacks,
   canUndoFeedbackReset,
   onUndoFeedbackReset,
+  onUnifyYuzyuzeClasses,
+  onCategoryChange,
   onBackToLogin,
 }) => {
   const attendanceRecords = useMemo(
@@ -193,11 +203,28 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     [rawUnlistedReports]
   );
 
+  const coursesById = useMemo(
+    () => new Map(courses.map(c => [c.id, c])),
+    [courses]
+  );
+  const studentsById = useMemo(
+    () => new Map(students.map(s => [s.id, s])),
+    [students]
+  );
+  const attendanceIndex = useMemo(
+    () => buildAttendanceIndex(attendanceRecords),
+    [attendanceRecords]
+  );
+
   const [category, setCategory] = useState<AdminCategory>('menu');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [selectedCourseId, setSelectedCourseId] = useState<string | null>(null);
   const [selectedInstructorId, setSelectedInstructorId] = useState<string | null>(null);
+
+  useEffect(() => {
+    onCategoryChange?.(category);
+  }, [category, onCategoryChange]);
 
   // Compact top-right reset states with text confirmation ("SIFIRLA")
   const [confirmingAttendanceReset, setConfirmingAttendanceReset] = useState(false);
@@ -206,6 +233,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
   const [feedbackResetConfirmText, setFeedbackResetConfirmText] = useState('');
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [showUndoIgnoreInNotice, setShowUndoIgnoreInNotice] = useState(false);
+  const [isUnifyingYuzyuze, setIsUnifyingYuzyuze] = useState(false);
 
   // Add / Remove Student Panel states
   const [activeStudentPanel, setActiveStudentPanel] = useState<'none' | 'add' | 'remove'>('none');
@@ -386,29 +414,29 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     return studentId.replace(/^stu-/, '').replace(/-/g, ' ');
   };
 
-  const migrationDryRunReport = useMemo(
-    () =>
-      buildMigrationDryRunReport(
-        {
-          baseStudents: BASE_DB.students,
-          customStudents: rawCustomStudents,
-          unlistedReports: rawUnlistedReports,
-          attendanceRecords: rawAttendanceRecords,
-          courses,
-          notDuplicatePairs,
-        },
-        migrationResolutions
-      ),
-    [
-      rawCustomStudents,
-      rawUnlistedReports,
-      rawAttendanceRecords,
-      courses,
-      notDuplicatePairs,
-      migrationResolutions,
-      rescanCounter,
-    ]
-  );
+  const migrationDryRunReport = useMemo(() => {
+    if (category !== 'uyumsuzluklar') return null;
+    return buildMigrationDryRunReport(
+      {
+        baseStudents: BASE_DB.students,
+        customStudents: rawCustomStudents,
+        unlistedReports: rawUnlistedReports,
+        attendanceRecords: rawAttendanceRecords,
+        courses,
+        notDuplicatePairs,
+      },
+      migrationResolutions
+    );
+  }, [
+    category,
+    rawCustomStudents,
+    rawUnlistedReports,
+    rawAttendanceRecords,
+    courses,
+    notDuplicatePairs,
+    migrationResolutions,
+    rescanCounter,
+  ]);
 
   const executeCreateNewStudentRecord = async (
     cleanName: string,
@@ -668,39 +696,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     );
   };
 
-  // ================= STUDENT METRICS (Sorted by lowest attendance rate first) =================
+  // ================= STUDENT METRICS (Computed lazily only when 'ogrenci' tab is open) =================
   const baseStudentStats = useMemo(() => {
-    return students
-      .map(student => {
-        const relevantRecords = attendanceRecords.filter(
-          r => r.weekNumber <= currentWeek && isStudentResponsibleForSession(student, r)
-        );
-        const totalSessionsHeld = relevantRecords.length;
-        const absentCount = relevantRecords.filter(r =>
-          r.absentStudentIds.includes(student.id)
-        ).length;
-        const attendedCount = Math.max(0, totalSessionsHeld - absentCount);
-        const attendanceRate =
-          totalSessionsHeld > 0 ? attendedCount / totalSessionsHeld : 1;
-
-        return {
-          student,
-          totalSessionsHeld,
-          absentCount,
-          attendedCount,
-          attendanceRate,
-        };
-      })
-      .sort((a, b) => {
-        if (b.absentCount !== a.absentCount) {
-          return b.absentCount - a.absentCount;
-        }
-        if (a.attendanceRate !== b.attendanceRate) {
-          return a.attendanceRate - b.attendanceRate;
-        }
-        return a.student.name.localeCompare(b.student.name, 'tr-TR');
-      });
-  }, [students, attendanceRecords, currentWeek]);
+    if (category !== 'ogrenci') return [];
+    return computeStudentStats(students, attendanceIndex, currentWeek);
+  }, [category, students, attendanceIndex, currentWeek]);
 
   const studentStats = useMemo(() => {
     if (!normalizedQuery) return baseStudentStats;
@@ -711,48 +711,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     );
   }, [baseStudentStats, normalizedQuery]);
 
-  // ================= INSTRUCTOR METRICS (Unrecorded / "ders yapmadım" this week on top) =================
+  // ================= INSTRUCTOR METRICS (Computed lazily only when 'ders' tab is open) =================
   const baseInstructorStats = useMemo(() => {
-    return instructors
-      .map(instructor => {
-        const instCourses = instructor.courseIds
-          .map(cid => courses.find(c => c.id === cid))
-          .filter((c): c is Course => Boolean(c));
-
-        const isHolidayThisWeek =
-          instCourses.length > 0 &&
-          instCourses.every(c => c.modality === 'yuzyuze') &&
-          isYuzyuzeHolidayWeek(currentWeek);
-
-        const thisWeekRecords = attendanceRecords.filter(
-          r =>
-            (r.instructorId === instructor.id || instructor.courseIds.includes(r.courseId)) &&
-            r.weekNumber === currentWeek
-        );
-        const didNotTakeAttendance = !isHolidayThisWeek && thisWeekRecords.length === 0;
-        const markedDidNotHold = !isHolidayThisWeek && thisWeekRecords.some(r => r.didNotHoldClass);
-        const inactiveThisWeek = didNotTakeAttendance || markedDidNotHold;
-
-        return {
-          instructor,
-          courses: instCourses,
-          thisWeekRecords,
-          didNotTakeAttendance,
-          markedDidNotHold,
-          inactiveThisWeek,
-          isHolidayThisWeek,
-        };
-      })
-      .sort((a, b) => {
-        if (a.inactiveThisWeek !== b.inactiveThisWeek) {
-          return a.inactiveThisWeek ? -1 : 1;
-        }
-        if (a.markedDidNotHold !== b.markedDidNotHold) {
-          return a.markedDidNotHold ? -1 : 1;
-        }
-        return a.instructor.name.localeCompare(b.instructor.name, 'tr-TR');
-      });
-  }, [instructors, courses, attendanceRecords, currentWeek]);
+    if (category !== 'ders') return [];
+    return computeInstructorStats(instructors, coursesById, attendanceIndex, currentWeek);
+  }, [category, instructors, coursesById, attendanceIndex, currentWeek]);
 
   const cleanSearchQuery = normalizeName(searchQuery);
 
@@ -774,41 +737,11 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     });
   }, [baseInstructorStats, cleanSearchQuery]);
 
-  // ================= COURSE METRICS (Highest absence / unrecorded this week on top) =================
+  // ================= COURSE METRICS (Computed lazily only when 'ders' tab is open) =================
   const baseCourseStats = useMemo(() => {
-    return courses
-      .map(course => {
-        const isHolidayThisWeek =
-          course.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(currentWeek);
-
-        const courseRecords = attendanceRecords.filter(
-          r => r.courseId === course.id && r.weekNumber <= currentWeek
-        );
-        const thisWeekRecords = courseRecords.filter(r => r.weekNumber === currentWeek);
-        const totalAbsences = courseRecords.reduce(
-          (sum, r) => sum + r.absentStudentIds.length,
-          0
-        );
-        const noAttendanceThisWeek = !isHolidayThisWeek && thisWeekRecords.length === 0;
-
-        return {
-          course,
-          thisWeekRecords,
-          totalAbsences,
-          noAttendanceThisWeek,
-          isHolidayThisWeek,
-        };
-      })
-      .sort((a, b) => {
-        if (b.totalAbsences !== a.totalAbsences) {
-          return b.totalAbsences - a.totalAbsences;
-        }
-        if (a.noAttendanceThisWeek !== b.noAttendanceThisWeek) {
-          return a.noAttendanceThisWeek ? -1 : 1;
-        }
-        return a.course.title.localeCompare(b.course.title, 'tr-TR');
-      });
-  }, [courses, attendanceRecords, currentWeek]);
+    if (category !== 'ders') return [];
+    return computeCourseStats(courses, attendanceIndex, currentWeek);
+  }, [category, courses, attendanceIndex, currentWeek]);
 
   const courseStats = useMemo(() => {
     if (!cleanSearchQuery) return baseCourseStats;
@@ -828,10 +761,20 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     setSelectedInstructorId(null);
   };
 
-  // Helper to render a cell for (courseId, studentId, weekNumber)
+  // O(1) indexed helper to render a cell for (courseId, studentId, weekNumber)
   const renderStudentCourseWeekCell = (courseId: string, studentId: string, week: number) => {
-    const course = courses.find(c => c.id === courseId);
-    if (course?.modality === 'yuzyuze' && isYuzyuzeHolidayWeek(week)) {
+    const course = coursesById.get(courseId);
+    const student = studentsById.get(studentId);
+    const cell = resolveStudentCourseWeekCell(
+      course,
+      student,
+      studentId,
+      courseId,
+      week,
+      attendanceIndex
+    );
+
+    if (cell.kind === 'holiday') {
       return (
         <span
           data-testid={`matrix-holiday-cell-${courseId}-w${week}`}
@@ -843,84 +786,85 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       );
     }
 
-    const student = students.find(s => s.id === studentId);
-    if (student?.addedAtWeek && week < student.addedAtWeek) {
+    if (cell.kind === 'pre_registration') {
       return <span className="text-stone-400 italic">kayıt öncesi</span>;
     }
 
-    const records = attendanceRecords.filter(
-      r => r.courseId === courseId && r.weekNumber === week
-    );
-
-    if (records.length === 0) {
+    if (cell.kind === 'unrecorded') {
       return <span className="text-stone-400">girilmedi</span>;
     }
 
-    if (records.some(r => r.didNotHoldClass)) {
+    if (cell.kind === 'did_not_hold') {
       return <span className="text-amber-700">ders yapılmadı</span>;
     }
 
-    const sessionBadges = records.map(r => {
-      const shortSession =
-        r.sessionType === '1. ders'
-          ? '1.d'
-          : r.sessionType === '2. ders'
-          ? '2.d'
-          : 'ek';
-
-      if (student && !isStudentResponsibleForSession(student, r)) {
-        return (
-          <span key={r.sessionType} className="inline-block mr-2 text-xs text-stone-400 italic">
-            {shortSession}: kayıt öncesi
-          </span>
-        );
-      }
-
-      const isAbsent = r.absentStudentIds.includes(studentId);
-      return (
-        <span
-          key={r.sessionType}
-          className={`inline-block mr-2 text-xs ${
-            isAbsent ? 'text-rose-700 font-medium' : 'text-emerald-800'
-          }`}
-        >
-          {shortSession}: {isAbsent ? 'yok 🫏' : 'var'}
-        </span>
-      );
-    });
-
-    return <div className="flex flex-wrap gap-y-1">{sessionBadges}</div>;
+    return (
+      <div className="flex flex-wrap gap-y-1">
+        {cell.badges.map(badge => {
+          if (badge.status === 'pre_registration') {
+            return (
+              <span
+                key={badge.sessionType}
+                className="inline-block mr-2 text-xs text-stone-400 italic"
+              >
+                {badge.shortSession}: kayıt öncesi
+              </span>
+            );
+          }
+          const isAbsent = badge.status === 'absent';
+          return (
+            <span
+              key={badge.sessionType}
+              className={`inline-block mr-2 text-xs ${
+                isAbsent ? 'text-rose-700 font-medium' : 'text-emerald-800'
+              }`}
+            >
+              {badge.shortSession}: {isAbsent ? 'yok 🫏' : 'var'}
+            </span>
+          );
+        })}
+      </div>
+    );
   };
 
   // Helper to render a class matrix table for a given Course
   const renderCourseMatrix = (course: Course) => {
-    const courseStudents: Student[] = course.studentIds
-      .map(sid => students.find(s => s.id === sid))
-      .filter((s): s is Student => Boolean(s));
+    const courseStudents: Student[] = [];
+    const enrolledCanonicalNames = new Set<string>();
+    for (const sid of course.studentIds) {
+      const stu = studentsById.get(sid);
+      if (stu) {
+        courseStudents.push(stu);
+        enrolledCanonicalNames.add(getCanonicalStudentName(stu.name));
+      }
+    }
 
     // Temporary (geçici) students who attended a specific session of this course without being enrolled
-    const courseTempReports = unlistedReports.filter(
-      r =>
-        r.courseId === course.id &&
-        (r.status === 'temporary' || r.status === 'pending') &&
-        !courseStudents.some(
-          cs => getCanonicalStudentName(cs.name) === getCanonicalStudentName(r.studentName)
-        )
-    );
+    const tempReportsByCanonical = new Map<string, UnlistedStudentReport[]>();
+    for (const r of unlistedReports) {
+      if (
+        r.courseId !== course.id ||
+        (r.status !== 'temporary' && r.status !== 'pending')
+      ) {
+        continue;
+      }
+      const canon = getCanonicalStudentName(r.studentName);
+      if (enrolledCanonicalNames.has(canon)) continue;
+      let list = tempReportsByCanonical.get(canon);
+      if (!list) {
+        list = [];
+        tempReportsByCanonical.set(canon, list);
+      }
+      list.push(r);
+    }
 
-    const groupedTempStudents = Array.from(
-      new Set(courseTempReports.map(r => getCanonicalStudentName(r.studentName)))
-    ).map(canonicalName => {
-      const matchingExisting = findMatchingStudentByFullName(canonicalName, students);
-      const reportsForStudent = courseTempReports.filter(
-        r => getCanonicalStudentName(r.studentName) === canonicalName
-      );
-      return {
+    const groupedTempStudents = Array.from(tempReportsByCanonical.entries()).map(
+      ([canonicalName, reportsForStudent]) => ({
         canonicalName,
-        matchingExisting,
+        matchingExisting: findMatchingStudentByFullName(canonicalName, students),
         reports: reportsForStudent,
-      };
-    });
+      })
+    );
 
     return (
       <div key={course.id} className="rounded-2xl border border-stone-300/90 bg-white/90 p-4 sm:p-5 mb-6">
@@ -1149,6 +1093,40 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               </button>
             )}
 
+            {onUnifyYuzyuzeClasses && (
+              <button
+                type="button"
+                data-testid="unify-yuzyuze-classes-btn"
+                disabled={isUnifyingYuzyuze}
+                onClick={async () => {
+                  if (isUnifyingYuzyuze) return;
+                  setIsUnifyingYuzyuze(true);
+                  try {
+                    const res = await onUnifyYuzyuzeClasses();
+                    if (res.updatedStudentsCount > 0) {
+                      showTemporaryNotice(
+                        `${res.updatedClassesCount} yüz yüze sınıfta ${res.updatedStudentsCount} öğrencinin ders kayıtları birleştirildi.`
+                      );
+                    } else {
+                      showTemporaryNotice(
+                        'tüm yüz yüze sınıflar zaten birleştirilmiş durumda.'
+                      );
+                    }
+                  } finally {
+                    setIsUnifyingYuzyuze(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300/90 bg-white/80 px-2.5 py-1.5 text-[11px] text-stone-700 hover:border-stone-700 hover:text-stone-950 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Users className="h-3 w-3" />
+                <span>
+                  {isUnifyingYuzyuze
+                    ? 'birleştiriliyor...'
+                    : 'yüz yüze sınıfları birleştir'}
+                </span>
+              </button>
+            )}
+
             {onResetZeroAttendance && (
               <button
                 type="button"
@@ -1183,7 +1161,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                 className="inline-flex items-center gap-1.5 rounded-lg border border-stone-300/90 bg-white/80 px-2.5 py-1.5 text-[11px] text-stone-600 hover:border-rose-700 hover:text-rose-800 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <RotateCcw className="h-3 w-3" />
-                <span>yoklamaları sıfırla ({attendanceRecords.length})</span>
+                <span>
+                  yoklamaları sıfırla
+                  {attendanceRecords.length > 0 ? ` (${attendanceRecords.length})` : ''}
+                </span>
               </button>
             ) : (
               <div className="inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px]">
@@ -1303,8 +1284,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                         pendingUnlistedCount > 0 ? ` (${pendingUnlistedCount})` : ''
                       }`
                     : cat === 'audit_log'
-                    ? `işlem geçmişi (${auditLogs.length})`
-                    : `olası tekrarlar & migrasyon (${migrationDryRunReport.groupsToMigrate.length})`;
+                    ? `işlem geçmişi${auditLogs.length > 0 ? ` (${auditLogs.length})` : ''}`
+                    : `olası tekrarlar & migrasyon${
+                        migrationDryRunReport ? ` (${migrationDryRunReport.groupsToMigrate.length})` : ''
+                      }`;
                 return (
                   <button
                     key={cat}
@@ -1359,16 +1342,6 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
             )}
         </div>
       )}
-
-      {/* Modular Sibelius AI Question Assistant (can be hidden by user or disabled via ENABLE_SIBELIUS_CHATBOT) */}
-      <SibeliusAssistantWidget
-        currentWeek={currentWeek}
-        students={students}
-        courses={courses}
-        instructors={instructors}
-        attendanceRecords={attendanceRecords}
-        unlistedReports={unlistedReports}
-      />
 
       {/* Category 0: Main Menu + Liste Dışı Öğrenciler + Student Add/Remove + Instructor Assignment */}
       {category === 'menu' && (
@@ -2249,7 +2222,10 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               }}
               className="inline-flex items-center gap-2 rounded-xl border border-stone-300/80 bg-white/75 px-3.5 py-1.5 text-[11px] font-medium text-stone-700 hover:border-stone-500 hover:bg-white transition-colors cursor-pointer"
             >
-              <span>işlem geçmişi (audit log): {auditLogs.length} kayıt →</span>
+              <span>
+                işlem geçmişi (audit log)
+                {auditLogs.length > 0 ? `: ${auditLogs.length} kayıt` : ''} →
+              </span>
             </button>
 
             <button
@@ -2262,9 +2238,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               className="inline-flex items-center gap-2 rounded-xl border border-amber-400/90 bg-amber-50/90 px-3.5 py-1.5 text-[11px] font-medium text-amber-950 hover:bg-amber-100 transition-colors cursor-pointer"
             >
               <AlertCircle className="h-3.5 w-3.5 text-amber-800" />
-              <span>
-                olası tekrarlar & kimlik birleştirme ({migrationDryRunReport.groupsToMigrate.length} grup · {migrationDryRunReport.nearDuplicatePairs.length} benzer) →
-              </span>
+              <span>olası tekrarlar & kimlik birleştirme →</span>
             </button>
           </div>
         </div>
@@ -3021,7 +2995,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
       )}
 
       {/* ================= CATEGORY: OLASI TEKRARLAR, KURU ÇALIŞTIRMA & KİMLİK BİRLEŞTİRME ================= */}
-      {category === 'uyumsuzluklar' && (
+      {category === 'uyumsuzluklar' && migrationDryRunReport && (
         <div className="space-y-6">
           {/* Live Duplicate Scanner & Safe Migration Panel (Requirement 3 & 4) */}
           <div
@@ -3056,8 +3030,8 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
                   <button
                     type="button"
                     data-testid="download-migration-backup-btn"
-                    onClick={() => {
-                      onDownloadMigrationBackup();
+                    onClick={async () => {
+                      await onDownloadMigrationBackup();
                       showTemporaryNotice('ilgili tüm koleksiyonların tam JSON yedeği indirildi.');
                     }}
                     className="inline-flex items-center gap-1.5 rounded-xl border border-stone-300 bg-[#faf8f4] px-3.5 py-2 text-xs font-medium text-stone-800 hover:border-stone-600 hover:bg-white transition-colors cursor-pointer"

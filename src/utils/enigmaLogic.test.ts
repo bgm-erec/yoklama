@@ -7,13 +7,6 @@ import {
   isStudentResponsibleForSession,
   createNewStudentRecord,
   findMatchingStudentByFullName,
-  isMelekYilmazInstructor,
-  MELEK_YILMAZ_REASSURANCE_MESSAGE,
-  getInstructorDisplayFirstName,
-  getInstructorReassuranceMessage,
-  getPlaceboSavePreference,
-  setPlaceboSavePreferenceInMap,
-  computeActivePlaceboSaveUsers,
   shouldPromptEmptyExit,
   resolveExitPromptDecision,
   isZeroPresentAttendanceRecord,
@@ -340,67 +333,6 @@ test('findMatchingStudentByFullName matches existing students by full name and m
   assert.equal(notFound, undefined);
 
   syncDatabaseMutations([], [], []);
-});
-
-test('placebo save button preference and personalized reassurance message work for Melek and any opted-in instructor', () => {
-  const melekRes = resolveIdentityInput('melek yılmaz');
-  assert.equal(melekRes.type, 'instructor');
-
-  const cagdasRes = resolveIdentityInput('çağdaş');
-  assert.equal(cagdasRes.type, 'instructor');
-
-  const elifBusraRes = resolveIdentityInput('elif büşra dede');
-  assert.equal(elifBusraRes.type, 'instructor');
-
-  if (
-    melekRes.type === 'instructor' &&
-    cagdasRes.type === 'instructor' &&
-    elifBusraRes.type === 'instructor'
-  ) {
-    assert.equal(isMelekYilmazInstructor(melekRes.instructor), true);
-    assert.equal(isMelekYilmazInstructor(cagdasRes.instructor), false);
-
-    // Personalized display name & reassurance messages
-    assert.equal(getInstructorDisplayFirstName(melekRes.instructor), 'melek');
-    assert.equal(
-      getInstructorReassuranceMessage(melekRes.instructor),
-      MELEK_YILMAZ_REASSURANCE_MESSAGE
-    );
-
-    assert.equal(getInstructorDisplayFirstName(cagdasRes.instructor), 'çağdaş');
-    assert.equal(
-      getInstructorReassuranceMessage(cagdasRes.instructor),
-      'aklın sakın orada kalmasın çağdaş, yoklaman kayıt altında, iyi dersler'
-    );
-
-    assert.equal(getInstructorDisplayFirstName(elifBusraRes.instructor), 'elif büşra');
-    assert.equal(
-      getInstructorReassuranceMessage(elifBusraRes.instructor),
-      'aklın sakın orada kalmasın elif büşra, yoklaman kayıt altında, iyi dersler'
-    );
-
-    // Default preference: false for other instructors, true for Melek
-    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, null), false);
-    assert.equal(getPlaceboSavePreference(melekRes.instructor, null), true);
-
-    // Opting in persists across logins until deactivated
-    const enabledRaw = setPlaceboSavePreferenceInMap(cagdasRes.instructor, true, null);
-    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, enabledRaw), true);
-
-    const disabledRaw = setPlaceboSavePreferenceInMap(cagdasRes.instructor, false, enabledRaw);
-    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, disabledRaw), false);
-
-    // Remote Firestore preference overrides local empty storage and computes paranoya count
-    const remotePrefs = [
-      { instructorId: cagdasRes.instructor.id, instructorName: cagdasRes.instructor.name, enabled: true },
-      { instructorId: elifBusraRes.instructor.id, instructorName: elifBusraRes.instructor.name, enabled: false },
-    ];
-    assert.equal(getPlaceboSavePreference(cagdasRes.instructor, null, remotePrefs), true);
-    assert.equal(getPlaceboSavePreference(elifBusraRes.instructor, null, remotePrefs), false);
-    const activeStats = computeActivePlaceboSaveUsers(remotePrefs);
-    assert.equal(activeStats.count, 1);
-    assert.deepEqual(activeStats.names, ['çağdaş şahin']);
-  }
 });
 
 test('shouldPromptEmptyExit triggers when leaving with 0 present students or without taking attendance', () => {

@@ -80,7 +80,11 @@ export function getTrustedNow(): Date {
  * so that week calculation remains accurate even if the user's device clock is wrong.
  */
 export async function syncServerClockOffset(): Promise<number> {
-  if (typeof window === 'undefined' || typeof fetch === 'undefined') {
+  if (
+    typeof window === 'undefined' ||
+    typeof fetch === 'undefined' ||
+    window.location.protocol === 'file:'
+  ) {
     return 0;
   }
   try {

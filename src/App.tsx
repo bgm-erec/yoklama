@@ -3,14 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
   collection,
   deleteDoc,
   doc,
+  DocumentChange,
+  DocumentData,
+  getDoc,
   getDocs,
+  limit,
   onSnapshot,
+  orderBy,
+  Query,
   query,
+  QueryDocumentSnapshot,
   runTransaction,
   serverTimestamp,
   setDoc,
@@ -43,7 +50,6 @@ import {
   normalizeName,
   normalizeTurkish,
   NotDuplicatePairRecord,
-  PlaceboSavePreferenceRecord,
   reconcileNotDuplicatesOnDelete,
   reconcileNotDuplicatesOnMerge,
   RemovedStudentRecord,
@@ -65,12 +71,11 @@ import {
   getZeroPresentAttendanceRecords,
   resolveIdentityInput,
 } from './utils/enigmaLogic';
-import {
-  buildMigrationDryRunReport,
-  createMigrationBackupPayload,
+import type {
   MigrationBackupPayload,
   MigrationUserResolutions,
 } from './utils/studentMigration';
+import type { YuzyuzeUnionExecutionResult } from './utils/yuzyuzeUnion';
 import {
   isClockSkewSignificant,
   getClockSkewMinutes,
@@ -79,14 +84,262 @@ import {
 import { WriteQueueController, WriteQueueSnapshot } from './utils/writeQueue';
 import { BogaziciIllustration } from './components/BogaziciIllustration';
 import { FeedbackWidget } from './components/FeedbackWidget';
-import {
-  AttendanceConflictNotice,
-  InstructorView,
-} from './components/InstructorView';
-import { AdminSibeliusView } from './components/AdminSibeliusView';
-import { AmadeusFeedbackView } from './components/AmadeusFeedbackView';
+import type { AttendanceConflictNotice } from './components/InstructorView';
+import type { AdminCategory } from './components/AdminSibeliusView';
 import { SaveStatusIndicator } from './components/SaveStatusIndicator';
 import { NavigationGuardModal } from './components/NavigationGuardModal';
+
+const InstructorView = lazy(() =>
+  import('./components/InstructorView').then(m => ({ default: m.InstructorView }))
+);
+const AdminSibeliusView = lazy(() =>
+  import('./components/AdminSibeliusView').then(m => ({
+    default: m.AdminSibeliusView,
+  }))
+);
+const AmadeusFeedbackView = lazy(() =>
+  import('./components/AmadeusFeedbackView').then(m => ({
+    default: m.AmadeusFeedbackView,
+  }))
+);
+
+const PENDING_WRITES_STORAGE_KEY = 'bach_pending_writes_v1';
+
+function readStoredPendingWritesFlag(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(PENDING_WRITES_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredPendingWritesFlag(hasPending: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const nextVal = hasPending ? '1' : '0';
+    if (window.localStorage.getItem(PENDING_WRITES_STORAGE_KEY) !== nextVal) {
+      window.localStorage.setItem(PENDING_WRITES_STORAGE_KEY, nextVal);
+    }
+  } catch {
+    // Ignore storage quota or private-mode errors
+  }
+}
+
+function parseAttendanceDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): AttendanceRecord {
+  const raw = docSnap.data();
+  return canonicalizeAttendanceRecordIds({
+    id: docSnap.id,
+    courseId: raw.courseId,
+    instructorId: raw.instructorId,
+    weekNumber: raw.weekNumber,
+    sessionType: raw.sessionType,
+    absentStudentIds: Array.isArray(raw.absentStudentIds)
+      ? raw.absentStudentIds
+      : [],
+    didNotHoldClass: Boolean(raw.didNotHoldClass),
+    updatedAt: formatFirestoreTimestamp(raw.updatedAt, raw.updatedAtIso),
+    version: typeof raw.version === 'number' ? raw.version : 1,
+    updatedBySessionId: raw.updatedBySessionId,
+    deletedAt: raw.deletedAt
+      ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
+      : null,
+  });
+}
+
+function parseUnlistedDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): UnlistedStudentReport {
+  const raw = docSnap.data();
+  return {
+    ...(raw as UnlistedStudentReport),
+    id: docSnap.id,
+    createdAt: formatFirestoreTimestamp(raw.createdAt, raw.createdAtIso),
+    resolvedAt: raw.resolvedAt
+      ? formatFirestoreTimestamp(raw.resolvedAt, raw.resolvedAtIso)
+      : undefined,
+    deletedAt: raw.deletedAt
+      ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
+      : null,
+  };
+}
+
+function parseCustomStudentDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): Student | null {
+  const data = docSnap.data();
+  const rawId = data.id || docSnap.id;
+  if (typeof data.name === 'string') {
+    const canonicalId = buildStudentIdFromName(data.name);
+    if (rawId && canonicalId && rawId !== canonicalId) {
+      STUDENT_ID_ALIAS_MAP.set(rawId, canonicalId);
+    }
+  }
+  if (data.deletedAt) return null;
+  return {
+    ...(data as Student),
+    id: rawId,
+    addedAt: formatFirestoreTimestamp(data.addedAt, data.addedAtIso),
+    deletedAt: data.deletedAt
+      ? formatFirestoreTimestamp(data.deletedAt, data.deletedAtIso)
+      : null,
+  };
+}
+
+function parseRemovedStudentDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): string | null {
+  const data = docSnap.data() as RemovedStudentRecord;
+  if (data.deletedAt) return null;
+  return data.studentId || docSnap.id;
+}
+
+function parseInstructorAssignmentDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): InstructorAssignmentRecord {
+  const data = docSnap.data();
+  return {
+    ...(data as InstructorAssignmentRecord),
+    updatedAt: formatFirestoreTimestamp(data.updatedAt, data.updatedAtIso),
+  };
+}
+
+function parseNotDuplicateDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): NotDuplicatePairRecord | null {
+  const data = docSnap.data();
+  if (data.deletedAt) return null;
+  const pair = buildNotDuplicatePairId(
+    String(data.studentIdA || ''),
+    String(data.studentIdB || '')
+  );
+  if (!pair) return null;
+  return {
+    id: pair.id,
+    studentIdA: pair.studentIdA,
+    studentIdB: pair.studentIdB,
+    createdAt: formatFirestoreTimestamp(data.createdAt, data.createdAtIso),
+    note: typeof data.note === 'string' ? data.note : undefined,
+  };
+}
+
+function parseCoordinatorDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): CoordinatorAssignmentRecord {
+  const data = docSnap.data();
+  return {
+    id: docSnap.id,
+    weekNumber:
+      typeof data.weekNumber === 'number'
+        ? data.weekNumber
+        : Number(docSnap.id.replace(/\D/g, '')) || 1,
+    saturday: Array.isArray(data.saturday) ? data.saturday : [],
+    sunday: Array.isArray(data.sunday) ? data.sunday : [],
+    updatedAt: formatFirestoreTimestamp(data.updatedAt, data.updatedAtIso),
+    updatedAtIso: data.updatedAtIso,
+  };
+}
+
+function parseAuditLogDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): AuditLogEntry {
+  const raw = docSnap.data();
+  return {
+    id: docSnap.id,
+    actor: raw.actor,
+    action: raw.action,
+    target: raw.target,
+    details: raw.details,
+    createdAt: formatFirestoreTimestamp(raw.createdAt, raw.createdAtIso),
+  };
+}
+
+function parseFeedbackDoc(
+  docSnap: QueryDocumentSnapshot<DocumentData>
+): FeedbackItem {
+  const raw = docSnap.data();
+  return {
+    id: docSnap.id,
+    message: raw.message,
+    createdAt: formatFirestoreTimestamp(raw.createdAt, raw.createdAtIso),
+    deletedAt: raw.deletedAt
+      ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
+      : null,
+  };
+}
+
+/**
+ * Subscribes to a Firestore query with:
+ * - Metadata-only snapshot guard (skips remapping & React setState when only metadata changed)
+ * - Incremental docChanges() updates on subsequent snapshots
+ */
+function subscribeCollectionIncremental<T>(
+  q: Query<DocumentData>,
+  options: {
+    includeMetadataChanges?: boolean;
+    parseDoc: (docSnap: QueryDocumentSnapshot<DocumentData>) => T | null;
+    onMetadata?: (hasPendingWrites: boolean, isFirstSnapshot: boolean) => void;
+    onFirstDoc?: (
+      docSnap: QueryDocumentSnapshot<DocumentData>,
+      parsed: T | null
+    ) => void;
+    onDocChange?: (
+      change: DocumentChange<DocumentData>,
+      parsed: T | null
+    ) => void;
+    onData: (items: T[]) => void;
+    onError: (error: unknown) => void;
+  }
+) {
+  let initialized = false;
+  const docMap = new Map<string, T>();
+
+  return onSnapshot(
+    q,
+    options.includeMetadataChanges ? { includeMetadataChanges: true } : {},
+    snapshot => {
+      const isFirst = !initialized;
+      options.onMetadata?.(snapshot.metadata.hasPendingWrites, isFirst);
+
+      const changes = snapshot.docChanges();
+      if (!isFirst && changes.length === 0) {
+        return;
+      }
+
+      if (isFirst) {
+        docMap.clear();
+        snapshot.forEach(docSnap => {
+          const parsed = options.parseDoc(docSnap);
+          if (parsed !== null) {
+            docMap.set(docSnap.id, parsed);
+          }
+          options.onFirstDoc?.(docSnap, parsed);
+        });
+      } else {
+        for (const change of changes) {
+          if (change.type === 'removed') {
+            docMap.delete(change.doc.id);
+            options.onDocChange?.(change, null);
+          } else {
+            const parsed = options.parseDoc(change.doc);
+            if (parsed !== null) {
+              docMap.set(change.doc.id, parsed);
+            } else {
+              docMap.delete(change.doc.id);
+            }
+            options.onDocChange?.(change, parsed);
+          }
+        }
+      }
+
+      initialized = true;
+      options.onData(Array.from(docMap.values()));
+    },
+    options.onError
+  );
+}
 
 type AppRoute =
   | { view: 'login' }
@@ -167,8 +420,8 @@ export default function App() {
   const knownVersionsRef = useRef<Map<string, number>>(new Map());
 
   // Undo buffers for soft-deleted bulk operations & migration backup
-  const [lastSoftDeletedAttendanceIds, setLastSoftDeletedAttendanceIds] =
-    useState<string[]>([]);
+  const [lastSoftDeletedAttendanceRecords, setLastSoftDeletedAttendanceRecords] =
+    useState<AttendanceRecord[]>([]);
   const [lastSoftDeletedFeedbackIds, setLastSoftDeletedFeedbackIds] = useState<
     string[]
   >([]);
@@ -177,6 +430,8 @@ export default function App() {
   const [lastIgnoredNotDuplicateIds, setLastIgnoredNotDuplicateIds] = useState<
     string[]
   >([]);
+  const [sibeliusCategory, setSibeliusCategory] =
+    useState<AdminCategory>('menu');
 
   // Real-time synced lists from Firestore
   const [attendanceRecords, setAttendanceRecords] = useState<
@@ -196,9 +451,6 @@ export default function App() {
   >([]);
   const [unlistedReports, setUnlistedReports] = useState<
     UnlistedStudentReport[]
-  >([]);
-  const [placeboSavePrefs, setPlaceboSavePrefs] = useState<
-    PlaceboSavePreferenceRecord[]
   >([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
@@ -221,12 +473,87 @@ export default function App() {
     }
   };
 
-  // Subscribe to WriteQueueController state transitions
+  // Subscribe to WriteQueueController state transitions and mirror pending state across tabs/reloads
   useEffect(() => {
     const queue = writeQueueRef.current!;
     return queue.subscribe(snap => {
       setQueueSnapshot(snap);
+      if (
+        snap.pendingCount > 0 ||
+        snap.inFlightCount > 0 ||
+        snap.phase === 'saving' ||
+        snap.phase === 'offline' ||
+        snap.phase === 'syncing_startup'
+      ) {
+        writeStoredPendingWritesFlag(true);
+      } else if (
+        snap.phase === 'saved' &&
+        snap.pendingCount === 0 &&
+        snap.inFlightCount === 0 &&
+        snap.failedCount === 0
+      ) {
+        writeStoredPendingWritesFlag(false);
+      }
     });
+  }, []);
+
+  // Lightweight startup & multi-tab pending-writes sync (replaces weekly attendance listener on login/amadeus)
+  useEffect(() => {
+    const queue = writeQueueRef.current!;
+    let cancelled = false;
+    const hadStoredPending = readStoredPendingWritesFlag();
+
+    const syncStoredPendingWrites = () => {
+      queue.notifySnapshotPendingState(true, true);
+      void waitForPendingWrites(db)
+        .then(() => {
+          if (cancelled) return;
+          const snap = queue.getSnapshot();
+          if (
+            snap.pendingCount === 0 &&
+            snap.inFlightCount === 0 &&
+            snap.failedCount === 0 &&
+            snap.isOnline
+          ) {
+            writeStoredPendingWritesFlag(false);
+            queue.notifySnapshotPendingState(false, false);
+          }
+        })
+        .catch(err => {
+          console.error('Bekleyen yazma eşzamanlama kontrolü hatası:', err);
+        });
+    };
+
+    if (hadStoredPending) {
+      syncStoredPendingWrites();
+    }
+
+    const handleStorageSync = (e: StorageEvent) => {
+      if (e.key !== PENDING_WRITES_STORAGE_KEY) return;
+      if (e.newValue === '1') {
+        syncStoredPendingWrites();
+      } else if (e.newValue === '0') {
+        const snap = queue.getSnapshot();
+        if (
+          snap.pendingCount === 0 &&
+          snap.inFlightCount === 0 &&
+          snap.failedCount === 0 &&
+          snap.isOnline
+        ) {
+          void waitForPendingWrites(db).then(() => {
+            if (!cancelled) {
+              queue.notifySnapshotPendingState(false, false);
+            }
+          });
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageSync);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('storage', handleStorageSync);
+    };
   }, []);
 
   // Automatically continue paused in-app navigation once pending writes finish on server
@@ -355,520 +682,417 @@ export default function App() {
     action();
   };
 
-  // Roster mutation listeners (lightweight delta collections: custom_students, removed_students, instructor_assignments)
+  // Stable primitive query keys for Firestore subscriptions
+  const routeView = route.view;
+  const routeInstructorId =
+    route.view === 'instructor' ? route.instructor.id : '';
+  const routeInstructorDefaultCourseId =
+    route.view === 'instructor' ? route.instructor.courseIds[0] || '' : '';
+  const targetInstructorCourseId =
+    routeView === 'instructor'
+      ? activeInstructorCourseId || routeInstructorDefaultCourseId
+      : '';
+
+  // 1. instructor_assignments: needed on login (up-to-date name resolution), instructor, and sibelius
+  const needsInstructorAssignments =
+    routeView === 'login' ||
+    routeView === 'instructor' ||
+    routeView === 'sibelius';
   useEffect(() => {
+    if (!needsInstructorAssignments) return;
+    const assignmentsQuery = query(
+      collection(db, 'instructor_assignments'),
+      where('courseId', '>=', '')
+    );
+    return subscribeCollectionIncremental(assignmentsQuery, {
+      parseDoc: parseInstructorAssignmentDoc,
+      onData: setInstructorAssignments,
+      onError: error => {
+        console.error('instructor_assignments dinleme hatası:', error);
+      },
+    });
+  }, [needsInstructorAssignments]);
+
+  // 2. custom_students & removed_students: needed only on instructor and sibelius (not login or amadeus)
+  const needsRosterMutations =
+    routeView === 'instructor' || routeView === 'sibelius';
+  useEffect(() => {
+    if (!needsRosterMutations) return;
     const customStudentsQuery = query(
       collection(db, 'custom_students'),
       where('addedAtWeek', '>=', 1)
     );
-    const unsubCustom = onSnapshot(
-      customStudentsQuery,
-      { includeMetadataChanges: true },
-      snapshot => {
-        const items: Student[] = [];
-        snapshot.forEach(docSnap => {
-          const data = docSnap.data();
-          const rawId = data.id || docSnap.id;
-          if (typeof data.name === 'string') {
-            const canonicalId = buildStudentIdFromName(data.name);
-            if (rawId && canonicalId && rawId !== canonicalId) {
-              STUDENT_ID_ALIAS_MAP.set(rawId, canonicalId);
-            }
-          }
-          if (data.deletedAt) return;
-          items.push({
-            ...(data as Student),
-            id: rawId,
-            addedAt: formatFirestoreTimestamp(data.addedAt, data.addedAtIso),
-            deletedAt: data.deletedAt
-              ? formatFirestoreTimestamp(data.deletedAt, data.deletedAtIso)
-              : null,
-          });
-        });
-        setCustomStudents(items);
+    const unsubCustom = subscribeCollectionIncremental(customStudentsQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseCustomStudentDoc,
+      onMetadata: hasPending => {
+        if (hasPending) {
+          writeQueueRef.current?.notifySnapshotPendingState(true, false);
+        }
       },
-      error => {
+      onData: setCustomStudents,
+      onError: error => {
         console.error('custom_students dinleme hatası:', error);
-      }
-    );
+      },
+    });
 
     const removedStudentsQuery = query(
       collection(db, 'removed_students'),
       where('studentId', '>=', '')
     );
-    const unsubRemoved = onSnapshot(
-      removedStudentsQuery,
-      snapshot => {
-        const ids: string[] = [];
-        snapshot.forEach(docSnap => {
-          const data = docSnap.data() as RemovedStudentRecord;
-          if (data.deletedAt) return;
-          ids.push(data.studentId || docSnap.id);
-        });
-        setRemovedStudentIds(ids);
-      },
-      error => {
+    const unsubRemoved = subscribeCollectionIncremental(removedStudentsQuery, {
+      parseDoc: parseRemovedStudentDoc,
+      onData: setRemovedStudentIds,
+      onError: error => {
         console.error('removed_students dinleme hatası:', error);
-      }
-    );
-
-    const assignmentsQuery = query(
-      collection(db, 'instructor_assignments'),
-      where('courseId', '>=', '')
-    );
-    const unsubAssign = onSnapshot(
-      assignmentsQuery,
-      snapshot => {
-        const items: InstructorAssignmentRecord[] = [];
-        snapshot.forEach(docSnap => {
-          const data = docSnap.data();
-          items.push({
-            ...(data as InstructorAssignmentRecord),
-            updatedAt: formatFirestoreTimestamp(
-              data.updatedAt,
-              data.updatedAtIso
-            ),
-          });
-        });
-        setInstructorAssignments(items);
       },
-      error => {
-        console.error('instructor_assignments dinleme hatası:', error);
-      }
-    );
-
-    const notDuplicatesQuery = query(
-      collection(db, 'not_duplicates'),
-      where('studentIdA', '>=', '')
-    );
-    const unsubNotDups = onSnapshot(
-      notDuplicatesQuery,
-      { includeMetadataChanges: true },
-      snapshot => {
-        const items: NotDuplicatePairRecord[] = [];
-        snapshot.forEach(docSnap => {
-          const data = docSnap.data();
-          if (data.deletedAt) return;
-          const pair = buildNotDuplicatePairId(
-            String(data.studentIdA || ''),
-            String(data.studentIdB || '')
-          );
-          if (!pair) return;
-          items.push({
-            id: pair.id,
-            studentIdA: pair.studentIdA,
-            studentIdB: pair.studentIdB,
-            createdAt: formatFirestoreTimestamp(
-              data.createdAt,
-              data.createdAtIso
-            ),
-            note: typeof data.note === 'string' ? data.note : undefined,
-          });
-        });
-        setNotDuplicatePairs(deduplicateNotDuplicatePairs(items));
-      },
-      error => {
-        console.error('not_duplicates dinleme hatası:', error);
-      }
-    );
-
-    const coordinatorQuery = query(
-      collection(db, 'coordinator_assignments'),
-      where('weekNumber', '>=', 1)
-    );
-    const unsubCoord = onSnapshot(
-      coordinatorQuery,
-      { includeMetadataChanges: true },
-      snapshot => {
-        const items: CoordinatorAssignmentRecord[] = [];
-        snapshot.forEach(docSnap => {
-          const data = docSnap.data();
-          items.push({
-            id: docSnap.id,
-            weekNumber:
-              typeof data.weekNumber === 'number'
-                ? data.weekNumber
-                : Number(docSnap.id.replace(/\D/g, '')) || 1,
-            saturday: Array.isArray(data.saturday) ? data.saturday : [],
-            sunday: Array.isArray(data.sunday) ? data.sunday : [],
-            updatedAt: formatFirestoreTimestamp(
-              data.updatedAt,
-              data.updatedAtIso
-            ),
-            updatedAtIso: data.updatedAtIso,
-          });
-        });
-        setCoordinatorAssignments(items);
-      },
-      error => {
-        console.error('coordinator_assignments dinleme hatası:', error);
-      }
-    );
+    });
 
     return () => {
       unsubCustom();
       unsubRemoved();
-      unsubAssign();
-      unsubNotDups();
-      unsubCoord();
     };
-  }, []);
+  }, [needsRosterMutations]);
 
-  // Scoped Real-Time Listener for Attendance & Unlisted Students (Item 7: Only active week & relevant course!)
+  // 3. not_duplicates: needed on instructor and Sibelius screens that handle student identity checks
+  const needsNotDuplicates =
+    routeView === 'instructor' ||
+    (routeView === 'sibelius' &&
+      (sibeliusCategory === 'menu' ||
+        sibeliusCategory === 'ogrenci' ||
+        sibeliusCategory === 'liste_disi' ||
+        sibeliusCategory === 'uyumsuzluklar'));
   useEffect(() => {
-    if (route.view === 'login' || route.view === 'amadeus') {
-      // Do not download attendance or unlisted_students on login or feedback screens!
-      // Only run a one-time startup check for any unsent offline writes in IndexedDB cache
-      let initialChecked = false;
-      const startupQuery = query(
-        collection(db, 'attendance'),
-        where('weekNumber', '==', currentWeek)
-      );
-      const unsubStartup = onSnapshot(
-        startupQuery,
-        { includeMetadataChanges: true },
-        snapshot => {
-          if (!initialChecked) {
-            initialChecked = true;
-            if (snapshot.metadata.hasPendingWrites) {
-              writeQueueRef.current?.notifySnapshotPendingState(true, true);
-              void waitForPendingWrites(db).then(() => {
-                writeQueueRef.current?.notifySnapshotPendingState(false, false);
-              });
-            }
-          }
-        },
-        err => {
-          console.error('Başlangıç bekleyen yazma kontrolü hatası:', err);
-        }
-      );
-      return () => unsubStartup();
-    }
+    if (!needsNotDuplicates) return;
+    const notDuplicatesQuery = query(
+      collection(db, 'not_duplicates'),
+      where('studentIdA', '>=', '')
+    );
+    return subscribeCollectionIncremental(notDuplicatesQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseNotDuplicateDoc,
+      onData: items => setNotDuplicatePairs(deduplicateNotDuplicatePairs(items)),
+      onError: error => {
+        console.error('not_duplicates dinleme hatası:', error);
+      },
+    });
+  }, [needsNotDuplicates]);
 
-    if (route.view === 'instructor') {
-      const targetCourseId =
-        activeInstructorCourseId || route.instructor.courseIds[0] || '';
-      if (!targetCourseId) return;
-
-      let isFirstSnap = true;
-      const attQuery = query(
-        collection(db, 'attendance'),
-        where('weekNumber', '==', selectedWeek),
-        where('courseId', '==', targetCourseId)
-      );
-
-      const unsubAtt = onSnapshot(
-        attQuery,
-        { includeMetadataChanges: true },
-        snapshot => {
-          writeQueueRef.current?.notifySnapshotPendingState(
-            snapshot.metadata.hasPendingWrites,
-            isFirstSnap
-          );
-          isFirstSnap = false;
-
-          const incomingRecords: AttendanceRecord[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            const record: AttendanceRecord = canonicalizeAttendanceRecordIds({
-              id: docSnap.id,
-              courseId: raw.courseId,
-              instructorId: raw.instructorId,
-              weekNumber: raw.weekNumber,
-              sessionType: raw.sessionType,
-              absentStudentIds: Array.isArray(raw.absentStudentIds)
-                ? raw.absentStudentIds
-                : [],
-              didNotHoldClass: Boolean(raw.didNotHoldClass),
-              updatedAt: formatFirestoreTimestamp(
-                raw.updatedAt,
-                raw.updatedAtIso
-              ),
-              version: typeof raw.version === 'number' ? raw.version : 1,
-              updatedBySessionId: raw.updatedBySessionId,
-              deletedAt: raw.deletedAt
-                ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-                : null,
-            });
-
-            if (!docSnap.metadata.hasPendingWrites && record.version) {
-              const prevKnown = knownVersionsRef.current.get(docSnap.id) ?? 0;
-              if (
-                prevKnown > 0 &&
-                detectConcurrentAttendanceConflict({
-                  serverVersion: record.version,
-                  serverUpdatedBySessionId: record.updatedBySessionId,
-                  expectedBaseVersion: prevKnown,
-                  currentClientSessionId: CLIENT_SESSION_ID,
-                })
-              ) {
-                setConflictNotice({
-                  docId: docSnap.id,
-                  courseId: record.courseId,
-                  weekNumber: record.weekNumber,
-                  sessionType: record.sessionType,
-                  serverRecord: record,
-                  localAttemptRecord: record,
-                });
-              }
-              knownVersionsRef.current.set(docSnap.id, record.version);
-            }
-
-            incomingRecords.push(record);
-          });
-
-          setAttendanceRecords(prev => {
-            const others = prev.filter(
-              r =>
-                !(
-                  r.courseId === targetCourseId &&
-                  r.weekNumber === selectedWeek
-                )
-            );
-            return [...others, ...incomingRecords];
-          });
-        },
-        error => {
-          console.error('Yoklama dinleme hatası:', error);
-        }
-      );
-
-      const unlistedQuery = query(
-        collection(db, 'unlisted_students'),
-        where('weekNumber', '==', selectedWeek),
-        where('courseId', '==', targetCourseId)
-      );
-
-      const unsubUnlisted = onSnapshot(
-        unlistedQuery,
-        { includeMetadataChanges: true },
-        snapshot => {
-          writeQueueRef.current?.notifySnapshotPendingState(
-            snapshot.metadata.hasPendingWrites,
-            false
-          );
-          const items: UnlistedStudentReport[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            items.push({
-              ...(raw as UnlistedStudentReport),
-              id: docSnap.id,
-              createdAt: formatFirestoreTimestamp(
-                raw.createdAt,
-                raw.createdAtIso
-              ),
-              resolvedAt: raw.resolvedAt
-                ? formatFirestoreTimestamp(raw.resolvedAt, raw.resolvedAtIso)
-                : undefined,
-              deletedAt: raw.deletedAt
-                ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-                : null,
-            });
-          });
-          setUnlistedReports(prev => {
-            const others = prev.filter(
-              r =>
-                !(
-                  r.courseId === targetCourseId &&
-                  r.weekNumber === selectedWeek
-                )
-            );
-            return [...others, ...items];
-          });
-        },
-        error => {
-          console.error('Liste dışı öğrenci dinleme hatası:', error);
-        }
-      );
-
-      return () => {
-        unsubAtt();
-        unsubUnlisted();
-      };
-    }
-
-    if (route.view === 'sibelius') {
-      const attQuery = query(
-        collection(db, 'attendance'),
-        where('weekNumber', '>=', 1),
-        where('weekNumber', '<=', currentWeek + 1)
-      );
-      const unsubAtt = onSnapshot(
-        attQuery,
-        { includeMetadataChanges: true },
-        snapshot => {
-          writeQueueRef.current?.notifySnapshotPendingState(
-            snapshot.metadata.hasPendingWrites,
-            false
-          );
-          const remoteRecords: AttendanceRecord[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            remoteRecords.push(
-              canonicalizeAttendanceRecordIds({
-                id: docSnap.id,
-                courseId: raw.courseId,
-                instructorId: raw.instructorId,
-                weekNumber: raw.weekNumber,
-                sessionType: raw.sessionType,
-                absentStudentIds: Array.isArray(raw.absentStudentIds)
-                  ? raw.absentStudentIds
-                  : [],
-                didNotHoldClass: Boolean(raw.didNotHoldClass),
-                updatedAt: formatFirestoreTimestamp(
-                  raw.updatedAt,
-                  raw.updatedAtIso
-                ),
-                version: typeof raw.version === 'number' ? raw.version : 1,
-                updatedBySessionId: raw.updatedBySessionId,
-                deletedAt: raw.deletedAt
-                  ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-                  : null,
-              })
-            );
-          });
-          setAttendanceRecords(remoteRecords);
-        },
-        error => {
-          console.error('Sibelius yoklama dinleme hatası:', error);
-        }
-      );
-
-      const unlistedQuery = query(
-        collection(db, 'unlisted_students'),
-        where('weekNumber', '>=', 1),
-        where('weekNumber', '<=', currentWeek + 1)
-      );
-      const unsubUnlisted = onSnapshot(
-        unlistedQuery,
-        snapshot => {
-          const items: UnlistedStudentReport[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            items.push({
-              ...(raw as UnlistedStudentReport),
-              id: docSnap.id,
-              createdAt: formatFirestoreTimestamp(
-                raw.createdAt,
-                raw.createdAtIso
-              ),
-              resolvedAt: raw.resolvedAt
-                ? formatFirestoreTimestamp(raw.resolvedAt, raw.resolvedAtIso)
-                : undefined,
-              deletedAt: raw.deletedAt
-                ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-                : null,
-            });
-          });
-          items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-          setUnlistedReports(items);
-        },
-        error => {
-          console.error('Sibelius liste dışı dinleme hatası:', error);
-        }
-      );
-
-      const prefsQuery = query(
-        collection(db, 'placebo_save_preferences'),
-        where('instructorId', '>=', '')
-      );
-      const unsubPrefs = onSnapshot(
-        prefsQuery,
-        snapshot => {
-          const items: PlaceboSavePreferenceRecord[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            items.push({
-              instructorId: raw.instructorId || docSnap.id,
-              instructorName: raw.instructorName,
-              enabled: Boolean(raw.enabled),
-              updatedAt: formatFirestoreTimestamp(
-                raw.updatedAt,
-                raw.updatedAtIso
-              ),
-            });
-          });
-          setPlaceboSavePrefs(items);
-        },
-        error => {
-          console.error('Placebo tercih dinleme hatası:', error);
-        }
-      );
-
-      const auditQuery = query(
-        collection(db, 'audit_log'),
-        where('createdAtIso', '>=', '2020-01-01')
-      );
-      const unsubAudit = onSnapshot(
-        auditQuery,
-        snapshot => {
-          const logs: AuditLogEntry[] = [];
-          snapshot.forEach(docSnap => {
-            const raw = docSnap.data();
-            logs.push({
-              id: docSnap.id,
-              actor: raw.actor,
-              action: raw.action,
-              target: raw.target,
-              details: raw.details,
-              createdAt: formatFirestoreTimestamp(
-                raw.createdAt,
-                raw.createdAtIso
-              ),
-            });
-          });
-          logs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-          setAuditLogs(logs.slice(0, 100));
-        },
-        error => {
-          console.error('Audit log dinleme hatası:', error);
-        }
-      );
-
-      return () => {
-        unsubAtt();
-        unsubUnlisted();
-        unsubPrefs();
-        unsubAudit();
-      };
-    }
-  }, [route, selectedWeek, activeInstructorCourseId, currentWeek]);
-
-  // Scoped Real-Time Listener for Amadeus Feedback View ONLY
+  // 4. coordinator_assignments: needed ONLY when Sibelius coordinator tab is open
+  const needsCoordinatorAssignments =
+    routeView === 'sibelius' && sibeliusCategory === 'koordinator';
   useEffect(() => {
-    if (route.view !== 'amadeus') return;
+    if (!needsCoordinatorAssignments) return;
+    const coordinatorQuery = query(
+      collection(db, 'coordinator_assignments'),
+      where('weekNumber', '>=', 1)
+    );
+    return subscribeCollectionIncremental(coordinatorQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseCoordinatorDoc,
+      onMetadata: hasPending => {
+        writeQueueRef.current?.notifySnapshotPendingState(hasPending, false);
+      },
+      onData: setCoordinatorAssignments,
+      onError: error => {
+        console.error('coordinator_assignments dinleme hatası:', error);
+      },
+    });
+  }, [needsCoordinatorAssignments]);
+
+  // 5. audit_log: needed ONLY when Sibelius audit_log tab is open, ordered & limited to 100 in Firestore
+  const needsAuditLogs =
+    routeView === 'sibelius' && sibeliusCategory === 'audit_log';
+  useEffect(() => {
+    if (!needsAuditLogs) return;
+    const auditQuery = query(
+      collection(db, 'audit_log'),
+      where('createdAtIso', '>=', '2020-01-01'),
+      orderBy('createdAtIso', 'desc'),
+      limit(100)
+    );
+    return subscribeCollectionIncremental(auditQuery, {
+      parseDoc: parseAuditLogDoc,
+      onData: logs => {
+        logs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        setAuditLogs(logs);
+      },
+      onError: error => {
+        console.error('Audit log dinleme hatası:', error);
+      },
+    });
+  }, [needsAuditLogs]);
+
+  // 6. Instructor course+week scoped attendance & unlisted_students listeners
+  useEffect(() => {
+    if (routeView !== 'instructor' || !targetInstructorCourseId) return;
+
+    const trackVersionAndConflict = (
+      docSnap: QueryDocumentSnapshot<DocumentData>,
+      record: AttendanceRecord | null
+    ) => {
+      if (!record || docSnap.metadata.hasPendingWrites || !record.version) {
+        return;
+      }
+      const prevKnown = knownVersionsRef.current.get(docSnap.id) ?? 0;
+      if (
+        prevKnown > 0 &&
+        detectConcurrentAttendanceConflict({
+          serverVersion: record.version,
+          serverUpdatedBySessionId: record.updatedBySessionId,
+          expectedBaseVersion: prevKnown,
+          currentClientSessionId: CLIENT_SESSION_ID,
+        })
+      ) {
+        setConflictNotice({
+          docId: docSnap.id,
+          courseId: record.courseId,
+          weekNumber: record.weekNumber,
+          sessionType: record.sessionType,
+          serverRecord: record,
+          localAttemptRecord: record,
+        });
+      }
+      knownVersionsRef.current.set(docSnap.id, record.version);
+    };
+
+    const attQuery = query(
+      collection(db, 'attendance'),
+      where('weekNumber', '==', selectedWeek),
+      where('courseId', '==', targetInstructorCourseId)
+    );
+    const unsubAtt = subscribeCollectionIncremental(attQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseAttendanceDoc,
+      onMetadata: (hasPending, isFirst) => {
+        writeQueueRef.current?.notifySnapshotPendingState(hasPending, isFirst);
+      },
+      onFirstDoc: trackVersionAndConflict,
+      onDocChange: (change, parsed) => {
+        if (change.type !== 'removed') {
+          trackVersionAndConflict(change.doc, parsed);
+        }
+      },
+      onData: incomingRecords => {
+        setAttendanceRecords(prev => {
+          const others = prev.filter(
+            r =>
+              !(
+                r.courseId === targetInstructorCourseId &&
+                r.weekNumber === selectedWeek
+              )
+          );
+          return [...others, ...incomingRecords];
+        });
+      },
+      onError: error => {
+        console.error('Yoklama dinleme hatası:', error);
+      },
+    });
+
+    const unlistedQuery = query(
+      collection(db, 'unlisted_students'),
+      where('weekNumber', '==', selectedWeek),
+      where('courseId', '==', targetInstructorCourseId)
+    );
+    const unsubUnlisted = subscribeCollectionIncremental(unlistedQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseUnlistedDoc,
+      onMetadata: hasPending => {
+        writeQueueRef.current?.notifySnapshotPendingState(hasPending, false);
+      },
+      onData: items => {
+        setUnlistedReports(prev => {
+          const others = prev.filter(
+            r =>
+              !(
+                r.courseId === targetInstructorCourseId &&
+                r.weekNumber === selectedWeek
+              )
+          );
+          return [...others, ...items];
+        });
+      },
+      onError: error => {
+        console.error('Liste dışı öğrenci dinleme hatası:', error);
+      },
+    });
+
+    return () => {
+      unsubAtt();
+      unsubUnlisted();
+    };
+  }, [routeView, routeInstructorId, targetInstructorCourseId, selectedWeek]);
+
+  // 7. Sibelius unlisted_students listener (not needed on coordinator or audit_log tabs)
+  const needsSibeliusUnlisted =
+    routeView === 'sibelius' &&
+    sibeliusCategory !== 'koordinator' &&
+    sibeliusCategory !== 'audit_log';
+  useEffect(() => {
+    if (!needsSibeliusUnlisted) return;
+    const unlistedQuery = query(
+      collection(db, 'unlisted_students'),
+      where('weekNumber', '>=', 1),
+      where('weekNumber', '<=', currentWeek + 1)
+    );
+    return subscribeCollectionIncremental(unlistedQuery, {
+      parseDoc: parseUnlistedDoc,
+      onData: items => {
+        items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        setUnlistedReports(items);
+      },
+      onError: error => {
+        console.error('Sibelius liste dışı dinleme hatası:', error);
+      },
+    });
+  }, [needsSibeliusUnlisted, currentWeek]);
+
+  // 8. Sibelius attendance listener: ONLY on term-stat / course / migration views — NOT on 'menu', 'koordinator', 'audit_log', or 'liste_disi'
+  const needsSibeliusAttendance =
+    routeView === 'sibelius' &&
+    (sibeliusCategory === 'ders' ||
+      sibeliusCategory === 'ogrenci' ||
+      sibeliusCategory === 'uyumsuzluklar');
+  useEffect(() => {
+    if (!needsSibeliusAttendance) return;
+    const attQuery = query(
+      collection(db, 'attendance'),
+      where('weekNumber', '>=', 1),
+      where('weekNumber', '<=', currentWeek + 1)
+    );
+    return subscribeCollectionIncremental(attQuery, {
+      includeMetadataChanges: true,
+      parseDoc: parseAttendanceDoc,
+      onMetadata: hasPending => {
+        writeQueueRef.current?.notifySnapshotPendingState(hasPending, false);
+      },
+      onData: setAttendanceRecords,
+      onError: error => {
+        console.error('Sibelius yoklama dinleme hatası:', error);
+      },
+    });
+  }, [needsSibeliusAttendance, currentWeek]);
+
+  // 9. Scoped Real-Time Listener for Amadeus Feedback View ONLY
+  useEffect(() => {
+    if (routeView !== 'amadeus') return;
     const feedbackQuery = query(
       collection(db, 'feedback'),
       where('message', '>=', '')
     );
-    const unsubscribe = onSnapshot(
-      feedbackQuery,
-      snapshot => {
-        const items: FeedbackItem[] = [];
-        snapshot.forEach(docSnap => {
-          const raw = docSnap.data();
-          items.push({
-            id: docSnap.id,
-            message: raw.message,
-            createdAt: formatFirestoreTimestamp(
-              raw.createdAt,
-              raw.createdAtIso
-            ),
-            deletedAt: raw.deletedAt
-              ? formatFirestoreTimestamp(raw.deletedAt, raw.deletedAtIso)
-              : null,
-          });
-        });
+    return subscribeCollectionIncremental(feedbackQuery, {
+      parseDoc: parseFeedbackDoc,
+      onData: items => {
         items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         setFeedbacks(items);
       },
-      error => {
+      onError: error => {
         console.error('Feedback dinleme hatası:', error);
-      }
+      },
+    });
+  }, [routeView]);
+
+  /**
+   * Fetches complete, unfiltered Firestore collections directly via getDocs so bulk resets,
+   * JSON backups, and identity migrations never rely on partial view-scoped listener state.
+   */
+  const fetchFullScopeCollections = async () => {
+    const [
+      attSnap,
+      unlistedSnap,
+      customSnap,
+      removedSnap,
+      assignSnap,
+      notDupSnap,
+    ] = await Promise.all([
+      getDocs(
+        query(
+          collection(db, 'attendance'),
+          where('weekNumber', '>=', 1),
+          where('weekNumber', '<=', 52)
+        )
+      ),
+      getDocs(
+        query(
+          collection(db, 'unlisted_students'),
+          where('weekNumber', '>=', 1),
+          where('weekNumber', '<=', 52)
+        )
+      ),
+      getDocs(
+        query(collection(db, 'custom_students'), where('addedAtWeek', '>=', 1))
+      ),
+      getDocs(
+        query(collection(db, 'removed_students'), where('studentId', '>=', ''))
+      ),
+      getDocs(
+        query(
+          collection(db, 'instructor_assignments'),
+          where('courseId', '>=', '')
+        )
+      ),
+      getDocs(
+        query(collection(db, 'not_duplicates'), where('studentIdA', '>=', ''))
+      ),
+    ]);
+
+    const fullAttendance: AttendanceRecord[] = [];
+    attSnap.forEach(d => fullAttendance.push(parseAttendanceDoc(d)));
+
+    const fullUnlisted: UnlistedStudentReport[] = [];
+    unlistedSnap.forEach(d => fullUnlisted.push(parseUnlistedDoc(d)));
+
+    const fullCustomStudents: Student[] = [];
+    customSnap.forEach(d => {
+      const parsed = parseCustomStudentDoc(d);
+      if (parsed) fullCustomStudents.push(parsed);
+    });
+
+    const fullRemovedStudents: RemovedStudentRecord[] = [];
+    const fullRemovedIds: string[] = [];
+    removedSnap.forEach(d => {
+      const raw = d.data();
+      if (raw.deletedAt) return;
+      const sid = (raw.studentId as string | undefined) || d.id;
+      fullRemovedIds.push(sid);
+      fullRemovedStudents.push({
+        studentId: sid,
+        name: (raw.name as string | undefined) || sid,
+        removedAt: formatFirestoreTimestamp(
+          raw.removedAt,
+          raw.removedAtIso as string | undefined
+        ),
+      });
+    });
+
+    const fullInstructorAssignments: InstructorAssignmentRecord[] = [];
+    assignSnap.forEach(d =>
+      fullInstructorAssignments.push(parseInstructorAssignmentDoc(d))
     );
 
-    return () => unsubscribe();
-  }, [route.view]);
+    const rawNotDups: NotDuplicatePairRecord[] = [];
+    notDupSnap.forEach(d => {
+      const parsed = parseNotDuplicateDoc(d);
+      if (parsed) rawNotDups.push(parsed);
+    });
+
+    const fullEffectiveDb = syncDatabaseMutations(
+      fullCustomStudents,
+      fullRemovedIds,
+      fullInstructorAssignments
+    );
+
+    return {
+      attendanceRecords: fullAttendance,
+      unlistedReports: fullUnlisted,
+      customStudents: fullCustomStudents,
+      removedStudents: fullRemovedStudents,
+      instructorAssignments: fullInstructorAssignments,
+      notDuplicatePairs: deduplicateNotDuplicatePairs(rawNotDups),
+      effectiveDb: fullEffectiveDb,
+    };
+  };
 
   const handleAddStudent = async (student: Student) => {
     const prevCustom = [...customStudents];
@@ -876,7 +1100,7 @@ export default function App() {
 
     const canonicalName = normalizeName(student.name);
     const canonicalId = buildStudentIdFromName(canonicalName);
-    const baseMatch = BASE_DB.students.find(s => s.id === canonicalId);
+    const baseMatch = BASE_DB.studentsById.get(canonicalId);
     const existingCustomMatch = customStudents.find(
       s => buildStudentIdFromName(s.name) === canonicalId || s.id === canonicalId
     );
@@ -1018,7 +1242,7 @@ export default function App() {
     const prevCustom = [...customStudents];
     const prevRemoved = [...removedStudentIds];
     const prevNotDups = [...notDuplicatePairs];
-    const isBaseStudent = BASE_DB.students.some(s => s.id === student.id);
+    const isBaseStudent = BASE_DB.studentsById.has(student.id);
 
     const notDupCleanup = reconcileNotDuplicatesOnDelete(
       notDuplicatePairs,
@@ -1814,13 +2038,33 @@ export default function App() {
       noticeMessage = `"${targetStudent.name}" için yeni öğrenci kaydı (${targetStudent.id}) oluşturuldu ve şimdilik sadece ${courseTitle} dersine kaydedildi.`;
     }
 
-    const matchingAttendance = attendanceRecords.find(
+    let matchingAttendance = attendanceRecords.find(
       r =>
         !r.deletedAt &&
         r.courseId === report.courseId &&
         r.weekNumber === report.weekNumber &&
         r.sessionType === report.sessionType
     );
+    if (!matchingAttendance) {
+      try {
+        const attDocId = buildAttendanceDocId(
+          report.courseId,
+          report.weekNumber,
+          report.sessionType
+        );
+        const attSnap = await getDoc(doc(db, 'attendance', attDocId));
+        if (attSnap.exists()) {
+          const parsed = parseAttendanceDoc(
+            attSnap as QueryDocumentSnapshot<DocumentData>
+          );
+          if (!parsed.deletedAt) {
+            matchingAttendance = parsed;
+          }
+        }
+      } catch (err) {
+        console.warn('Liste dışı kayıt yoklama kontrolü hatası:', err);
+      }
+    }
     if (
       matchingAttendance &&
       matchingAttendance.absentStudentIds.includes(targetStudent.id)
@@ -2017,12 +2261,13 @@ export default function App() {
   };
 
   const handleResetZeroPresentAttendance = async (): Promise<number> => {
-    const activeRecords = attendanceRecords.filter(r => !r.deletedAt);
+    const fullScope = await fetchFullScopeCollections();
+    const activeRecords = fullScope.attendanceRecords.filter(r => !r.deletedAt);
     const zeroRecords = getZeroPresentAttendanceRecords(
       activeRecords,
-      effectiveDb.courses,
-      unlistedReports.filter(u => !u.deletedAt),
-      customStudents
+      fullScope.effectiveDb.courses,
+      fullScope.unlistedReports.filter(u => !u.deletedAt),
+      fullScope.customStudents
     );
     if (zeroRecords.length === 0) {
       return 0;
@@ -2037,7 +2282,7 @@ export default function App() {
     setAttendanceRecords(prev =>
       prev.map(r => (r.id && zeroIds.has(r.id) ? { ...r, deletedAt: nowIso } : r))
     );
-    setLastSoftDeletedAttendanceIds(Array.from(zeroIds));
+    setLastSoftDeletedAttendanceRecords(zeroRecords);
 
     await writeQueueRef.current!.enqueueImmediate({
       key: 'reset_zero_attendance',
@@ -2081,19 +2326,17 @@ export default function App() {
   };
 
   const handleResetAllAttendance = async () => {
-    const activeRecords = attendanceRecords.filter(r => !r.deletedAt);
+    const fullScope = await fetchFullScopeCollections();
+    const activeRecords = fullScope.attendanceRecords.filter(r => !r.deletedAt);
     triggerJsonBackupDownload('tum-yoklamalar', activeRecords);
 
     const prevAttendance = [...attendanceRecords];
     const nowIso = new Date().toISOString();
-    const affectedIds = activeRecords
-      .map(r => r.id)
-      .filter((id): id is string => Boolean(id));
 
     setAttendanceRecords(prev =>
       prev.map(r => ({ ...r, deletedAt: nowIso }))
     );
-    setLastSoftDeletedAttendanceIds(affectedIds);
+    setLastSoftDeletedAttendanceRecords(activeRecords);
 
     await writeQueueRef.current!.enqueueImmediate({
       key: 'reset_all_attendance',
@@ -2135,11 +2378,11 @@ export default function App() {
   };
 
   const handleUndoAttendanceReset = async () => {
-    if (lastSoftDeletedAttendanceIds.length === 0) return;
-    const idsToRestore = new Set(lastSoftDeletedAttendanceIds);
-    const recordsToRestore = attendanceRecords.filter(
-      r => r.id && idsToRestore.has(r.id)
+    if (lastSoftDeletedAttendanceRecords.length === 0) return;
+    const recordsToRestore = lastSoftDeletedAttendanceRecords.filter(r =>
+      Boolean(r.id)
     );
+    const idsToRestore = new Set(recordsToRestore.map(r => r.id!));
     const nowIso = new Date().toISOString();
 
     setAttendanceRecords(prev =>
@@ -2147,7 +2390,7 @@ export default function App() {
         r.id && idsToRestore.has(r.id) ? { ...r, deletedAt: null } : r
       )
     );
-    setLastSoftDeletedAttendanceIds([]);
+    setLastSoftDeletedAttendanceRecords([]);
 
     await writeQueueRef.current!.enqueueImmediate({
       key: 'undo_attendance_reset',
@@ -2330,19 +2573,19 @@ export default function App() {
     });
   };
 
-  const handleDownloadMigrationBackup = () => {
+  const handleDownloadMigrationBackup = async () => {
+    const [{ createMigrationBackupPayload }, fullScope] = await Promise.all([
+      import('./utils/studentMigration'),
+      fetchFullScopeCollections(),
+    ]);
     const backup = createMigrationBackupPayload({
       baseStudents: BASE_DB.students,
-      customStudents,
-      removedStudents: removedStudentIds.map(id => ({
-        studentId: id,
-        name: id,
-        removedAt: new Date().toISOString(),
-      })),
-      unlistedReports,
-      attendanceRecords,
-      instructorAssignments,
-      notDuplicatePairs,
+      customStudents: fullScope.customStudents,
+      removedStudents: fullScope.removedStudents,
+      unlistedReports: fullScope.unlistedReports,
+      attendanceRecords: fullScope.attendanceRecords,
+      instructorAssignments: fullScope.instructorAssignments,
+      notDuplicatePairs: fullScope.notDuplicatePairs,
     });
     setLastMigrationBackup(backup);
     triggerJsonBackupDownload('ogrenci-birlestirme-tam-yedek', backup);
@@ -2351,20 +2594,23 @@ export default function App() {
   const handleExecuteStudentMigration = async (
     resolutions: MigrationUserResolutions
   ): Promise<string> => {
+    const [
+      { buildMigrationDryRunReport, createMigrationBackupPayload },
+      fullScope,
+    ] = await Promise.all([
+      import('./utils/studentMigration'),
+      fetchFullScopeCollections(),
+    ]);
     const nowIso = new Date().toISOString();
     const backup = createMigrationBackupPayload(
       {
         baseStudents: BASE_DB.students,
-        customStudents,
-        removedStudents: removedStudentIds.map(id => ({
-          studentId: id,
-          name: id,
-          removedAt: nowIso,
-        })),
-        unlistedReports,
-        attendanceRecords,
-        instructorAssignments,
-        notDuplicatePairs,
+        customStudents: fullScope.customStudents,
+        removedStudents: fullScope.removedStudents,
+        unlistedReports: fullScope.unlistedReports,
+        attendanceRecords: fullScope.attendanceRecords,
+        instructorAssignments: fullScope.instructorAssignments,
+        notDuplicatePairs: fullScope.notDuplicatePairs,
       },
       nowIso
     );
@@ -2374,11 +2620,11 @@ export default function App() {
     const report = buildMigrationDryRunReport(
       {
         baseStudents: BASE_DB.students,
-        customStudents,
-        unlistedReports,
-        attendanceRecords,
-        courses: effectiveDb.courses,
-        notDuplicatePairs,
+        customStudents: fullScope.customStudents,
+        unlistedReports: fullScope.unlistedReports,
+        attendanceRecords: fullScope.attendanceRecords,
+        courses: fullScope.effectiveDb.courses,
+        notDuplicatePairs: fullScope.notDuplicatePairs,
       },
       resolutions,
       nowIso
@@ -2389,7 +2635,7 @@ export default function App() {
     }
 
     // Reconcile any not_duplicates pairs when students are merged
-    let nextNotDups = [...notDuplicatePairs];
+    let nextNotDups = [...fullScope.notDuplicatePairs];
     const notDupIdsToDelete = new Set<string>();
     const notDupRecordsToUpsert = new Map<string, NotDuplicatePairRecord>();
 
@@ -2434,6 +2680,18 @@ export default function App() {
       label: 'Öğrenci Kimliklerini Birleştir',
       execute: async () => {
         try {
+          const customById = new Map(
+            fullScope.customStudents.map(c => [c.id, c])
+          );
+          const unlistedById = new Map(
+            fullScope.unlistedReports.map(u => [u.id, u])
+          );
+          const attendanceById = new Map(
+            fullScope.attendanceRecords
+              .filter(a => Boolean(a.id))
+              .map(a => [a.id!, a])
+          );
+
           const batch = writeBatch(db);
 
           for (const group of report.groupsToMigrate) {
@@ -2462,7 +2720,7 @@ export default function App() {
             }
 
             for (const dupId of group.duplicateCustomDocIdsToSoftDelete) {
-              const oldRec = customStudents.find(c => c.id === dupId);
+              const oldRec = customById.get(dupId);
               if (oldRec) {
                 batch.set(doc(db, 'custom_students', dupId), {
                   id: oldRec.id,
@@ -2481,7 +2739,7 @@ export default function App() {
           }
 
           for (const uRedir of report.unlistedRedirects) {
-            const orig = unlistedReports.find(u => u.id === uRedir.docId);
+            const orig = unlistedById.get(uRedir.docId);
             if (orig) {
               batch.set(doc(db, 'unlisted_students', orig.id), {
                 id: orig.id,
@@ -2504,7 +2762,7 @@ export default function App() {
           }
 
           for (const aRedir of report.attendanceRedirects) {
-            const orig = attendanceRecords.find(a => a.id === aRedir.docId);
+            const orig = attendanceById.get(aRedir.docId);
             if (orig) {
               batch.set(doc(db, 'attendance', aRedir.docId), {
                 courseId: orig.courseId,
@@ -2628,6 +2886,92 @@ export default function App() {
     });
   };
 
+  const handleUnifyYuzyuzeClassStudents =
+    async (): Promise<YuzyuzeUnionExecutionResult> => {
+      const { buildCustomStudentUnionPayload, computeYuzyuzeClassUnionPlan } =
+        await import('./utils/yuzyuzeUnion');
+      const plan = computeYuzyuzeClassUnionPlan({
+        students: effectiveDb.students,
+        courses: effectiveDb.courses,
+      });
+
+      if (plan.studentUpdates.length === 0) {
+        return {
+          updatedClassesCount: 0,
+          updatedStudentsCount: 0,
+          addedEnrollmentsCount: 0,
+        };
+      }
+
+      const prevCustom = [...customStudents];
+      const nowIso = new Date().toISOString();
+
+      const updatedPayloads = plan.studentUpdates.map(upd =>
+        buildCustomStudentUnionPayload(
+          upd.student,
+          upd.nextEnrolledCourseIds,
+          nowIso
+        )
+      );
+
+      setCustomStudents(prev => {
+        const nextMap = new Map(prev.map(s => [s.id, s]));
+        for (const payload of updatedPayloads) {
+          const existing = nextMap.get(payload.id);
+          nextMap.set(payload.id, {
+            ...(existing || {}),
+            id: payload.id,
+            name: payload.name,
+            grade: payload.grade,
+            modality: payload.modality,
+            enrolledCourseIds: payload.enrolledCourseIds,
+            addedAtWeek: payload.addedAtWeek,
+            addedAt: payload.addedAt,
+            deletedAt: null,
+          });
+        }
+        return Array.from(nextMap.values());
+      });
+
+      await writeQueueRef.current!.enqueueImmediate({
+        key: 'unify_yuzyuze_class_students',
+        label: 'Yüz Yüze Sınıfları Birleştir',
+        rollback: () => setCustomStudents(prevCustom),
+        execute: async () => {
+          try {
+            const CHUNK_SIZE = 400;
+            for (let i = 0; i < updatedPayloads.length; i += CHUNK_SIZE) {
+              const chunk = updatedPayloads.slice(i, i + CHUNK_SIZE);
+              const batch = writeBatch(db);
+              for (const payload of chunk) {
+                batch.set(doc(db, 'custom_students', payload.id), payload);
+              }
+              await batch.commit();
+            }
+
+            void writeAuditLog({
+              actor: 'sibelius (ekip)',
+              action: 'yuzyuze_sinif_birlestir',
+              target: 'custom_students',
+              details: `${plan.updatedClassesCount} yüz yüze sınıfta ${plan.updatedStudentsCount} öğrencinin ders kayıtları birleştirildi (+${plan.addedEnrollmentsCount} ders kaydı).`,
+            });
+          } catch (error) {
+            handleFirestoreError(
+              error,
+              OperationType.WRITE,
+              'custom_students/yuzyuze_union'
+            );
+          }
+        },
+      });
+
+      return {
+        updatedClassesCount: plan.updatedClassesCount,
+        updatedStudentsCount: plan.updatedStudentsCount,
+        addedEnrollmentsCount: plan.addedEnrollmentsCount,
+      };
+    };
+
   const handleDownloadHtml = () => {
     const link = document.createElement('a');
     link.href = './bach.html';
@@ -2651,6 +2995,7 @@ export default function App() {
 
     if (res.type === 'admin') {
       setPromptWarning(null);
+      setSibeliusCategory('menu');
       setRoute({ view: 'sibelius' });
       safeReplaceHash('#bach/sibelius');
       return;
@@ -2686,6 +3031,7 @@ export default function App() {
 
   const performReturnHome = () => {
     setRoute({ view: 'login' });
+    setSibeliusCategory('menu');
     setIdentityInput('');
     setPromptWarning(null);
     setInstructorExitCounter(0);
@@ -2820,84 +3166,118 @@ export default function App() {
         )}
 
         {route.view === 'instructor' && (
-          <InstructorView
-            instructor={
-              effectiveDb.instructors.find(i => i.id === route.instructor.id) ||
-              route.instructor
+          <Suspense
+            fallback={
+              <div className="mx-auto w-full max-w-2xl px-4 py-12 text-center text-sm text-stone-500">
+                yükleniyor...
+              </div>
             }
-            currentWeek={currentWeek}
-            selectedWeek={selectedWeek}
-            onSelectWeek={setSelectedWeek}
-            onActiveCourseChange={setActiveInstructorCourseId}
-            allStudents={effectiveDb.students}
-            allCourses={effectiveDb.courses}
-            attendanceRecords={attendanceRecords}
-            unlistedReports={unlistedReports}
-            notDuplicatePairs={notDuplicatePairs}
-            onSaveAttendance={handleSaveAttendance}
-            onAddStudent={handleAddStudent}
-            onAddUnlistedStudent={handleAddUnlistedStudent}
-            onRemoveUnlistedStudent={handleDeleteUnlistedReport}
-            onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
-            onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
-            onReconcileNotDuplicatesOnMerge={handleReconcileNotDuplicatesForMerge}
-            onDeleteCourseSession={handleDeleteCourseSession}
-            onBackToLogin={performReturnHome}
-            onGuardedNavigate={handleGuardedNavigate}
-            conflictNotice={conflictNotice}
-            onResolveConflict={handleResolveConflict}
-            exitRequestCounter={instructorExitCounter}
-          />
+          >
+            <InstructorView
+              instructor={
+                effectiveDb.instructorsById.get(route.instructor.id) ||
+                route.instructor
+              }
+              currentWeek={currentWeek}
+              selectedWeek={selectedWeek}
+              onSelectWeek={setSelectedWeek}
+              onActiveCourseChange={setActiveInstructorCourseId}
+              allStudents={effectiveDb.students}
+              allCourses={effectiveDb.courses}
+              attendanceRecords={attendanceRecords}
+              unlistedReports={unlistedReports}
+              notDuplicatePairs={notDuplicatePairs}
+              onSaveAttendance={handleSaveAttendance}
+              onAddStudent={handleAddStudent}
+              onAddUnlistedStudent={handleAddUnlistedStudent}
+              onRemoveUnlistedStudent={handleDeleteUnlistedReport}
+              onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
+              onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
+              onReconcileNotDuplicatesOnMerge={
+                handleReconcileNotDuplicatesForMerge
+              }
+              onDeleteCourseSession={handleDeleteCourseSession}
+              onBackToLogin={performReturnHome}
+              onGuardedNavigate={handleGuardedNavigate}
+              conflictNotice={conflictNotice}
+              onResolveConflict={handleResolveConflict}
+              exitRequestCounter={instructorExitCounter}
+            />
+          </Suspense>
         )}
 
         {route.view === 'sibelius' && (
-          <AdminSibeliusView
-            currentWeek={currentWeek}
-            students={effectiveDb.students}
-            rawCustomStudents={customStudents}
-            courses={effectiveDb.courses}
-            instructors={effectiveDb.instructors}
-            attendanceRecords={attendanceRecords}
-            unlistedReports={unlistedReports}
-            notDuplicatePairs={notDuplicatePairs}
-            coordinatorAssignments={coordinatorAssignments}
-            auditLogs={auditLogs}
-            onAddStudent={handleAddStudent}
-            onRemoveStudent={handleRemoveStudent}
-            onAssignInstructor={handleAssignInstructor}
-            onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
-            onMarkTemporaryUnlistedStudent={handleMarkTemporaryUnlistedStudent}
-            onDeleteUnlistedReport={handleDeleteUnlistedReport}
-            onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
-            onRemoveNotDuplicatePair={handleRemoveNotDuplicatePair}
-            canUndoNotDuplicate={lastIgnoredNotDuplicateIds.length > 0}
-            onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
-            onReconcileNotDuplicatesOnMerge={handleReconcileNotDuplicatesForMerge}
-            onDownloadMigrationBackup={handleDownloadMigrationBackup}
-            onExecuteStudentMigration={handleExecuteStudentMigration}
-            canUndoMigration={Boolean(lastMigrationBackup)}
-            onUndoMigration={handleUndoStudentMigration}
-            onSaveCoordinator={handleSaveCoordinatorAssignment}
-            onResetZeroAttendance={handleResetZeroPresentAttendance}
-            onResetAllAttendance={handleResetAllAttendance}
-            canUndoAttendanceReset={lastSoftDeletedAttendanceIds.length > 0}
-            onUndoAttendanceReset={handleUndoAttendanceReset}
-            onResetAllFeedbacks={handleClearAllFeedbacks}
-            canUndoFeedbackReset={lastSoftDeletedFeedbackIds.length > 0}
-            onUndoFeedbackReset={handleUndoFeedbackReset}
-            onBackToLogin={handleReturnHome}
-          />
+          <Suspense
+            fallback={
+              <div className="mx-auto w-full max-w-2xl px-4 py-12 text-center text-sm text-stone-500">
+                yükleniyor...
+              </div>
+            }
+          >
+            <AdminSibeliusView
+              currentWeek={currentWeek}
+              students={effectiveDb.students}
+              rawCustomStudents={customStudents}
+              courses={effectiveDb.courses}
+              instructors={effectiveDb.instructors}
+              attendanceRecords={attendanceRecords}
+              unlistedReports={unlistedReports}
+              notDuplicatePairs={notDuplicatePairs}
+              coordinatorAssignments={coordinatorAssignments}
+              auditLogs={auditLogs}
+              onCategoryChange={setSibeliusCategory}
+              onAddStudent={handleAddStudent}
+              onRemoveStudent={handleRemoveStudent}
+              onAssignInstructor={handleAssignInstructor}
+              onEnrollUnlistedStudent={handleEnrollUnlistedStudent}
+              onMarkTemporaryUnlistedStudent={
+                handleMarkTemporaryUnlistedStudent
+              }
+              onDeleteUnlistedReport={handleDeleteUnlistedReport}
+              onMarkNotDuplicatePairs={handleMarkNotDuplicatePairs}
+              onRemoveNotDuplicatePair={handleRemoveNotDuplicatePair}
+              canUndoNotDuplicate={lastIgnoredNotDuplicateIds.length > 0}
+              onUndoLastNotDuplicate={handleUndoLastNotDuplicatePairs}
+              onReconcileNotDuplicatesOnMerge={
+                handleReconcileNotDuplicatesForMerge
+              }
+              onDownloadMigrationBackup={handleDownloadMigrationBackup}
+              onExecuteStudentMigration={handleExecuteStudentMigration}
+              canUndoMigration={Boolean(lastMigrationBackup)}
+              onUndoMigration={handleUndoStudentMigration}
+              onSaveCoordinator={handleSaveCoordinatorAssignment}
+              onResetZeroAttendance={handleResetZeroPresentAttendance}
+              onResetAllAttendance={handleResetAllAttendance}
+              canUndoAttendanceReset={
+                lastSoftDeletedAttendanceRecords.length > 0
+              }
+              onUndoAttendanceReset={handleUndoAttendanceReset}
+              onResetAllFeedbacks={handleClearAllFeedbacks}
+              canUndoFeedbackReset={lastSoftDeletedFeedbackIds.length > 0}
+              onUndoFeedbackReset={handleUndoFeedbackReset}
+              onUnifyYuzyuzeClasses={handleUnifyYuzyuzeClassStudents}
+              onBackToLogin={handleReturnHome}
+            />
+          </Suspense>
         )}
 
         {route.view === 'amadeus' && (
-          <AmadeusFeedbackView
-            feedbacks={feedbacks}
-            onDeleteFeedback={handleDeleteFeedback}
-            onClearAllFeedbacks={handleClearAllFeedbacks}
-            canUndoFeedbackReset={lastSoftDeletedFeedbackIds.length > 0}
-            onUndoFeedbackReset={handleUndoFeedbackReset}
-            onBackToLogin={handleReturnHome}
-          />
+          <Suspense
+            fallback={
+              <div className="mx-auto w-full max-w-2xl px-4 py-12 text-center text-sm text-stone-500">
+                yükleniyor...
+              </div>
+            }
+          >
+            <AmadeusFeedbackView
+              feedbacks={feedbacks}
+              onDeleteFeedback={handleDeleteFeedback}
+              onClearAllFeedbacks={handleClearAllFeedbacks}
+              canUndoFeedbackReset={lastSoftDeletedFeedbackIds.length > 0}
+              onUndoFeedbackReset={handleUndoFeedbackReset}
+              onBackToLogin={handleReturnHome}
+            />
+          </Suspense>
         )}
       </main>
 

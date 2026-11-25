@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   RotateCcw,
   Sparkles,
@@ -124,9 +124,22 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   onResolveConflict,
   exitRequestCounter = 0,
 }) => {
-  const instructorCourses: Course[] = instructor.courseIds
-    .map(id => allCourses.find(c => c.id === id))
-    .filter((c): c is Course => Boolean(c));
+  const allCoursesById = useMemo(
+    () => new Map(allCourses.map(c => [c.id, c])),
+    [allCourses]
+  );
+  const allStudentsById = useMemo(
+    () => new Map(allStudents.map(s => [s.id, s])),
+    [allStudents]
+  );
+
+  const instructorCourses: Course[] = useMemo(
+    () =>
+      instructor.courseIds
+        .map(id => allCoursesById.get(id))
+        .filter((c): c is Course => Boolean(c)),
+    [instructor.courseIds, allCoursesById]
+  );
 
   const [selectedCourseId, setSelectedCourseId] = useState<string>(
     instructorCourses[0]?.id || ''
@@ -160,14 +173,26 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
     }
   }, [activeCourse?.id, onActiveCourseChange]);
 
-  const activeAttendanceRecords = attendanceRecords.filter(r => !r.deletedAt);
-  const activeUnlistedReports = unlistedReports.filter(r => !r.deletedAt);
+  const activeAttendanceRecords = useMemo(
+    () => attendanceRecords.filter(r => !r.deletedAt),
+    [attendanceRecords]
+  );
+  const activeUnlistedReports = useMemo(
+    () => unlistedReports.filter(r => !r.deletedAt),
+    [unlistedReports]
+  );
 
-  const courseWeekRecords = activeCourse
-    ? activeAttendanceRecords
-        .filter(r => r.courseId === activeCourse.id && r.weekNumber === selectedWeek)
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    : [];
+  const courseWeekRecords = useMemo(
+    () =>
+      activeCourse
+        ? activeAttendanceRecords
+            .filter(
+              r => r.courseId === activeCourse.id && r.weekNumber === selectedWeek
+            )
+            .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        : [],
+    [activeCourse, activeAttendanceRecords, selectedWeek]
+  );
 
   const autoSelectedKeyRef = useRef<string>('');
 
@@ -204,41 +229,62 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   }, [activeCourse?.id, selectedWeek, courseWeekRecords.length, selectedSession]);
 
   // Find current attendance record for (activeCourse, selectedWeek, selectedSession)
-  const existingRecord = activeAttendanceRecords.find(
-    r =>
-      r.courseId === activeCourse?.id &&
-      r.weekNumber === selectedWeek &&
-      (selectedSession ? r.sessionType === selectedSession : false)
-  );
+  const existingRecord = selectedSession
+    ? courseWeekRecords.find(r => r.sessionType === selectedSession)
+    : undefined;
 
   // Also check if instructor marked "ders yapmadım" for this course & week
-  const didNotHoldRecord = activeAttendanceRecords.find(
-    r =>
-      r.courseId === activeCourse?.id &&
-      r.weekNumber === selectedWeek &&
-      r.didNotHoldClass
+  const didNotHoldRecord = courseWeekRecords.find(r => r.didNotHoldClass);
+
+  const courseStudents: Student[] = useMemo(
+    () =>
+      (activeCourse?.studentIds || [])
+        .map(sid => allStudentsById.get(sid))
+        .filter((s): s is Student => Boolean(s)),
+    [activeCourse?.studentIds, allStudentsById]
   );
 
-  const courseStudents: Student[] = (activeCourse?.studentIds || [])
-    .map(sid => allStudents.find(s => s.id === sid))
-    .filter((s): s is Student => Boolean(s));
-
-  const courseStudentIds = courseStudents.map(s => s.id);
+  const courseStudentIds = useMemo(
+    () => courseStudents.map(s => s.id),
+    [courseStudents]
+  );
+  const courseStudentIdSet = useMemo(
+    () => new Set(courseStudentIds),
+    [courseStudentIds]
+  );
 
   // Difference set (fark kümesi) stored in existingRecord.absentStudentIds
-  const absentStudentIds = existingRecord
-    ? existingRecord.absentStudentIds.filter(id => courseStudentIds.includes(id))
-    : courseStudentIds;
+  const absentStudentIds = useMemo(
+    () =>
+      existingRecord
+        ? existingRecord.absentStudentIds.filter(id => courseStudentIdSet.has(id))
+        : courseStudentIds,
+    [existingRecord, courseStudentIdSet, courseStudentIds]
+  );
+  const absentStudentIdSet = useMemo(
+    () => new Set(absentStudentIds),
+    [absentStudentIds]
+  );
 
-  const presentStudentIds = courseStudentIds.filter(id => !absentStudentIds.includes(id));
-  const absentStudents = courseStudents.filter(s => absentStudentIds.includes(s.id));
+  const presentStudentIds = useMemo(
+    () => courseStudentIds.filter(id => !absentStudentIdSet.has(id)),
+    [courseStudentIds, absentStudentIdSet]
+  );
+  const absentStudents = useMemo(
+    () => courseStudents.filter(s => absentStudentIdSet.has(s.id)),
+    [courseStudents, absentStudentIdSet]
+  );
 
   // Unlisted / temporary students reported for this specific (course, week, session)
-  const sessionUnlistedReports = activeUnlistedReports.filter(
-    r =>
-      r.courseId === activeCourse?.id &&
-      r.weekNumber === selectedWeek &&
-      r.sessionType === selectedSession
+  const sessionUnlistedReports = useMemo(
+    () =>
+      activeUnlistedReports.filter(
+        r =>
+          r.courseId === activeCourse?.id &&
+          r.weekNumber === selectedWeek &&
+          r.sessionType === selectedSession
+      ),
+    [activeUnlistedReports, activeCourse?.id, selectedWeek, selectedSession]
   );
 
   const currentSessionConfirmKey =

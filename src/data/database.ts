@@ -91,13 +91,6 @@ export interface UnlistedStudentReport {
   deletedAt?: string | null;
 }
 
-export interface PlaceboSavePreferenceRecord {
-  instructorId: string;
-  instructorName: string;
-  enabled: boolean;
-  updatedAt: string;
-}
-
 export interface AuditLogEntry {
   id: string;
   actor: string;
@@ -133,8 +126,6 @@ interface RawCourseDef {
   instructorName: string;
   alias?: string;
   rawStudents: { name: string; grade: string; note?: string }[];
-  initialWeek1Absents?: string[];
-  initialWeek1Tracked?: boolean;
 }
 
 const RAW_COURSES: RawCourseDef[] = [
@@ -1630,8 +1621,6 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
     modality: 'yuzyuze',
     instructorName: 'sümeyye nur yıldırım',
     rawStudents: YUZYUZE_5A_STUDENTS,
-    initialWeek1Tracked: true,
-    initialWeek1Absents: ['Arda Deniz Bal', 'Defne Gür', 'Defne Nil Aksu', 'Dilara Tehik', 'Eymen Bozkurt'],
   },
   { id: 'yy-5a-fen', gradeClass: '5/a', subject: 'fen bilimleri', modality: 'yuzyuze', instructorName: 'rana bıyıklıoğlu', rawStudents: YUZYUZE_5A_STUDENTS },
   { id: 'yy-5a-sos', gradeClass: '5/a', subject: 'sosyal bilgiler', modality: 'yuzyuze', instructorName: 'rabia kılbaş', rawStudents: YUZYUZE_5A_STUDENTS },
@@ -1669,8 +1658,6 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
     modality: 'yuzyuze',
     instructorName: 'zehra bağır',
     rawStudents: YUZYUZE_7B_STUDENTS,
-    initialWeek1Tracked: true,
-    initialWeek1Absents: ['Nail Tunç', 'Nazlı Navruz', 'Nisa Aydın', 'Şahin Onur Gökçe', 'Yiğit Efe Kılıç', 'Yusuf Ayaz Mercan', 'Zeynep Navruz', 'Zümra Karaman'],
   },
   {
     id: 'yy-7b-fen',
@@ -1679,8 +1666,6 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
     modality: 'yuzyuze',
     instructorName: 'ebru yıldırım',
     rawStudents: YUZYUZE_7B_STUDENTS,
-    initialWeek1Tracked: true,
-    initialWeek1Absents: ['Nail Tunç', 'Nazlı Navruz', 'Nisa Aydın', 'Yiğit Efe Kılıç', 'Zeynep Navruz'],
   },
   { id: 'yy-7b-sos', gradeClass: '7/b', subject: 'sosyal bilgiler', modality: 'yuzyuze', instructorName: 'vedat fidan', rawStudents: YUZYUZE_7B_STUDENTS },
   { id: 'yy-7b-ing', gradeClass: '7/b', subject: 'ingilizce', modality: 'yuzyuze', instructorName: 'sündüz yaren turan', rawStudents: YUZYUZE_7B_STUDENTS },
@@ -1692,8 +1677,6 @@ const YUZYUZE_COURSES: RawCourseDef[] = [
     modality: 'yuzyuze',
     instructorName: 'ayşegül kayacık',
     rawStudents: YUZYUZE_8A_STUDENTS,
-    initialWeek1Tracked: true,
-    initialWeek1Absents: ['Esila Tanem Kavutcu', 'Beren Asya Ayra', 'Emir Ali Bayram', 'Halil İbrahim Bayram', 'Sude Nil İpek', 'Derin Nazlı Sarıyar', 'Mehmet Fettah Salman', 'Damla Karabacak'],
   },
   { id: 'yy-8a-tur', gradeClass: '8/a', subject: 'türkçe', modality: 'yuzyuze', instructorName: 'bekir toprak bilgin', rawStudents: YUZYUZE_8A_STUDENTS },
   { id: 'yy-8a-fen', gradeClass: '8/a', subject: 'fen bilimleri', modality: 'yuzyuze', instructorName: 'elifnur meriç', rawStudents: YUZYUZE_8A_STUDENTS },
@@ -1816,12 +1799,21 @@ export function getCanonicalStudentName(rawName: string, useBuiltinMap = false):
   return norm;
 }
 
-// Build complete normalized database
-function buildDatabase() {
+export interface DatabaseSnapshot {
+  students: Student[];
+  instructors: Instructor[];
+  courses: Course[];
+  studentsById: Map<string, Student>;
+  instructorsById: Map<string, Instructor>;
+  coursesById: Map<string, Course>;
+}
+
+// Build complete normalized database once
+function buildDatabase(): DatabaseSnapshot {
   const studentsMap = new Map<string, Student>();
   const instructorsMap = new Map<string, Instructor>();
   const coursesList: Course[] = [];
-  const initialAttendanceRecords: AttendanceRecord[] = [];
+  const coursesById = new Map<string, Course>();
 
   const allRawCourses = [...RAW_COURSES, ...YUZYUZE_COURSES];
 
@@ -1849,7 +1841,7 @@ function buildDatabase() {
       instructor.courseIds.push(rc.id);
     }
 
-    const courseStudentIds: string[] = [];
+    const courseStudentIdSet = new Set<string>();
 
     for (const rs of rc.rawStudents) {
       if (/^bos\d+$/i.test(normalizeName(rs.name))) continue;
@@ -1874,20 +1866,17 @@ function buildDatabase() {
       if (!student.enrolledCourseIds.includes(rc.id)) {
         student.enrolledCourseIds.push(rc.id);
       }
-      if (!courseStudentIds.includes(studentId)) {
-        courseStudentIds.push(studentId);
-      }
+      courseStudentIdSet.add(studentId);
     }
 
-    // Sort students alphabetically in each course
-    courseStudentIds.sort((a, b) => {
+    const courseStudentIds = Array.from(courseStudentIdSet).sort((a, b) => {
       const sa = studentsMap.get(a)?.name || '';
       const sb = studentsMap.get(b)?.name || '';
       return sa.localeCompare(sb, 'tr-TR');
     });
 
     const modalityLabel = rc.modality === 'online' ? 'çevrim içi' : 'yüz yüze';
-    coursesList.push({
+    const courseObj: Course = {
       id: rc.id,
       title: `${rc.gradeClass} ${rc.subject} (${modalityLabel})`,
       shortTitle: `${rc.gradeClass} ${rc.subject}`,
@@ -1897,22 +1886,67 @@ function buildDatabase() {
       instructorId: instId,
       instructorName: instNormName,
       studentIds: courseStudentIds,
-    });
+    };
+    coursesList.push(courseObj);
+    coursesById.set(courseObj.id, courseObj);
   }
 
+  const students = Array.from(studentsMap.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, 'tr-TR')
+  );
+  const instructors = Array.from(instructorsMap.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, 'tr-TR')
+  );
+
   return {
-    students: Array.from(studentsMap.values()).sort((a, b) => a.name.localeCompare(b.name, 'tr-TR')),
-    instructors: Array.from(instructorsMap.values()).sort((a, b) => a.name.localeCompare(b.name, 'tr-TR')),
+    students,
+    instructors,
     courses: coursesList,
-    initialAttendanceRecords,
+    studentsById: studentsMap,
+    instructorsById: instructorsMap,
+    coursesById,
   };
 }
 
-export const BASE_DB = buildDatabase();
-export const DB = buildDatabase();
+function cloneDatabase(source: DatabaseSnapshot): DatabaseSnapshot {
+  const students = source.students.map(s => ({
+    ...s,
+    enrolledCourseIds: [...s.enrolledCourseIds],
+  }));
+  const instructors = source.instructors.map(i => ({
+    ...i,
+    courseIds: [...i.courseIds],
+  }));
+  const courses = source.courses.map(c => ({
+    ...c,
+    studentIds: [...c.studentIds],
+  }));
+  return {
+    students,
+    instructors,
+    courses,
+    studentsById: new Map(students.map(s => [s.id, s])),
+    instructorsById: new Map(instructors.map(i => [i.id, i])),
+    coursesById: new Map(courses.map(c => [c.id, c])),
+  };
+}
+
+export const BASE_DB: DatabaseSnapshot = buildDatabase();
+export const DB: DatabaseSnapshot = cloneDatabase(BASE_DB);
+
+const BASE_STUDENT_ID_SET = new Set<string>(BASE_DB.studentsById.keys());
+const BASE_COURSE_ID_SET = new Set<string>(BASE_DB.coursesById.keys());
+const BASE_YUZYUZE_BRANCH_COURSE_ID_BY_GRADE = new Map<string, string>();
+for (const c of BASE_DB.courses) {
+  if (c.modality === 'yuzyuze' && !BASE_YUZYUZE_BRANCH_COURSE_ID_BY_GRADE.has(c.gradeClass)) {
+    BASE_YUZYUZE_BRANCH_COURSE_ID_BY_GRADE.set(c.gradeClass, c.id);
+  }
+}
 
 // Global runtime alias map from legacy/duplicate IDs (e.g. stu_<random>) to canonical stu-<slug>
-export const STUDENT_ID_ALIAS_MAP = new Map<string, string>();
+export const STUDENT_ID_ALIAS_MAP = new Map<string, string>(
+  BASE_DB.students.map(st => [st.id, st.id])
+);
 
 export function resolveCanonicalStudentId(studentId: string): string {
   if (!studentId) return studentId;
@@ -2124,10 +2158,7 @@ export function syncDatabaseMutations(
   customStudents: Student[],
   removedStudentIds: string[],
   instructorAssignments: InstructorAssignmentRecord[] = []
-): { students: Student[]; courses: Course[]; instructors: Instructor[] } {
-  for (const baseSt of BASE_DB.students) {
-    STUDENT_ID_ALIAS_MAP.set(baseSt.id, baseSt.id);
-  }
+): DatabaseSnapshot {
   for (const custom of customStudents) {
     const canonicalId = buildStudentIdFromName(custom.name);
     if (canonicalId && custom.id) {
@@ -2135,9 +2166,10 @@ export function syncDatabaseMutations(
     }
   }
 
-  const removedSet = new Set(removedStudentIds.map(id => resolveCanonicalStudentId(id)));
+  const removedSet = new Set<string>();
   for (const rawId of removedStudentIds) {
     removedSet.add(rawId);
+    removedSet.add(resolveCanonicalStudentId(rawId));
   }
 
   const studentsMap = new Map<string, Student>();
@@ -2159,6 +2191,8 @@ export function syncDatabaseMutations(
     }
   }
 
+  const countTurkishChars = (s: string) => (s.match(/[çğıöşü]/g) || []).length;
+
   // 2. Add or merge custom students by canonical stu-<slug> ID (Requirement 1, 2, 4)
   for (const custom of customStudents) {
     if (custom.deletedAt) continue;
@@ -2170,7 +2204,7 @@ export function syncDatabaseMutations(
     if (removedSet.has(canonicalId) || removedSet.has(custom.id)) continue;
 
     const existing = studentsMap.get(canonicalId);
-    const isBaseStudent = BASE_DB.students.some(b => b.id === canonicalId);
+    const isBaseStudent = BASE_STUDENT_ID_SET.has(canonicalId);
 
     if (existing) {
       const mergedCourses = Array.from(
@@ -2189,8 +2223,6 @@ export function syncDatabaseMutations(
             : custom.addedAt
           : existing.addedAt ?? custom.addedAt;
 
-      // Prefer name with rich Turkish characters if slug is identical (e.g. "ahmet emir çelikcan" over "ahmet emir celikcan")
-      const countTurkishChars = (s: string) => (s.match(/[çğıöşü]/g) || []).length;
       const bestName =
         existing.name === 'f. mira gün'
           ? 'f. mira gün'
@@ -2220,37 +2252,46 @@ export function syncDatabaseMutations(
     }
   }
 
-  // 3. Rebuild courses with updated studentIds and instructor assignments
-  const baseCourseIdSet = new Set(BASE_DB.courses.map(c => c.id));
-  const updatedCourses: Course[] = BASE_DB.courses.map(baseCourse => {
-    const activeIds = new Set<string>();
-
-    for (const st of studentsMap.values()) {
-      if (st.enrolledCourseIds.includes(baseCourse.id)) {
-        activeIds.add(st.id);
+  // 3. Index enrolled students by courseId in a single pass O(S * avgCourses)
+  const courseToStudentIds = new Map<string, Set<string>>();
+  for (const st of studentsMap.values()) {
+    for (const cid of st.enrolledCourseIds) {
+      let set = courseToStudentIds.get(cid);
+      if (!set) {
+        set = new Set<string>();
+        courseToStudentIds.set(cid, set);
       }
+      set.add(st.id);
     }
+  }
 
-    const sortedStudentIds = Array.from(activeIds).sort((a, b) => {
-      const sa = studentsMap.get(a)?.name || '';
-      const sb = studentsMap.get(b)?.name || '';
-      return sa.localeCompare(sb, 'tr-TR');
-    });
+  const compareStudentId = (a: string, b: string) => {
+    const sa = studentsMap.get(a)?.name || '';
+    const sb = studentsMap.get(b)?.name || '';
+    return sa.localeCompare(sb, 'tr-TR');
+  };
+
+  const updatedCoursesById = new Map<string, Course>();
+  const updatedCourses: Course[] = BASE_DB.courses.map(baseCourse => {
+    const activeIds = courseToStudentIds.get(baseCourse.id);
+    const sortedStudentIds = activeIds ? Array.from(activeIds).sort(compareStudentId) : [];
 
     const assignedInstName = assignmentMap.get(baseCourse.id) || baseCourse.instructorName;
     const assignedInstId = `inst-${slugifyTurkish(assignedInstName)}`;
 
-    return {
+    const updated: Course = {
       ...baseCourse,
       instructorId: assignedInstId,
       instructorName: assignedInstName,
       studentIds: sortedStudentIds,
     };
+    updatedCoursesById.set(updated.id, updated);
+    return updated;
   });
 
   // 3b. Add any newly created courses from instructorAssignments
   for (const assign of instructorAssignments) {
-    if (!baseCourseIdSet.has(assign.courseId) && assign.gradeClass && assign.subject && assign.modality) {
+    if (!BASE_COURSE_ID_SET.has(assign.courseId) && assign.gradeClass && assign.subject && assign.modality) {
       const assignedInstName = normalizeTurkish(assign.instructorName);
       const assignedInstId = `inst-${slugifyTurkish(assignedInstName)}`;
       const gradeClass = normalizeTurkish(assign.gradeClass);
@@ -2258,31 +2299,27 @@ export function syncDatabaseMutations(
       const modality = assign.modality;
       const modalityLabel = modality === 'online' ? 'çevrim içi' : 'yüz yüze';
 
-      const activeIds = new Set<string>();
-      for (const st of studentsMap.values()) {
-        if (st.enrolledCourseIds.includes(assign.courseId)) {
-          activeIds.add(st.id);
-        } else if (modality === 'yuzyuze' && st.modality === 'yuzyuze') {
-          // For yüz yüze, students in the same gradeClass automatically take all courses of that branch
-          const sameBranchCourse = BASE_DB.courses.find(
-            c => c.modality === 'yuzyuze' && c.gradeClass === gradeClass
-          );
-          if (sameBranchCourse && st.enrolledCourseIds.includes(sameBranchCourse.id)) {
-            activeIds.add(st.id);
-            if (!st.enrolledCourseIds.includes(assign.courseId)) {
-              st.enrolledCourseIds.push(assign.courseId);
+      const activeIds = new Set<string>(courseToStudentIds.get(assign.courseId) || []);
+      if (modality === 'yuzyuze') {
+        const sameBranchCourseId = BASE_YUZYUZE_BRANCH_COURSE_ID_BY_GRADE.get(gradeClass);
+        const branchStudents = sameBranchCourseId
+          ? courseToStudentIds.get(sameBranchCourseId)
+          : undefined;
+        if (branchStudents) {
+          for (const stId of branchStudents) {
+            const st = studentsMap.get(stId);
+            if (st && st.modality === 'yuzyuze') {
+              activeIds.add(st.id);
+              if (!st.enrolledCourseIds.includes(assign.courseId)) {
+                st.enrolledCourseIds.push(assign.courseId);
+              }
             }
           }
         }
       }
 
-      const sortedStudentIds = Array.from(activeIds).sort((a, b) => {
-        const sa = studentsMap.get(a)?.name || '';
-        const sb = studentsMap.get(b)?.name || '';
-        return sa.localeCompare(sb, 'tr-TR');
-      });
-
-      updatedCourses.push({
+      const sortedStudentIds = Array.from(activeIds).sort(compareStudentId);
+      const createdCourse: Course = {
         id: assign.courseId,
         title: `${gradeClass} ${subject} (${modalityLabel})`,
         shortTitle: `${gradeClass} ${subject}`,
@@ -2292,7 +2329,9 @@ export function syncDatabaseMutations(
         instructorId: assignedInstId,
         instructorName: assignedInstName,
         studentIds: sortedStudentIds,
-      });
+      };
+      updatedCourses.push(createdCourse);
+      updatedCoursesById.set(createdCourse.id, createdCourse);
     }
   }
 
@@ -2335,11 +2374,17 @@ export function syncDatabaseMutations(
   DB.students = sortedStudents;
   DB.courses = updatedCourses;
   DB.instructors = sortedInstructors;
+  DB.studentsById = studentsMap;
+  DB.coursesById = updatedCoursesById;
+  DB.instructorsById = instructorsMap;
 
   return {
     students: sortedStudents,
     courses: updatedCourses,
     instructors: sortedInstructors,
+    studentsById: studentsMap,
+    coursesById: updatedCoursesById,
+    instructorsById: instructorsMap,
   };
 }
 
