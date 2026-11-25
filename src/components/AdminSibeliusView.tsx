@@ -319,6 +319,7 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
     return courses.filter(c => {
       if (c.modality !== 'online') return false;
       if (c.gradeClass === newOnlineGradeClass) return true;
+      if (newOnlineGradeClass === '6/a' && c.gradeClass === '6/b') return true;
       if (newOnlineGradeClass === '3/a' && c.id === 'online-4a-ing') return true;
       if ((newOnlineGradeClass === '11/a' || newOnlineGradeClass === '12/a') && c.gradeClass === 'tyt') {
         return true;
@@ -356,9 +357,14 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
 
   // Courses matching selected modality and grade level for Instructor Assignment
   const availableCoursesForInstructorAssign = useMemo(() => {
-    return courses.filter(
-      c => c.modality === assignModality && c.gradeClass === assignGradeClass
-    );
+    return courses.filter(c => {
+      if (c.modality !== assignModality) return false;
+      if (c.gradeClass === assignGradeClass) return true;
+      if (assignModality === 'online' && assignGradeClass === '6/a' && c.gradeClass === '6/b') {
+        return true;
+      }
+      return false;
+    });
   }, [courses, assignModality, assignGradeClass]);
 
   // Auto-select the first course (or bos course if present) when modality/level changes
@@ -912,6 +918,16 @@ export const AdminSibeliusView: React.FC<AdminSibeliusViewProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-200/60 text-xs">
+              {courseStudents.length === 0 && groupedTempStudents.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={weeksList.length + 1}
+                    className="py-8 text-center text-xs text-stone-500"
+                  >
+                    bu sınıfta henüz kayıtlı öğrenci bulunmuyor.
+                  </td>
+                </tr>
+              )}
               {courseStudents.map((st, idx) => (
                 <tr key={st.id} className="hover:bg-stone-100/60">
                   <td className="py-3 sm:py-2.5 pr-3 font-medium text-stone-900 whitespace-nowrap sticky left-0 bg-white/95 z-10">

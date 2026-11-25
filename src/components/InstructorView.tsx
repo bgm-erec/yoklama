@@ -337,7 +337,10 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
   );
 
   const attemptNavigationOrExit = (action: () => void) => {
-    if (isCurrentCourseHolidayWeek) {
+    if (
+      isCurrentCourseHolidayWeek ||
+      (courseStudentIds.length === 0 && sessionUnlistedReports.length === 0)
+    ) {
       onGuardedNavigate(action);
       return;
     }
@@ -921,67 +924,78 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                   derse kayıtlı öğrenciler ({courseStudents.length})
                 </span>
                 <div className="flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={handleMarkAllPresentOrClear}
-                    className="inline-flex items-center gap-1 text-xs text-stone-600 hover:text-stone-900 underline underline-offset-2 cursor-pointer"
-                  >
-                    <CheckSquare className="h-3.5 w-3.5" />
-                    <span>
-                      {presentStudentIds.length === courseStudents.length
-                        ? 'tüm işaretleri kaldır'
-                        : 'tümünü derste işaretle'}
-                    </span>
-                  </button>
+                  {courseStudents.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleMarkAllPresentOrClear}
+                      className="inline-flex items-center gap-1 text-xs text-stone-600 hover:text-stone-900 underline underline-offset-2 cursor-pointer"
+                    >
+                      <CheckSquare className="h-3.5 w-3.5" />
+                      <span>
+                        {presentStudentIds.length === courseStudents.length
+                          ? 'tüm işaretleri kaldır'
+                          : 'tümünü derste işaretle'}
+                      </span>
+                    </button>
+                  )}
                   <span className="text-xs text-stone-500 font-mono-num">
                     gelen: {presentStudentIds.length} · gelmeyen: {absentStudents.length}
                   </span>
                 </div>
               </div>
 
-              <div className="divide-y divide-stone-200/70">
-                {courseStudents.map((student, index) => {
-                  const isPresent = presentStudentIds.includes(student.id);
-                  return (
-                    <label
-                      key={student.id}
-                      className={`flex items-center justify-between gap-3 py-3 sm:py-2.5 px-2.5 rounded-xl transition-colors cursor-pointer select-none ${
-                        isPresent
-                          ? 'bg-emerald-50/70 text-stone-900'
-                          : 'hover:bg-stone-100/70 active:bg-stone-200/50 text-stone-700'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <input
-                          type="checkbox"
-                          checked={isPresent}
-                          onChange={() => handleTogglePresent(student.id)}
-                          aria-label={`${student.name} derste olarak işaretle`}
-                          className="h-5 w-5 sm:h-4 sm:w-4 shrink-0 rounded border-stone-400 text-stone-900 focus:ring-stone-700 cursor-pointer"
-                        />
-                        <span className="font-mono-num text-xs text-stone-400 w-5 shrink-0">
-                          {index + 1}.
-                        </span>
-                        <span
-                          className={`text-sm truncate ${
-                            isPresent ? 'font-medium text-stone-900' : 'text-stone-600'
-                          }`}
-                        >
-                          {student.name}
-                        </span>
-                      </div>
-
-                      <span
-                        className={`text-xs whitespace-nowrap shrink-0 ${
-                          isPresent ? 'text-emerald-800 font-medium' : 'text-stone-400'
+              {courseStudents.length === 0 ? (
+                <div
+                  data-testid="empty-course-roster-notice"
+                  className="py-8 px-4 text-center text-xs text-stone-500 leading-relaxed"
+                >
+                  bu sınıfta henüz kayıtlı öğrenci bulunmuyor. derse katılan öğrenci olursa aşağıdan liste dışı olarak ekleyebilirsin.
+                </div>
+              ) : (
+                <div className="divide-y divide-stone-200/70">
+                  {courseStudents.map((student, index) => {
+                    const isPresent = presentStudentIds.includes(student.id);
+                    return (
+                      <label
+                        key={student.id}
+                        className={`flex items-center justify-between gap-3 py-3 sm:py-2.5 px-2.5 rounded-xl transition-colors cursor-pointer select-none ${
+                          isPresent
+                            ? 'bg-emerald-50/70 text-stone-900'
+                            : 'hover:bg-stone-100/70 active:bg-stone-200/50 text-stone-700'
                         }`}
                       >
-                        {isPresent ? 'derste' : 'gelmedi 🫏'}
-                      </span>
-                    </label>
-                  );
-                })}
-              </div>
+                        <div className="flex items-center gap-3 min-w-0">
+                          <input
+                            type="checkbox"
+                            checked={isPresent}
+                            onChange={() => handleTogglePresent(student.id)}
+                            aria-label={`${student.name} derste olarak işaretle`}
+                            className="h-5 w-5 sm:h-4 sm:w-4 shrink-0 rounded border-stone-400 text-stone-900 focus:ring-stone-700 cursor-pointer"
+                          />
+                          <span className="font-mono-num text-xs text-stone-400 w-5 shrink-0">
+                            {index + 1}.
+                          </span>
+                          <span
+                            className={`text-sm truncate ${
+                              isPresent ? 'font-medium text-stone-900' : 'text-stone-600'
+                            }`}
+                          >
+                            {student.name}
+                          </span>
+                        </div>
+
+                        <span
+                          className={`text-xs whitespace-nowrap shrink-0 ${
+                            isPresent ? 'text-emerald-800 font-medium' : 'text-stone-400'
+                          }`}
+                        >
+                          {isPresent ? 'derste' : 'gelmedi 🫏'}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Compact Bar: Listede Olmayan Öğrenci Ekle */}
               <div className="mt-3 pt-2.5 border-t border-stone-200/80">
@@ -1274,7 +1288,13 @@ export const InstructorView: React.FC<InstructorViewProps> = ({
                 </span>
               </div>
 
-              {absentStudents.length === 0 ? (
+              {courseStudents.length === 0 ? (
+                <div className="py-8 sm:py-10 text-center">
+                  <p className="text-xs text-stone-500">
+                    bu sınıfta henüz kayıtlı öğrenci bulunmuyor.
+                  </p>
+                </div>
+              ) : absentStudents.length === 0 ? (
                 <div className="py-8 sm:py-10 text-center">
                   <Sparkles className="h-5 w-5 text-stone-400 mx-auto mb-2" />
                   <p className="text-xs text-stone-500">

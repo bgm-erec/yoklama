@@ -271,8 +271,8 @@ test('syncDatabaseMutations assigns new instructor to bos1 and dynamically updat
   const initial = syncDatabaseMutations([], [], []);
   const initialRealInstructors = initial.instructors.filter(i => !/^bos\d+$/.test(i.name)).length;
   const initialCourseCount = initial.courses.length;
-  assert.equal(initialRealInstructors, 80);
-  assert.equal(initialCourseCount, 86);
+  assert.equal(initialRealInstructors, 81);
+  assert.equal(initialCourseCount, 87);
 
   // 1. Assign 'selim kaya' to online-5a-tur (which was bos1)
   const afterBosAssign = syncDatabaseMutations(
@@ -284,9 +284,9 @@ test('syncDatabaseMutations assigns new instructor to bos1 and dynamically updat
   const course5aTur = afterBosAssign.courses.find(c => c.id === 'online-5a-tur');
   assert.equal(course5aTur?.instructorName, 'selim kaya');
   assert.ok(!afterBosAssign.instructors.some(i => i.name === 'bos1'));
-  // Real instructor count dynamically increases from 80 to 81!
+  // Real instructor count dynamically increases from 81 to 82!
   const nextRealInstructors = afterBosAssign.instructors.filter(i => !/^bos\d+$/.test(i.name)).length;
-  assert.equal(nextRealInstructors, 81);
+  assert.equal(nextRealInstructors, 82);
 
   // 2. Add a brand-new course (e.g. 5/a geometri) with a new instructor
   const afterNewCourse = syncDatabaseMutations(
@@ -303,11 +303,54 @@ test('syncDatabaseMutations assigns new instructor to bos1 and dynamically updat
       },
     ]
   );
-  assert.equal(afterNewCourse.courses.length, 87);
-  assert.equal(afterNewCourse.instructors.filter(i => !/^bos\d+$/.test(i.name)).length, 81);
+  assert.equal(afterNewCourse.courses.length, 88);
+  assert.equal(afterNewCourse.instructors.filter(i => !/^bos\d+$/.test(i.name)).length, 82);
 
   // Reset DB back to clean state
   syncDatabaseMutations([], [], []);
+});
+
+test('online 6/b matematik is empty with amro alismaeil, only 6th grade has online /b, and 6/a matematik is assigned to semanur demirci', () => {
+  const db = syncDatabaseMutations([], [], []);
+
+  // Only 6th grade has an online /b class
+  const onlineBCourses = db.courses.filter(
+    c => c.modality === 'online' && c.gradeClass.endsWith('/b')
+  );
+  assert.equal(onlineBCourses.length, 1);
+  assert.equal(onlineBCourses[0].id, 'online-6b-mat');
+  assert.equal(onlineBCourses[0].gradeClass, '6/b');
+  assert.equal(onlineBCourses[0].subject, 'matematik');
+  assert.equal(onlineBCourses[0].title, '6/b matematik (çevrim içi)');
+  assert.equal(onlineBCourses[0].instructorName, 'amro alismaeil');
+  assert.equal(onlineBCourses[0].instructorId, 'inst-amro-alismaeil');
+  assert.deepEqual(onlineBCourses[0].studentIds, []);
+
+  // 6/a matematik keeps its exact id & student roster, with instructor changed to semanur demirci
+  const online6aMat = db.coursesById.get('online-6a-mat');
+  assert.ok(online6aMat);
+  assert.equal(online6aMat.instructorName, 'semanur demirci');
+  assert.equal(online6aMat.instructorId, 'inst-semanur-demirci');
+  assert.ok(online6aMat.studentIds.length >= 18);
+
+  // Login identity resolution for both instructors
+  const amroFull = resolveIdentityInput('Amro Alismaeil');
+  assert.equal(amroFull.type, 'instructor');
+  if (amroFull.type === 'instructor') {
+    assert.deepEqual(amroFull.instructor.courseIds, ['online-6b-mat']);
+  }
+
+  const amroFirst = resolveIdentityInput('amro');
+  assert.equal(amroFirst.type, 'instructor');
+
+  const semanurFull = resolveIdentityInput('Semanur Demirci');
+  assert.equal(semanurFull.type, 'instructor');
+  if (semanurFull.type === 'instructor') {
+    assert.deepEqual(semanurFull.instructor.courseIds, ['online-6a-mat']);
+  }
+
+  const semanurFirst = resolveIdentityInput('semanur');
+  assert.equal(semanurFirst.type, 'instructor');
 });
 
 test('findMatchingStudentByFullName matches existing students by full name and merges new course when enrolled', () => {

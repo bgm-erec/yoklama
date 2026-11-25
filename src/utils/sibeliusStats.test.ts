@@ -219,3 +219,118 @@ test('indexed Sibelius stats and O(1) cell resolver preserve pre-registration, h
   assert.equal(onlineMatStat.totalAbsences, 4); // 2 + 1 + 1 raw absent entries
   assert.equal(onlineMatStat.noAttendanceThisWeek, true);
 });
+
+test('reassigning online-6a-mat to semanur demirci preserves all historical attendance and isolates amro alismaeil on empty online-6b-mat', () => {
+  const courses: Course[] = [
+    {
+      id: 'online-6a-mat',
+      title: '6/a matematik (çevrim içi)',
+      shortTitle: '6/a matematik',
+      gradeClass: '6/a',
+      subject: 'matematik',
+      modality: 'online',
+      instructorId: 'inst-semanur-demirci',
+      instructorName: 'semanur demirci',
+      studentIds: ['stu-dila-acarca', 'stu-osman-turan'],
+    },
+    {
+      id: 'online-6b-mat',
+      title: '6/b matematik (çevrim içi)',
+      shortTitle: '6/b matematik',
+      gradeClass: '6/b',
+      subject: 'matematik',
+      modality: 'online',
+      instructorId: 'inst-amro-alismaeil',
+      instructorName: 'amro alismaeil',
+      studentIds: [],
+    },
+  ];
+  const coursesById = new Map(courses.map(c => [c.id, c]));
+
+  const instructors: Instructor[] = [
+    {
+      id: 'inst-semanur-demirci',
+      name: 'semanur demirci',
+      firstName: 'semanur',
+      lastName: 'demirci',
+      modality: 'online',
+      courseIds: ['online-6a-mat'],
+    },
+    {
+      id: 'inst-amro-alismaeil',
+      name: 'amro alismaeil',
+      firstName: 'amro',
+      lastName: 'alismaeil',
+      modality: 'online',
+      courseIds: ['online-6b-mat'],
+    },
+  ];
+
+  const students: Student[] = [
+    {
+      id: 'stu-dila-acarca',
+      name: 'dila acarca',
+      grade: '6. sınıf',
+      modality: 'online',
+      enrolledCourseIds: ['online-6a-mat'],
+    },
+    {
+      id: 'stu-osman-turan',
+      name: 'osman turan',
+      grade: '6. sınıf',
+      modality: 'online',
+      enrolledCourseIds: ['online-6a-mat'],
+    },
+  ];
+
+  // Historical attendance previously recorded under inst-amro-alismaeil for online-6a-mat
+  const attendance: AttendanceRecord[] = [
+    {
+      id: 'online-6a-mat_w3_1-ders',
+      courseId: 'online-6a-mat',
+      instructorId: 'inst-amro-alismaeil',
+      weekNumber: 3,
+      sessionType: '1. ders',
+      absentStudentIds: ['stu-dila-acarca'],
+      didNotHoldClass: false,
+      updatedAt: '2026-11-04T12:00:00.000Z',
+    },
+    {
+      id: 'online-6a-mat_w6_1-ders',
+      courseId: 'online-6a-mat',
+      instructorId: 'inst-amro-alismaeil',
+      weekNumber: 6,
+      sessionType: '1. ders',
+      absentStudentIds: ['stu-osman-turan'],
+      didNotHoldClass: false,
+      updatedAt: '2026-11-25T12:00:00.000Z',
+    },
+  ];
+
+  const index = buildAttendanceIndex(attendance);
+
+  // Course stats keep all historical absences under online-6a-mat, while online-6b-mat stays 0
+  const courseStats = computeCourseStats(courses, index, 6);
+  const stat6a = courseStats.find(c => c.course.id === 'online-6a-mat')!;
+  const stat6b = courseStats.find(c => c.course.id === 'online-6b-mat')!;
+  assert.equal(stat6a.totalAbsences, 2);
+  assert.equal(stat6a.noAttendanceThisWeek, false);
+  assert.equal(stat6b.totalAbsences, 0);
+  assert.equal(stat6b.noAttendanceThisWeek, true);
+
+  // Student stats preserve week 3 and week 6 attendance for 6/a students
+  const studentStats = computeStudentStats(students, index, 6);
+  const dilaStat = studentStats.find(s => s.student.id === 'stu-dila-acarca')!;
+  assert.equal(dilaStat.totalSessionsHeld, 2);
+  assert.equal(dilaStat.absentCount, 1);
+
+  // Instructor stats credit online-6a-mat's week 6 record to semanur demirci, NOT amro alismaeil
+  const instStats = computeInstructorStats(instructors, coursesById, index, 6);
+  const semanurStat = instStats.find(i => i.instructor.id === 'inst-semanur-demirci')!;
+  const amroStat = instStats.find(i => i.instructor.id === 'inst-amro-alismaeil')!;
+  assert.equal(semanurStat.thisWeekRecords.length, 1);
+  assert.equal(semanurStat.didNotTakeAttendance, false);
+  assert.equal(amroStat.thisWeekRecords.length, 0);
+  assert.equal(amroStat.didNotTakeAttendance, true);
+});
+

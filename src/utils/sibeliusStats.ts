@@ -171,12 +171,13 @@ export function computeInstructorStats(
         instCourses.every(c => c.modality === 'yuzyuze') &&
         isYuzyuzeHolidayWeek(currentWeek);
 
+      const instCourseIdSet = new Set(instructor.courseIds);
       const seen = new Set<AttendanceRecord>();
       const thisWeekRecords: AttendanceRecord[] = [];
       const byInst = currentWeekByInstructor.get(instructor.id);
       if (byInst) {
         for (const r of byInst) {
-          if (!seen.has(r)) {
+          if (instCourseIdSet.has(r.courseId) && !seen.has(r)) {
             seen.add(r);
             thisWeekRecords.push(r);
           }

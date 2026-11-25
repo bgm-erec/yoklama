@@ -314,7 +314,7 @@ const RAW_COURSES: RawCourseDef[] = [
     gradeClass: '6/a',
     subject: 'matematik',
     modality: 'online',
-    instructorName: 'semanur demircioğlu',
+    instructorName: 'semanur demirci',
     rawStudents: [
       { name: 'Abdullah Muhammed Kaya', grade: '6. sınıf' },
       { name: 'Dila Acarca', grade: '6. sınıf' },
@@ -335,6 +335,14 @@ const RAW_COURSES: RawCourseDef[] = [
       { name: 'Muhammet Yasin Dağ', grade: '6. sınıf' },
       { name: 'Hatice Hüma Demir', grade: '6. sınıf' },
     ],
+  },
+  {
+    id: 'online-6b-mat',
+    gradeClass: '6/b',
+    subject: 'matematik',
+    modality: 'online',
+    instructorName: 'amro alismaeil',
+    rawStudents: [],
   },
   {
     id: 'online-6a-tur',
